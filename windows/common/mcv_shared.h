@@ -17,9 +17,9 @@
 #define MCV_SHM_NAME L"Global\\MagerCamVirtualCamera"
 #define MCV_MAX_SLOTS 4 /* «MagerCam», «MagerCam 2»… — по камере на телефон */
 #define MCV_MAGIC 0x4D435643u /* 'MCVC' */
-#define MCV_VERSION 1
-#define MCV_MAX_W 1920
-#define MCV_MAX_H 1080
+#define MCV_VERSION 2
+#define MCV_MAX_W 3840
+#define MCV_MAX_H 2160
 #define MCV_HEADER_SIZE 4096
 #define MCV_FRAME_MAX ((size_t)MCV_MAX_W * MCV_MAX_H * 3 / 2)
 #define MCV_SHM_SIZE (MCV_HEADER_SIZE + MCV_FRAME_MAX)

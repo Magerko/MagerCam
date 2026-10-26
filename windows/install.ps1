@@ -91,11 +91,12 @@ foreach ($key in $keys) {
 	New-ItemProperty -Force -Path "$key\InprocServer32" -Name ThreadingModel -Value 'Both' | Out-Null
 }
 
-# для QR-сопряжения телефон сам подключается к ПК, разрешаю это только в частных сетях
+# для QR-сопряжения телефон сам подключается к ПК. Домашнюю сеть Windows часто считает общественной,
+# поэтому разрешаю во всех профилях: порт слушается, только пока открыто окно с QR, и ждёт одноразовый nonce
 try {
 	Remove-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue
 	New-NetFirewallRule -DisplayName $fwRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4850-4859 `
-		-Program (Join-Path $dest 'MagerCam.exe') -Profile Private, Domain | Out-Null
+		-Program (Join-Path $dest 'MagerCam.exe') -Profile Any | Out-Null
 } catch {
 	Write-Host "Правило брандмауэра не добавлено: $($_.Exception.Message)"
 }

@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <mswsock.h>
 #include <windows.h>
 
 #include <stdio.h>
@@ -25,7 +26,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.1.1"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -117,6 +118,9 @@ struct mc_source {
 	bool had_video;
 	bool stream_hevc; /* по флагу в VIDEO_CONFIG */
 	bool phone_rec;   /* под lock */
+	/* что умеют камера и кодер телефона, под lock: из этого строю списки в свойствах */
+	int phone_sizes[32][2], phone_nsizes;
+	int phone_fps[8], phone_nfps;
 };
 
 static wchar_t *utf8_to_wide(const char *s)
@@ -490,6 +494,10 @@ static void discovery_run(int timeout_ms)
 		return;
 	int one = 1;
 	setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof(one));
+	/* иначе ICMP «порт закрыт» от соседей по подсети рвёт приём ошибкой WSAECONNRESET */
+	BOOL no_reset = FALSE;
+	DWORD ret = 0;
+	WSAIoctl(sock, SIO_UDP_CONNRESET, &no_reset, sizeof(no_reset), NULL, 0, &ret, NULL, NULL);
 	struct sockaddr_in local = {0};
 	local.sin_family = AF_INET;
 	bind(sock, (struct sockaddr *)&local, sizeof(local));
@@ -518,6 +526,15 @@ static void discovery_run(int timeout_ms)
 				uint32_t mask = prefix ? 0xFFFFFFFFu << (32 - prefix) : 0;
 				dst.sin_addr.s_addr = htonl((ip & mask) | ~mask);
 				sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+				/* broadcast часто глушит роутер или сам телефон в экономии энергии, а на прямой запрос
+				 * он ответит, и брандмауэр пропустит ответ. Поэтому опрашиваю ещё всю свою /24 */
+				uint32_t net = ip & 0xFFFFFF00u;
+				for (uint32_t h = 1; h < 255; h++) {
+					if ((net | h) == ip)
+						continue;
+					dst.sin_addr.s_addr = htonl(net | h);
+					sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+				}
 			}
 		}
 	}
@@ -810,11 +827,60 @@ static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, 
 	}
 }
 
+/* obs_data не держит массивы строк и чисел, поэтому "sizes" и "fps_list" разбираю из текста сам */
+static const char *json_array_body(const char *json, const char *key)
+{
+	char pat[32];
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = strstr(json, pat);
+	if (!p)
+		return NULL;
+	p = strchr(p + strlen(pat), '[');
+	return p ? p + 1 : NULL;
+}
+
+static void parse_formats(struct mc_source *s, const char *json)
+{
+	int sizes[32][2], ns = 0, fps[8], nf = 0;
+	const char *p = json_array_body(json, "sizes");
+	while (p && *p && *p != ']' && ns < 32) {
+		int w, h;
+		if (*p == '"' && sscanf(p + 1, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) {
+			sizes[ns][0] = w;
+			sizes[ns][1] = h;
+			ns++;
+			p = strchr(p + 1, '"');
+			if (!p)
+				break;
+		}
+		p++;
+	}
+	p = json_array_body(json, "fps_list");
+	while (p && *p && *p != ']' && nf < 8) {
+		if (*p >= '0' && *p <= '9') {
+			fps[nf++] = (int)strtol(p, (char **)&p, 10);
+			continue;
+		}
+		p++;
+	}
+	EnterCriticalSection(&s->lock);
+	if (ns) {
+		memcpy(s->phone_sizes, sizes, sizeof(sizes));
+		s->phone_nsizes = ns;
+	}
+	if (nf) {
+		memcpy(s->phone_fps, fps, sizeof(fps));
+		s->phone_nfps = nf;
+	}
+	LeaveCriticalSection(&s->lock);
+}
+
 static void apply_status_json(struct mc_source *s, const char *json)
 {
 	obs_data_t *d = obs_data_create_from_json(json);
 	if (!d)
 		return;
+	parse_formats(s, json);
 	EnterCriticalSection(&s->lock);
 	s->phone_orient = (int)obs_data_get_int(d, "orient");
 	s->battery = (int)obs_data_get_int(d, "battery");
@@ -883,6 +949,14 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	} else if (!*host) {
 		set_status(s, "Укажите IP телефона или выберите его из списка");
 		return true;
+	}
+	/* неполный код телефон засчитает как неверный, а после десяти таких заблокирует ПК на минуту */
+	int digits = 0;
+	for (const char *k = cfg->key; *k; k++)
+		digits += *k >= '0' && *k <= '9';
+	if (digits && digits != 6 && !cfg->usb) {
+		set_status(s, "Код доступа — 6 цифр с экрана телефона");
+		return false;
 	}
 
 	set_status(s, "Подключение к %s:%d…", host, cfg->port);
@@ -1035,12 +1109,22 @@ static DWORD WINAPI net_thread(LPVOID param)
 	s->frame = av_frame_alloc();
 	s->sw_frame = av_frame_alloc();
 
+	LONG last_gen = s->gen;
 	while (!s->stop) {
+		/* настройки меняют по символу, пока печатают IP или код: жду паузы, а не подключаюсь к «192.1» */
+		if (s->gen != last_gen) {
+			LONG g;
+			do {
+				g = s->gen;
+				Sleep(700);
+			} while (!s->stop && s->gen != g);
+		}
+		LONG gen = s->gen;
+		last_gen = gen;
 		EnterCriticalSection(&s->lock);
 		struct mc_config cfg = s->cfg;
 		bool idle = s->deactivate_hidden && !s->showing;
 		LeaveCriticalSection(&s->lock);
-		LONG gen = s->gen;
 
 		if (idle) {
 			set_status(s, "Неактивно (источник скрыт)");
@@ -1497,18 +1581,45 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_add_group(props, "grp_conn", "Подключение", OBS_GROUP_NORMAL, conn);
 
 	obs_properties_t *vid = obs_properties_create();
+	/* после подключения списки берутся у телефона, до него показываю типовые */
+	int sizes[32][2], ns = 0, fps[8], nf = 0;
+	if (s) {
+		EnterCriticalSection(&s->lock);
+		ns = s->phone_nsizes;
+		memcpy(sizes, s->phone_sizes, sizeof(sizes));
+		nf = s->phone_nfps;
+		memcpy(fps, s->phone_fps, sizeof(fps));
+		LeaveCriticalSection(&s->lock);
+	}
+	if (!ns) {
+		static const int def[][2] = {{3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720}, {640, 480}};
+		memcpy(sizes, def, sizeof(def));
+		ns = 5;
+	}
+	if (!nf) {
+		static const int def[] = {24, 25, 30, 50, 60};
+		memcpy(fps, def, sizeof(def));
+		nf = 5;
+	}
 	p = obs_properties_add_list(vid, "resolution", "Разрешение", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "640x480 (4:3)", "640x480");
-	obs_property_list_add_string(p, "1280x720 (HD)", "1280x720");
-	obs_property_list_add_string(p, "1920x1080 (Full HD)", "1920x1080");
-	obs_property_list_add_string(p, "2560x1440 (2K)", "2560x1440");
-	obs_property_list_add_string(p, "3840x2160 (4K)", "3840x2160");
+	for (int i = 0; i < ns; i++) {
+		int w = sizes[i][0], h = sizes[i][1];
+		const char *tag = w == 3840 && h == 2160 ? " (4K)"
+				  : w == 2560 && h == 1440 ? " (2K)"
+				  : w == 1920 && h == 1080 ? " (Full HD)"
+				  : w == 1280 && h == 720  ? " (HD)"
+							   : "";
+		char val[24], name[48];
+		snprintf(val, sizeof(val), "%dx%d", w, h);
+		snprintf(name, sizeof(name), "%dx%d%s", w, h, tag);
+		obs_property_list_add_string(p, name, val);
+	}
 	p = obs_properties_add_list(vid, "fps", "Кадров в секунду", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(p, "24", 24);
-	obs_property_list_add_int(p, "25", 25);
-	obs_property_list_add_int(p, "30", 30);
-	obs_property_list_add_int(p, "50", 50);
-	obs_property_list_add_int(p, "60", 60);
+	for (int i = 0; i < nf; i++) {
+		char name[8];
+		snprintf(name, sizeof(name), "%d", fps[i]);
+		obs_property_list_add_int(p, name, fps[i]);
+	}
 	p = obs_properties_add_int_slider(vid, "bitrate", "Битрейт (Мбит/с)", 1, 50, 1);
 	p = obs_properties_add_list(vid, "camera_id", "Камера", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "Задняя (основная)", "back");

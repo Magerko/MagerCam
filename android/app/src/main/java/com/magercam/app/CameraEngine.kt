@@ -123,6 +123,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     @Volatile var hasFlash = false; private set
     @Volatile var currentCameraId: String = ""; private set
     @Volatile var supportedSizes: List<Size> = emptyList(); private set
+    @Volatile var supportedFps: List<Int> = emptyList(); private set
     /** Потолок частоты кадров при перегреве, 0 — без ограничения. */
     @Volatile var fpsCap = 0
     @Volatile var wantHevc = false
@@ -602,7 +603,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val step = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0f
         evMin = (evRange?.lower ?: 0) * step
         evMax = (evRange?.upper ?: 0) * step
-        supportedSizes = videoSizes(sc)
+        // ПК строит списки из того, что реально потянут камера и кодер этого телефона
+        supportedSizes = videoSizes(sc).filter { VideoEncoder.isSizeSupported(it.width, it.height) }
+        supportedFps = (ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray())
+            .map { it.upper }.filter { it in 15..60 }.distinct().sorted()
         faceModes = ch.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES) ?: intArrayOf()
         framingAvailable = physicalId == null && faceModes.any { it != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF }
         framingCrop = null

@@ -1,6 +1,7 @@
 #include "net.h"
 #include <windows.h>
 #include <iphlpapi.h>
+#include <mswsock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,6 +164,10 @@ int discovery_run(int timeout_ms, struct found_device *found, int max)
 		return 0;
 	int one = 1;
 	setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof(one));
+	/* иначе ICMP «порт закрыт» от соседей по подсети рвёт приём ошибкой WSAECONNRESET */
+	BOOL no_reset = FALSE;
+	DWORD ret = 0;
+	WSAIoctl(sock, SIO_UDP_CONNRESET, &no_reset, sizeof(no_reset), NULL, 0, &ret, NULL, NULL);
 	struct sockaddr_in local = {0};
 	local.sin_family = AF_INET;
 	bind(sock, (struct sockaddr *)&local, sizeof(local));
@@ -192,6 +197,15 @@ int discovery_run(int timeout_ms, struct found_device *found, int max)
 				uint32_t mask = 0xFFFFFFFFu << (32 - prefix);
 				dst.sin_addr.s_addr = htonl((ip & mask) | ~mask);
 				sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+				/* broadcast часто глушит роутер или сам телефон в экономии энергии, а на прямой запрос
+				 * он ответит, и брандмауэр пропустит ответ. Поэтому опрашиваю ещё всю свою /24 */
+				uint32_t net = ip & 0xFFFFFF00u;
+				for (uint32_t h = 1; h < 255; h++) {
+					if ((net | h) == ip)
+						continue;
+					dst.sin_addr.s_addr = htonl(net | h);
+					sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+				}
 			}
 		}
 	}

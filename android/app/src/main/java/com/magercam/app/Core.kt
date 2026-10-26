@@ -365,6 +365,9 @@ class Core(val context: Context) : CameraEngine.Listener {
         val sizes = JSONArray()
         engine.supportedSizes.forEach { sizes.put("${it.width}x${it.height}") }
         o.put("sizes", sizes)
+        val fpsList = JSONArray()
+        engine.supportedFps.forEach { fpsList.put(it) }
+        o.put("fps_list", fpsList)
         o.put("orient", streamOrientation()).put("orientation_mode", settings.orientationMode)
         o.put("audio", settings.micEnabled).put("audio_source", settings.audioSource)
         o.put("torch", settings.torch).put("has_flash", engine.hasFlash)

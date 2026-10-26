@@ -17,7 +17,7 @@
 #include "../common/mcv_nv12.h"
 #include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.1.1"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
@@ -87,6 +87,9 @@ struct phone_status {
 	double bg_strength;
 	long long rec_ms;
 	wchar_t bg_error[120], rec_error[120];
+	/* что умеют камера и кодер телефона: из этого строю списки разрешений и частоты кадров */
+	int sizes[32][2], nsizes;
+	int fps_list[8], nfps;
 };
 
 static struct {
@@ -395,6 +398,23 @@ static void apply_status_json(const char *text)
 			p.ncams++;
 		}
 	}
+	const struct json *sz = json_get(j, "sizes");
+	if (sz && sz->type == JSON_ARR) {
+		for (const struct json *c = sz->child; c && p.nsizes < 32; c = c->next) {
+			int sw = 0, sh = 0;
+			if (c->str && sscanf(c->str, "%dx%d", &sw, &sh) == 2 && sw >= 320 && sh >= 240) {
+				p.sizes[p.nsizes][0] = sw;
+				p.sizes[p.nsizes][1] = sh;
+				p.nsizes++;
+			}
+		}
+	}
+	const struct json *fl = json_get(j, "fps_list");
+	if (fl && fl->type == JSON_ARR) {
+		for (const struct json *c = fl->child; c && p.nfps < 8; c = c->next)
+			if (c->num >= 1)
+				p.fps_list[p.nfps++] = (int)c->num;
+	}
 	json_free(j);
 	EnterCriticalSection(&app.lock);
 	app.ph = p;
@@ -463,8 +483,8 @@ static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stri
 		s->fps_count = 0;
 		s->fps_t0 = now;
 	}
-	/* превью хватает ~25 кадров в секунду, так меньше грузится процессор */
-	if (now - s->last_preview < 38 || IsIconic(app.wnd) || !IsWindowVisible(app.wnd))
+	/* превью показываю с частотой потока (до 60 к/с): по нему судят о плавности, а кадр там маленький */
+	if (now - s->last_preview < 14 || IsIconic(app.wnd) || !IsWindowVisible(app.wnd))
 		return;
 	s->last_preview = now;
 	if (!s->small)
@@ -963,6 +983,74 @@ static int pos_from_zoom(double z, double zmin, double zmax)
 	return (int)lround(100.0 * log(z / zmin) / log(zmax / zmin));
 }
 
+/* списки разрешений и к/с беру у телефона; пока он не подключён, показываю типовые */
+static void fill_format_lists(const struct phone_status *ph, int cur_w, int cur_h, int cur_fps)
+{
+	static const int def_sizes[][2] = {{3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720}, {640, 480}};
+	static const int def_fps[] = {15, 24, 30, 60};
+	int sizes[32][2], ns = 0, fps[8], nf = 0;
+	if (ph->valid && ph->nsizes > 0) {
+		memcpy(sizes, ph->sizes, sizeof(sizes));
+		ns = ph->nsizes;
+	} else {
+		memcpy(sizes, def_sizes, sizeof(def_sizes));
+		ns = 5;
+	}
+	if (ph->valid && ph->nfps > 0) {
+		memcpy(fps, ph->fps_list, sizeof(int) * ph->nfps);
+		nf = ph->nfps;
+	} else {
+		memcpy(fps, def_fps, sizeof(def_fps));
+		nf = 4;
+	}
+
+	/* пересобираю, только если списки поменялись, иначе раскрытый список закрывался бы раз в секунду */
+	static int last_sig = -1;
+	int sig = ns * 31 + nf;
+	for (int i = 0; i < ns; i++)
+		sig = sig * 131 + sizes[i][0] * 7 + sizes[i][1];
+	for (int i = 0; i < nf; i++)
+		sig = sig * 17 + fps[i];
+	if (sig != last_sig) {
+		last_sig = sig;
+		SendMessageW(app.res, CB_RESETCONTENT, 0, 0);
+		for (int i = 0; i < ns; i++) {
+			int w = sizes[i][0], h = sizes[i][1];
+			wchar_t b[32];
+			_snwprintf(b, 32, L"%d×%d", w, h);
+			combo_add(app.res, b, MAKELPARAM(w, h));
+		}
+		SendMessageW(app.fps, CB_RESETCONTENT, 0, 0);
+		for (int i = 0; i < nf; i++) {
+			wchar_t b[16];
+			_snwprintf(b, 16, L"%d к/с", fps[i]);
+			combo_add(app.fps, b, fps[i]);
+		}
+	}
+	combo_select_data(app.res, MAKELPARAM(cur_w, cur_h));
+	if (SendMessageW(app.res, CB_GETCURSEL, 0, 0) < 0) {
+		/* такого размера у телефона нет: выделяю ближайший по площади, его телефон и возьмёт */
+		int best = 0;
+		long long bd = -1;
+		for (int i = 0; i < ns; i++) {
+			long long d = llabs((long long)sizes[i][0] * sizes[i][1] - (long long)cur_w * cur_h);
+			if (bd < 0 || d < bd) {
+				bd = d;
+				best = i;
+			}
+		}
+		SendMessageW(app.res, CB_SETCURSEL, best, 0);
+	}
+	combo_select_data(app.fps, cur_fps);
+	if (SendMessageW(app.fps, CB_GETCURSEL, 0, 0) < 0) {
+		int best = 0;
+		for (int i = 0; i < nf; i++)
+			if (fps[i] <= cur_fps)
+				best = i;
+		SendMessageW(app.fps, CB_SETCURSEL, best, 0);
+	}
+}
+
 static void sync_phone_controls(void)
 {
 	EnterCriticalSection(&app.lock);
@@ -986,6 +1074,18 @@ static void sync_phone_controls(void)
 		combo_add(app.camera, L"Фронтальная", 1001);
 		SendMessageW(app.camera, CB_SETCURSEL, strcmp(cur_cam, "front") == 0 ? 1 : 0, 0);
 	}
+
+	EnterCriticalSection(&app.lock);
+	int cw = app.cfg.width, chh = app.cfg.height, cf = app.cfg.fps;
+	LeaveCriticalSection(&app.lock);
+	/* показываю то, что телефон реально отдаёт: он мог взять ближайший к запрошенному размер */
+	if (ph.valid && ph.w > 0 && ph.h > 0) {
+		cw = ph.w;
+		chh = ph.h;
+	}
+	if (ph.valid && ph.fps > 0)
+		cf = ph.fps;
+	fill_format_lists(&ph, cw, chh, cf);
 
 	bool on = ph.valid;
 	EnableWindow(app.torch, on && ph.has_flash);
@@ -1201,22 +1301,10 @@ static void build_ui(void)
 			  12, 524, PREVIEW_W, 40);
 	(void)hint;
 
-	static const struct { const wchar_t *t; int w, h; } res[] = {
-		{L"640×480", 640, 480}, {L"1280×720", 1280, 720}, {L"1920×1080", 1920, 1080}};
-	for (int i = 0; i < 3; i++)
-		combo_add(app.res, res[i].t, MAKELPARAM(res[i].w / 8, res[i].h / 8));
-	combo_select_data(app.res, MAKELPARAM(app.cfg.width / 8, app.cfg.height / 8));
-	if (SendMessageW(app.res, CB_GETCURSEL, 0, 0) < 0)
-		SendMessageW(app.res, CB_SETCURSEL, 2, 0);
-	static const int fps[] = {15, 24, 30, 60};
-	for (int i = 0; i < 4; i++) {
-		wchar_t b[16];
-		_snwprintf(b, 16, L"%d к/с", fps[i]);
-		combo_add(app.fps, b, fps[i]);
-	}
-	combo_select_data(app.fps, app.cfg.fps);
-	static const int br[] = {2000, 4000, 8000, 12000, 20000};
-	for (int i = 0; i < 5; i++) {
+	struct phone_status none = {0};
+	fill_format_lists(&none, app.cfg.width, app.cfg.height, app.cfg.fps);
+	static const int br[] = {2000, 4000, 8000, 12000, 20000, 30000, 50000};
+	for (int i = 0; i < (int)(sizeof(br) / sizeof(br[0])); i++) {
 		wchar_t b[24];
 		_snwprintf(b, 24, L"%d Мбит/с", br[i] / 1000);
 		combo_add(app.bitrate, b, br[i]);
@@ -1397,8 +1485,8 @@ static void on_command(int id, int code)
 		if (code == CBN_SELCHANGE) {
 			LPARAM r = combo_data(app.res);
 			EnterCriticalSection(&app.lock);
-			app.cfg.width = LOWORD(r) * 8;
-			app.cfg.height = HIWORD(r) * 8;
+			app.cfg.width = LOWORD(r);
+			app.cfg.height = HIWORD(r);
 			app.cfg.fps = (int)combo_data(app.fps);
 			app.cfg.bitrate_kbps = (int)combo_data(app.bitrate);
 			struct settings c = app.cfg;

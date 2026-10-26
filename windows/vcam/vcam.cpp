@@ -19,6 +19,10 @@
 extern "C" {
 #include "../common/mcv_shared.h"
 #include "../common/mcv_nv12.h"
+
+// заглушку рисую в 1080p: под 4K её всё равно растянет масштабирование, а памяти и работы вчетверо меньше
+#define PH_W 1920
+#define PH_H 1080
 }
 
 static const GUID CLSID_MagerCamSource = {0x6b1e3c7a, 0x4d2f, 0x4a8b, {0x9c, 0x5e, 0x2f, 0x7a, 0x1d, 0x3b, 0x8e, 0x41}};
@@ -83,7 +87,7 @@ struct FrameProvider {
 	uint8_t *copy = nullptr;       // последний целый кадр клиента, прочитанный по seqlock
 	uint32_t copy_w = 0, copy_h = 0;
 	int32_t copy_seq = -1;
-	uint8_t *placeholder = nullptr; // заглушка «Нет сигнала», NV12 MCV_MAX_W x MCV_MAX_H
+	uint8_t *placeholder = nullptr; // заглушка «Нет сигнала», NV12 PH_W x PH_H
 
 	bool open()
 	{
@@ -190,7 +194,7 @@ struct FrameProvider {
 	{
 		if (placeholder)
 			return;
-		const int W = MCV_MAX_W, H = MCV_MAX_H;
+		const int W = PH_W, H = PH_H;
 		placeholder = (uint8_t *)malloc((size_t)W * H * 3 / 2);
 		if (!placeholder)
 			return;
@@ -279,8 +283,8 @@ struct FrameProvider {
 				return;
 			}
 			src = placeholder;
-			sw = MCV_MAX_W;
-			sh = MCV_MAX_H;
+			sw = PH_W;
+			sh = PH_H;
 		}
 		if (sw == dst->w && sh == dst->h) {
 			for (int r = 0; r < sh; r++)
@@ -772,14 +776,13 @@ HRESULT MagerStream::init()
 		return hr;
 	m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-	static const UINT32 sizes[][2] = {{1920, 1080}, {1280, 720}, {960, 540}, {640, 360}};
+	// 1080p идёт первым: его берут программы, которые не спрашивают формат, а 4K им обычно не нужен
+	static const UINT32 sizes[][2] = {{1920, 1080}, {3840, 2160}, {2560, 1440}, {1280, 720}, {960, 540}, {640, 360}};
 	static const UINT32 fps_list[] = {30, 60};
-	IMFMediaType *types[8] = {};
+	IMFMediaType *types[12] = {};
 	DWORD n = 0;
 	for (auto &s : sizes) {
 		for (UINT32 fps : fps_list) {
-			if (fps == 60 && s[0] > 1280)
-				continue;
 			if (SUCCEEDED(make_type(s[0], s[1], fps, &types[n])))
 				n++;
 		}
