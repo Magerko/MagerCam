@@ -15,7 +15,6 @@ import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** HTTP server: web panel, MJPEG, JSON API and the binary /stream used by the OBS plugin. */
 class StreamServer(private val core: Core) {
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
@@ -54,9 +53,6 @@ class StreamServer(private val core: Core) {
         mjpegClients.forEach { it.close() }
     }
 
-    // ------------------------------------------------------------- broadcast
-
-    /** [pkt] is a complete packet (header + payload). */
     fun broadcastVideo(type: Int, pkt: ByteArray, key: Boolean) {
         if (type == PKT_VIDEO_CONFIG) lastVideoConfig = pkt
         for (c in streamClients) c.enqueueVideo(pkt, type, key)
@@ -79,8 +75,6 @@ class StreamServer(private val core: Core) {
         for (w in jpegWaiters) w.offer(jpeg)
     }
 
-    // ------------------------------------------------------------- HTTP
-
     private fun handle(sock: Socket) {
         try {
             sock.tcpNoDelay = true
@@ -101,7 +95,7 @@ class StreamServer(private val core: Core) {
                 "/", "/index.html" -> sendAsset(out, "index.html", "text/html; charset=utf-8")
                 "/api/status" -> sendJson(out, core.statusJson())
                 "/api/set" -> {
-                    // "audio" toggles the phone microphone here; in /stream it is a per-client flag
+                    // здесь "audio" включает микрофон телефона, а в /stream это флаг конкретного клиента
                     val q = if ("audio" in query && "mic" !in query) query + ("mic" to query.getValue("audio")) else query
                     core.applyParams(q)
                     sendJson(out, core.statusJson())
@@ -134,7 +128,7 @@ class StreamServer(private val core: Core) {
         Log.i(TAG, "stream client ${sock.inetAddress.hostAddress} audio=$wantsAudio")
         core.onClientsChanged()
         core.requestKeyFrame()
-        // reader: detect disconnects (client never sends anything after the request)
+        // клиент после запроса ничего не шлёт, так что чтением я только ловлю момент отключения
         Thread({
             try { while (sock.getInputStream().read() >= 0) {} } catch (_: Exception) {}
             client.close()
@@ -223,8 +217,6 @@ class StreamServer(private val core: Core) {
         }
     }
 
-    // ------------------------------------------------------------- clients
-
     class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean) {
         private val queue = LinkedBlockingDeque<ByteArray>()
         private val queued = AtomicLong(0)
@@ -247,7 +239,7 @@ class StreamServer(private val core: Core) {
                 waitingKey = false
             }
             if (queued.get() > MAX_QUEUE_BYTES) {
-                // network can't keep up: drop until next keyframe to bound latency
+                // сеть не успевает: выкидываю кадры до следующего ключевого, чтобы задержка не росла
                 waitingKey = true
                 keyRequested = true
                 return
@@ -288,7 +280,7 @@ class StreamServer(private val core: Core) {
 
         fun close() {
             closed = true
-            queue.offer(ByteArray(0)) // wake writer
+            queue.offer(ByteArray(0))
             try { sock.close() } catch (_: Exception) {}
         }
     }

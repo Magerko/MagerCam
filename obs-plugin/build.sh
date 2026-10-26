@@ -1,6 +1,6 @@
 #!/bin/sh
-# Сборка magercam.dll через llvm-mingw (MSVC не нужен).
-# Подготовка зависимостей: см. obs-plugin/setup-deps.sh
+# Собираю magercam.dll через llvm-mingw, MSVC мне тут не нужен.
+# Запуск: sh obs-plugin/build.sh, зависимости сначала готовлю через obs-plugin/setup-deps.sh
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DEPS="${MC_DEPS:-/c/mc-build}"

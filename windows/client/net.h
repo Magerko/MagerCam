@@ -1,4 +1,3 @@
-/* Networking with the phone: TCP/HTTP helpers, UDP discovery, ADB (USB mode), tiny JSON reader. */
 #pragma once
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -33,16 +32,15 @@ struct found_device {
 int discovery_run(int timeout_ms, struct found_device *out, int max);
 
 bool find_adb(const char *configured, char *out, size_t sz);
-/* Sets up `adb forward tcp:port tcp:port`. On failure writes a message (UTF-8) into err. */
+/* при ошибке кладу в err текст для пользователя в UTF-8 */
 bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz);
 
-/* ---- tiny JSON (enough for the phone status) ---- */
 enum json_type { JSON_NULL, JSON_BOOL, JSON_NUM, JSON_STR, JSON_ARR, JSON_OBJ };
 struct json {
 	enum json_type type;
-	char *key;    /* member name inside an object */
-	char *str;    /* JSON_STR */
-	double num;   /* JSON_NUM / JSON_BOOL */
+	char *key;
+	char *str;
+	double num;   /* для JSON_BOOL тоже здесь, 0 или 1 */
 	struct json *child, *next;
 };
 struct json *json_parse(const char *text);
@@ -52,6 +50,5 @@ const char *json_str(const struct json *obj, const char *key, const char *def);
 double json_num(const struct json *obj, const char *key, double def);
 bool json_bool(const struct json *obj, const char *key, bool def);
 
-/* UTF-8 <-> UTF-16 */
-wchar_t *utf8_to_wide(const char *s); /* free() the result */
+wchar_t *utf8_to_wide(const char *s); /* результат освобождаю через free() */
 void wide_to_utf8(const wchar_t *w, char *out, size_t sz);

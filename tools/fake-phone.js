@@ -1,5 +1,5 @@
-// Эмулятор телефона MagerCam для проверки плагина OBS без телефона.
-// Генерирует тестовую картинку + тон 440 Гц через ffmpeg и отдаёт их по протоколу docs/PROTOCOL.md.
+// Притворяюсь телефоном MagerCam, чтобы проверять плагин OBS без настоящего телефона.
+// Тестовую картинку и тон 440 Гц генерирую через ffmpeg и отдаю по протоколу docs/PROTOCOL.md.
 // Запуск: node tools/fake-phone.js [port]
 'use strict';
 const net = require('net');
@@ -49,7 +49,6 @@ function applyParams(q) {
   }
 }
 
-// Splits an Annex-B byte stream into NAL units.
 function* nals(buf) {
   let i = 0, start = -1;
   while (i + 3 <= buf.length) {
@@ -91,7 +90,7 @@ function startStream(sock, query) {
   vf.stdout.on('data', (d) => {
     vbuf = Buffer.concat([vbuf, d]);
     const units = [...nals(vbuf)];
-    // keep last (possibly incomplete) NAL in buffer
+    // последний NAL может быть недописан, поэтому держу его в буфере до следующего куска
     const last = units.pop();
     vbuf = last ? Buffer.from(last) : Buffer.alloc(0);
     for (const n of units) {
@@ -109,7 +108,7 @@ function startStream(sock, query) {
   let abuf = Buffer.alloc(0);
   af.stdout.on('data', (d) => {
     abuf = Buffer.concat([abuf, d]);
-    while (abuf.length >= 1920) { // 20 ms
+    while (abuf.length >= 1920) { // 1920 байт — это 20 мс моно s16 на 48 кГц
       const chunk = abuf.subarray(0, 1920); abuf = abuf.subarray(1920);
       if (state.audio) send(packet(4, Buffer.from(chunk), nowUs() - 20000, false));
     }

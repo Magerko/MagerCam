@@ -68,7 +68,8 @@ void vcam_stop(void)
 	}
 }
 
-/* The media source creates the mapping when an application starts reading the camera. */
+/* общую память создаёт media source, только когда приложение начинает читать камеру,
+ * поэтому открыть её получается не сразу и я пробую раз в полсекунды */
 static bool open_shm(void)
 {
 	if (g_base)
@@ -116,7 +117,7 @@ void vcam_write(const struct nv12 *src, int rot, bool mirror, bool fill)
 	struct nv12 d = {g_tmp, g_tmp + (size_t)w * hh, w, w, w, hh};
 	nv12_transform(src, &d, rot, mirror, fill);
 
-	/* seqlock publish */
+	/* публикую через seqlock: пока seq нечётный, кадр пишется и читатель его не берёт */
 	InterlockedIncrement((volatile LONG *)&h->seq);
 	MemoryBarrier();
 	memcpy(mcv_frame(g_base), g_tmp, (size_t)w * hh * 3 / 2);

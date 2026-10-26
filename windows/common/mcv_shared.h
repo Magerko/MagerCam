@@ -1,13 +1,13 @@
 /*
- * Shared memory between MagerCam.exe (writer) and the virtual camera media source
- * (magercam-vcam.dll, loaded by the Windows Frame Server service).
+ * Общая память между MagerCam.exe (пишет кадры) и медиаисточником виртуальной камеры
+ * (magercam-vcam.dll, его грузит служба Frame Server).
  *
- * The media source runs as LOCAL SERVICE, which may create objects in the Global\ namespace,
- * while a normal user process may not. So the DLL creates the mapping (with a DACL that lets the
- * user's client open it) and the client opens it whenever an application is watching the camera.
+ * Источник работает под LOCAL SERVICE и может создавать объекты в Global\, а обычный
+ * пользовательский процесс не может. Поэтому маппинг создаёт DLL, с DACL, которая пускает клиента,
+ * а клиент только открывает его, пока какое-то приложение смотрит в камеру.
  *
- * Frame exchange is a seqlock: the writer makes `seq` odd, writes the NV12 frame, makes it even.
- * The reader copies the frame and retries if `seq` changed or was odd.
+ * Кадры передаю через seqlock: писатель делает `seq` нечётным, пишет кадр NV12, делает чётным.
+ * Читатель копирует кадр и повторяет попытку, если `seq` был нечётным или изменился.
  */
 #pragma once
 #include <stdint.h>
@@ -24,18 +24,17 @@
 struct mcv_header {
 	uint32_t magic;
 	uint32_t version;
-	/* written by the media source */
-	volatile uint32_t want_w, want_h; /* format the application picked */
-	volatile int32_t streaming;      /* 1 while an application is reading frames */
+	/* пишет медиаисточник */
+	volatile uint32_t want_w, want_h; /* формат, который выбрало приложение */
+	volatile int32_t streaming;      /* 1, пока приложение читает кадры */
 	volatile uint32_t source_pid;
-	/* written by the client */
-	volatile int32_t seq;            /* seqlock */
-	volatile uint32_t width, height; /* NV12, stride == width */
-	volatile int64_t writer_tick;    /* GetTickCount64() of the last frame */
+	/* пишет клиент */
+	volatile int32_t seq;            /* счётчик seqlock, нечётный во время записи */
+	volatile uint32_t width, height; /* NV12, шаг строки равен ширине */
+	volatile int64_t writer_tick;    /* GetTickCount64() последнего кадра, по нему понимаю, жив ли клиент */
 	volatile uint32_t writer_pid;
 };
 
-/* Frame data starts at MCV_HEADER_SIZE. */
 static inline uint8_t *mcv_frame(void *base)
 {
 	return (uint8_t *)base + MCV_HEADER_SIZE;

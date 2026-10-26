@@ -35,8 +35,8 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * One selectable lens. [id] is the key used in settings and the protocol: a plain Camera2 id, or
- * "logicalId:physicalId" for a lens that is only reachable through a logical multi-camera.
+ * [id] — ключ объектива в настройках и протоколе: обычный id Camera2 или "logicalId:physicalId",
+ * если до объектива можно добраться только через логическую мультикамеру.
  */
 data class CameraInfo(
     val id: String,
@@ -47,9 +47,9 @@ data class CameraInfo(
 )
 
 /**
- * Owns the Camera2 device. Opens the camera only while somebody needs frames:
- * the on-screen preview, a /stream client (H.264 encoder) or a /video client (MJPEG).
- * All camera work happens on a dedicated handler thread.
+ * Камеру открываю только пока кадры кому-то нужны: превью на экране, клиенту /stream (H.264)
+ * или /video (MJPEG). Без зрителя держать её открытой незачем, она греет телефон и садит батарею.
+ * Вся работа с камерой идёт на отдельном потоке [handler], состояние трогаю только оттуда.
  */
 class CameraEngine(private val ctx: Context, private val settings: Settings, private val listener: Listener) {
     interface Listener {
@@ -67,18 +67,16 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     private val encoder = VideoEncoder { t, p, k -> listener.onEncoderPacket(t, p, k) }
 
-    // demands (camera thread)
     private var streamDemand = false
     private var mjpegDemand = false
     private var previewSurface: Surface? = null
     private var previewSurfaceSize: Size? = null
 
-    // camera state (camera thread)
     private var device: CameraDevice? = null
     private var deviceId: String? = null
     private var opening = false
     private var chars: CameraCharacteristics? = null
-    // characteristics of the lens that produces the frames (differs from [chars] for a physical lens)
+    // характеристики объектива, который реально даёт кадры; у физического объектива они отличаются от [chars]
     private var streamChars: CameraCharacteristics? = null
     private var physicalId: String? = null
     private var session: CameraCaptureSession? = null
@@ -92,7 +90,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var dropMjpeg = false
     private var lastJpegAt = 0L
 
-    // published state (read from any thread)
     @Volatile var activeSize: Size? = null; private set
     @Volatile var activeFps = 0; private set
     @Volatile var desiredPreviewSize: Size? = null; private set
@@ -113,8 +110,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     private val reconfigureRunnable = Runnable { doReconfigure() }
 
-    // ---------------------------------------------------------------- public API
-
     fun setStreamDemand(on: Boolean) = handler.post {
         if (streamDemand != on) { streamDemand = on; requestReconfigure() }
     }
@@ -130,7 +125,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         requestReconfigure()
     }
 
-    /** Synchronously detaches the preview surface (must finish before surfaceDestroyed returns). */
+    /** Отцепляю превью синхронно: это обязано закончиться до возврата из surfaceDestroyed. */
     fun clearPreviewSurface() {
         val latch = CountDownLatch(1)
         handler.post {
@@ -143,7 +138,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         latch.await(2, TimeUnit.SECONDS)
     }
 
-    /** Resolution / fps / camera changed. */
     fun restart() = handler.post { requestReconfigure() }
 
     fun updateControls() = handler.post { applyRepeating() }
@@ -152,7 +146,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     fun requestKeyFrame() = handler.post { encoder.requestKeyFrame() }
 
-    /** Tap-to-focus. x,y are normalized coordinates in the (unrotated) sensor image. */
+    /** x, y жду нормализованными, в координатах неповёрнутого кадра сенсора. */
     fun focusAt(x: Float, y: Float) = handler.post {
         val ch = chars ?: return@post
         val s = session ?: return@post
@@ -205,12 +199,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         } ?: list.firstOrNull { !it.front }?.id ?: list.firstOrNull()?.id ?: "0"
     }
 
-    /** Characteristics of a lens; for "logical:physical" ids those of the physical camera. */
+    /** Для id вида "logical:physical" отдаю характеристики именно физической камеры. */
     fun characteristics(id: String): CameraCharacteristics? = try {
         manager.getCameraCharacteristics(id.substringAfter(':'))
     } catch (_: Exception) { null }
-
-    // ---------------------------------------------------------------- internals
 
     private fun listCameras(): List<CameraInfo> {
         class Lens(val openId: String, val physId: String?, val ch: CameraCharacteristics, val logical: Boolean)
@@ -224,7 +216,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                     ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA) == true
                 lenses += Lens(id, null, c, logical)
                 if (!logical) continue
-                // Lenses hidden behind a logical camera (typical for ultra-wide / tele on many phones)
+                // на многих телефонах ширик и телевик спрятаны за логической камерой, достаю их отдельно
                 for (pid in c.physicalCameraIds) {
                     if (pid in ids || lenses.any { it.physId == pid }) continue
                     val pc = try { manager.getCameraCharacteristics(pid) } catch (_: Exception) { continue }
@@ -265,7 +257,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         return !map.getOutputSizes(SurfaceTexture::class.java).isNullOrEmpty()
     }
 
-    /** 35 mm-equivalent focal length, used to tell wide / main / tele lenses apart. */
+    /** По ЭФР в 35 мм отличаю ширик, основной и телевик; 43.27 — диагональ 35-мм кадра. */
     private fun equivFocal(ch: CameraCharacteristics): Float? {
         val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return null
         val phys = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
@@ -382,7 +374,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                 override fun onConfigureFailed(s: CameraCaptureSession) {
                     if (gen != sessionGen) return
                     Log.w(TAG, "session configure failed with ${surfaces.size} surfaces")
-                    // Too many streams for this device: give up the least important consumer and retry.
+                    // устройство не тянет столько потоков: жертвую наименее важным потребителем и пробую снова
                     when {
                         surfaces.size > 1 && ps != null && surfaces.contains(ps) && !dropPreview -> dropPreview = true
                         imageReader != null && surfaces.size > 1 -> dropMjpeg = true
@@ -466,7 +458,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         }
     }
 
-    /** [sc]: the lens producing frames, [ch]: the opened device (same unless a physical lens is used). */
+    /** [sc] — объектив, который даёт кадры, [ch] — открытое устройство; различаются только для физического объектива. */
     private fun readCaps(id: String, sc: CameraCharacteristics, ch: CameraCharacteristics) {
         currentCameraId = id
         isFront = sc.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
@@ -476,7 +468,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         hasFlash = ch.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true ||
             sc.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
         if (physicalId != null) {
-            // zoom of the logical camera would switch lenses again; a fixed lens has none
+            // зум логической камеры снова переключил бы объективы, поэтому у фиксированного объектива его нет
             zoomMin = 1f; zoomMax = 1f
         } else if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null) {
             val r = ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)!!
@@ -542,7 +534,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         return ranges.minByOrNull { abs(it.upper - fps) } ?: Range(fps, fps)
     }
 
-    /** Area in which 3A regions are expressed: full active array with zoom ratio, crop region otherwise. */
+    /** С CONTROL_ZOOM_RATIO области 3A задаются во всём active array, без него — внутри crop region. */
     private fun regionBase(active: Rect): Rect {
         if (Build.VERSION.SDK_INT >= 30 && chars?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
             return Rect(0, 0, active.width(), active.height())
@@ -579,7 +571,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         fpsRange?.let { b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
 
-        // exposure
         b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
         b.set(CaptureRequest.FLASH_MODE,
             if (settings.torch && hasFlash) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
@@ -599,7 +590,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         }
         if (abModes.contains(ab)) b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, ab)
 
-        // white balance
         val awbModes = ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
         val awb = when (settings.wb) {
             "daylight" -> CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT
@@ -613,7 +603,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         b.set(CaptureRequest.CONTROL_AWB_MODE, if (awbModes.contains(awb)) awb else CameraMetadata.CONTROL_AWB_MODE_AUTO)
         b.set(CaptureRequest.CONTROL_AWB_LOCK, settings.awbLock)
 
-        // focus
         val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
         val minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
         fun has(m: Int) = afModes.contains(m)
@@ -646,9 +635,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val maxAe = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
         if (maxAe > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, if (region != null && settings.focus == "auto") arrayOf(region) else null)
 
-        // zoom (not for a fixed physical lens)
         if (physicalId != null) {
-            // leave the logical camera at its default zoom
+            // физическому объективу зум не трогаю, логическая камера остаётся на своём зуме по умолчанию
         } else if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null) {
             b.set(CaptureRequest.CONTROL_ZOOM_RATIO, settings.zoom.coerceIn(zoomMin, zoomMax))
         } else {
@@ -657,7 +645,6 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             }
         }
 
-        // stabilization
         val vs = ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
         if (vs.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)) {
             b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -670,13 +657,11 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         }
     }
 
-    // ---------------------------------------------------------------- MJPEG
-
     private fun onImage(reader: ImageReader) {
         val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
         try {
             val now = SystemClock.elapsedRealtime()
-            if (now - lastJpegAt < 45) return // ~20 fps max
+            if (now - lastJpegAt < 45) return // не чаще ~20 кадров в секунду
             lastJpegAt = now
             val nv21 = toNv21(img)
             val out = ByteArrayOutputStream(img.width * img.height / 4)

@@ -8,7 +8,7 @@ import android.media.MediaRecorder
 import android.os.SystemClock
 import android.util.Log
 
-/** 48 kHz mono PCM capture. Timestamps share the clock with camera frames (see [useBootTime]). */
+/** Метки времени звука беру с тех же часов, что и у кадров камеры (см. [useBootTime]), иначе звук уедет от видео. */
 class AudioCapture(private val sink: (pcm: ByteArray, ptsUs: Long) -> Unit) {
     @Volatile private var running = false
     private var thread: Thread? = null
@@ -90,7 +90,7 @@ class AudioCapture(private val sink: (pcm: ByteArray, ptsUs: Long) -> Unit) {
         private const val TAG = "MC.Audio"
         const val RATE = 48000
         const val CHANNELS = 1
-        const val CHUNK_FRAMES = 960 // 20 ms
+        const val CHUNK_FRAMES = 960
         const val CHUNK_BYTES = CHUNK_FRAMES * 2 * CHANNELS
     }
 }

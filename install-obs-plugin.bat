@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-rem Устанавливает плагин MagerCam для OBS (из папки проекта или из распакованного архива релиза).
+rem Плагин беру из папки проекта, а если её нет, то из распакованного архива релиза.
 set "SRC=%~dp0dist\obs-plugin\magercam"
 if not exist "%SRC%" set "SRC=%~dp0magercam"
 set "DST=%ProgramData%\obs-studio\plugins\magercam"
@@ -19,7 +19,7 @@ if %ERRORLEVEL% GEQ 8 (
   pause
   exit /b 1
 )
-rem adb для режима USB: скачивается с официального сайта Google, если его ещё нет
+rem adb для USB в комплект не кладу, скачиваю с официального сайта Google, если его ещё нет нигде
 if exist "%DST%\data\adb\adb.exe" goto done
 if exist "%ProgramFiles%\MagerCam\adb\adb.exe" goto done
 where adb >nul 2>nul && goto done

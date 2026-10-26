@@ -1,6 +1,6 @@
 #!/bin/sh
-# Готовит всё для сборки плагина в $MC_DEPS (по умолчанию C:\mc-build):
-# llvm-mingw, заголовки libobs 32.1.0 и FFmpeg 7.1.1, import-библиотеки из DLL установленного OBS.
+# Запуск: sh obs-plugin/setup-deps.sh. Складываю всё для сборки в $MC_DEPS (по умолчанию C:\mc-build):
+# llvm-mingw, заголовки libobs 32.1.0 и FFmpeg 7.1.1, а import-библиотеки делаю из DLL установленного OBS.
 set -e
 DEPS="${MC_DEPS:-/c/mc-build}"
 OBS_BIN="${OBS_BIN:-/c/Program Files/obs-studio/bin/64bit}"

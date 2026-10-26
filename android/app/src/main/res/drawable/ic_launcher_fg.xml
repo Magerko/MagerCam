@@ -1,11 +1,8 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <!-- camera body -->
     <path android:fillColor="#FFFFFF"
         android:pathData="M30,40 L44,40 L48,34 L60,34 L64,40 L78,40 Q82,40 82,44 L82,72 Q82,76 78,76 L30,76 Q26,76 26,72 L26,44 Q26,40 30,40 Z" />
-    <!-- lens -->
     <path android:fillColor="#1B1B1F" android:pathData="M54,58 m-13,0 a13,13 0 1,0 26,0 a13,13 0 1,0 -26,0" />
     <path android:fillColor="#FFB300" android:pathData="M54,58 m-8,0 a8,8 0 1,0 16,0 a8,8 0 1,0 -16,0" />
-    <!-- live dot -->
     <path android:fillColor="#FF3D3D" android:pathData="M74,47 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
 </vector>

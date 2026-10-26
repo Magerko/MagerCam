@@ -9,8 +9,6 @@ import android.os.Bundle
 import android.util.Log
 import android.view.Surface
 
-/** H.264 encoder fed by a camera Surface. Emits Annex-B config/frame packets. */
-/** [sink] receives ready-to-send protocol packets (16-byte header + payload). */
 class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean) -> Unit) {
     private var codec: MediaCodec? = null
     var inputSurface: Surface? = null
@@ -119,7 +117,6 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
                         buf.get(data)
                         emitConfig(data)
                     } else {
-                        // single copy: encoder buffer -> packet
                         val key = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
                         val pkt = ByteArray(16 + info.size)
                         StreamServer.writeHeader(pkt, StreamServer.PKT_VIDEO_FRAME, info.size, info.presentationTimeUs, key)

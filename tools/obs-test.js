@@ -1,4 +1,4 @@
-// Автотест плагина через obs-websocket v5: создаёт источник MagerCam, снимает скриншоты, крутит настройки.
+// Гоняю плагин через obs-websocket v5: создаю источник MagerCam, снимаю скриншоты и кручу настройки.
 // Запуск: node tools/obs-test.js [ws://127.0.0.1:4466] [password] [outdir]
 'use strict';
 const crypto = require('crypto');

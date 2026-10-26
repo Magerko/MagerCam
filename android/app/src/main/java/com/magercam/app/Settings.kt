@@ -4,7 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
 
-/** Persistent app settings. All fields are read/written from several threads, hence @Volatile. */
+/** Поля читаю и пишу из нескольких потоков, поэтому все они @Volatile. */
 class Settings(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("magercam", Context.MODE_PRIVATE)
 
@@ -20,7 +20,6 @@ class Settings(context: Context) {
     @Volatile var keepScreenOn = prefs.getBoolean("keep_screen_on", true)
     @Volatile var orientationMode = prefs.getString("orientation_mode", "auto") ?: "auto"
 
-    // camera controls
     @Volatile var torch = false
     @Volatile var zoom = prefs.getFloat("zoom", 1f)
     @Volatile var ev = prefs.getFloat("ev", 0f)

@@ -20,9 +20,6 @@ void wide_to_utf8(const wchar_t *w, char *out, size_t sz)
 		out[0] = 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Sockets                                                                   */
-
 SOCKET tcp_connect(const char *host, int port, int timeout_ms)
 {
 	struct addrinfo hints = {0}, *res = NULL;
@@ -144,9 +141,6 @@ void url_encode(char *out, size_t outsz, const char *v)
 	out[o] = 0;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Discovery                                                                 */
-
 int discovery_run(int timeout_ms, struct found_device *found, int max)
 {
 	SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -165,7 +159,8 @@ int discovery_run(int timeout_ms, struct found_device *found, int max)
 	dst.sin_addr.s_addr = INADDR_BROADCAST;
 	sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
 
-	/* directed broadcast on every adapter: 255.255.255.255 goes out of one NIC only */
+	/* шлю ещё и направленный broadcast в каждый адаптер: 255.255.255.255 Windows
+	 * отправляет только через одну сетевую карту */
 	ULONG size = 32 * 1024;
 	IP_ADAPTER_ADDRESSES *addrs = malloc(size);
 	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
@@ -229,9 +224,6 @@ int discovery_run(int timeout_ms, struct found_device *found, int max)
 	closesocket(sock);
 	return count;
 }
-
-/* ------------------------------------------------------------------------- */
-/* ADB                                                                       */
 
 static bool run_process(const char *exe, const char *args, char *out, size_t outsz, DWORD timeout_ms)
 {
@@ -321,7 +313,7 @@ bool find_adb(const char *configured, char *out, size_t sz)
 		}
 	}
 	wchar_t path[MAX_PATH * 2];
-	/* bundled next to MagerCam.exe */
+	/* сначала ищу adb, который лежит рядом с MagerCam.exe */
 	DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
 	if (n) {
 		wchar_t *slash = wcsrchr(path, L'\\');
@@ -365,7 +357,7 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 		snprintf(err, errsz, "USB: не удалось запустить adb");
 		return false;
 	}
-	/* candidates in state "device": USB serials (no ':') first, then wireless */
+	/* беру устройства в состоянии "device": сначала USB (в серийнике нет ':'), потом беспроводные */
 	char cand[8][128];
 	int ncand = 0;
 	bool unauthorized = false;
@@ -390,7 +382,7 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 						  : "USB: телефон не найден (включите отладку по USB)");
 		return false;
 	}
-	/* several devices: take the one where MagerCam is running */
+	/* если устройств несколько, выбираю то, где запущен MagerCam */
 	const char *serial = cand[0];
 	if (ncand > 1) {
 		for (int i = 0; i < ncand; i++) {
@@ -410,9 +402,6 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 	}
 	return true;
 }
-
-/* ------------------------------------------------------------------------- */
-/* JSON                                                                      */
 
 struct jp {
 	const char *p;

@@ -1,5 +1,5 @@
-/* Client side of the virtual camera: registers the "MagerCam" camera for this session and
- * writes frames into the shared memory read by magercam-vcam.dll. */
+/* Камеру "MagerCam" регистрирую только на время сессии, а кадры пишу в общую память,
+ * откуда их забирает magercam-vcam.dll внутри Frame Server. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -7,15 +7,14 @@
 
 enum vcam_state {
 	VCAM_OFF,
-	VCAM_NOT_INSTALLED, /* DLL not registered: run the installer */
-	VCAM_UNSUPPORTED,   /* Windows 10 or older */
+	VCAM_NOT_INSTALLED, /* DLL не зарегистрирована, нужен установщик */
+	VCAM_UNSUPPORTED,   /* Windows 10 и более ранние: там нет MFCreateVirtualCamera */
 	VCAM_FAILED,
 	VCAM_READY,
 };
 
 enum vcam_state vcam_start(long *hr_out);
 void vcam_stop(void);
-/* true while some application reads the camera */
 bool vcam_in_use(void);
-/* Rotates/mirrors/fits the frame into the size the application asked for and publishes it. */
+/* кадр подгоняю под размер, который запросило приложение, а не под размер с телефона */
 void vcam_write(const struct nv12 *src, int rot, bool mirror, bool fill);

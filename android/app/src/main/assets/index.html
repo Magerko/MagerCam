@@ -94,7 +94,7 @@ function render() {
   $('name').textContent = st.name;
   $('st').textContent = `${st.w}×${st.h} @${st.fps} · OBS: ${st.clients} · 🔋${st.battery}%${st.charging ? '⚡' : ''} · ${Math.round(st.temp)}°C`;
   $('err').textContent = st.error || '';
-  const fresh = Date.now() - busy > 1500; // don't fight the user while dragging
+  const fresh = Date.now() - busy > 1500; // пока ползунок тянут, не перетираю его значениями с телефона
   const cam = $('camera');
   if (cam.options.length !== st.cameras.length) cam.innerHTML = st.cameras.map(c => `<option value="${c.id}">${c.label}</option>`).join('');
   const res = $('res'), sizes = st.sizes || [];
@@ -148,7 +148,7 @@ $('bStab').onclick = () => set({ stab: st.stab ? 0 : 1 });
 $('bAe').onclick = () => set({ ae_lock: st.ae_lock ? 0 : 1 });
 $('bAwb').onclick = () => set({ awb_lock: st.awb_lock ? 0 : 1 });
 $('img').onclick = (e) => {
-  // click position -> unrotated sensor coordinates
+  // картинка повёрнута через CSS, поэтому перевожу точку клика обратно в координаты сенсора
   const r = e.target.getBoundingClientRect();
   let u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
   const o = (st && st.orient) || 0;

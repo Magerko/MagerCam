@@ -1,7 +1,6 @@
 #!/bin/sh
-# Builds MagerCam for Windows with llvm-mingw (see obs-plugin/setup-deps.sh):
-#   build/magercam-vcam.dll  virtual camera media source (loaded by the Frame Server service)
-#   build/MagerCam.exe       client: phone -> preview, virtual camera, audio
+# Собираю под Windows через llvm-mingw, его ставит obs-plugin/setup-deps.sh.
+# magercam-vcam.dll грузит не клиент, а служба Frame Server.
 set -e
 cd "$(dirname "$0")"
 DEPS="${MC_DEPS:-/c/mc-build}"
@@ -20,7 +19,7 @@ if [ -d client ]; then
 	echo "built: build/MagerCam.exe"
 fi
 
-# stage the distributable folder
+# в dist кладу и adb, если он уже скачан для плагина OBS
 DIST=../dist/windows
 mkdir -p "$DIST/adb"
 cp build/MagerCam.exe build/magercam-vcam.dll install.ps1 "$DIST/"

@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
-rem Устанавливает MagerCam для Windows: программу и виртуальную камеру (нужны права администратора).
-rem Работает и из папки проекта (dist\windows), и из распакованного архива релиза.
+rem Нужны права администратора: пишу в Program Files и регистрирую камеру в HKLM.
+rem install.ps1 ищу и в папке проекта (dist\windows), и рядом с собой в распакованном релизе.
 set "SRC=%~dp0dist\windows"
 if not exist "%SRC%\install.ps1" set "SRC=%~dp0."
 net session >nul 2>&1

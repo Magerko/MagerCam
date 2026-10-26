@@ -7,7 +7,7 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <stdlib.h>
 
-#define BUFFER_HNS 1000000 /* 100 ms */
+#define BUFFER_HNS 1000000 /* 100 мс */
 #define MAX_LATENCY_MS 150
 
 struct audio_out {
@@ -76,14 +76,15 @@ struct audio_out *audio_open(const wchar_t *id, int rate, int channels)
 	wf.wBitsPerSample = 16;
 	wf.nBlockAlign = (WORD)(channels * 2);
 	wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
-	/* the shared-mode engine converts our 16-bit mono to the device mix format */
+	/* в shared-режиме устройство принимает только свой mix format, поэтому прошу
+	 * движок самому переводить мои 16 бит моно (AUTOCONVERTPCM) */
 	DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 	if (FAILED(IAudioClient_Initialize(a->client, AUDCLNT_SHAREMODE_SHARED, flags, BUFFER_HNS, 0, &wf, NULL)))
 		goto fail;
 	IAudioClient_GetBufferSize(a->client, &a->frames);
 	if (FAILED(IAudioClient_GetService(a->client, &IID_IAudioRenderClient, (void **)&a->render)))
 		goto fail;
-	/* a little silence up front so network jitter does not cause underruns */
+	/* подкладываю немного тишины в начало, чтобы джиттер сети не давал провалов */
 	UINT32 pre = (UINT32)rate * 40 / 1000;
 	BYTE *buf;
 	if (pre < a->frames && SUCCEEDED(IAudioRenderClient_GetBuffer(a->render, pre, &buf)))
@@ -109,7 +110,7 @@ void audio_write(struct audio_out *a, const int16_t *pcm, int frames)
 	if (FAILED(IAudioClient_GetCurrentPadding(a->client, &pad)))
 		return;
 	if (pad > (UINT32)a->rate * MAX_LATENCY_MS / 1000)
-		return; /* too much queued: drop to keep latency low */
+		return; /* в очереди слишком много: выкидываю кусок, чтобы задержка не росла */
 	UINT32 room = a->frames - pad;
 	UINT32 n = (UINT32)frames < room ? (UINT32)frames : room;
 	BYTE *buf;

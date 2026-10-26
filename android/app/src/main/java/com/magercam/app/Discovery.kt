@@ -8,7 +8,6 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 
-/** Answers "MAGERCAM_DISCOVER" broadcasts from the OBS plugin on UDP 4849. */
 class Discovery(private val core: Core) {
     private var socket: DatagramSocket? = null
     private var thread: Thread? = null

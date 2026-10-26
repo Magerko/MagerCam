@@ -16,7 +16,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 
-/** Foreground service: keeps camera, encoder and server alive when the screen is off or the app is in background. */
+/** Держу камеру, кодер и сервер в foreground-сервисе, иначе при выключенном экране или в фоне система их прибьёт. */
 class CameraService : Service() {
     private var core: Core? = null
     private var wakeLock: PowerManager.WakeLock? = null

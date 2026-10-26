@@ -7,7 +7,7 @@
 #include <mferror.h>
 #include <wmcodecdsp.h>
 
-/* not in any mingw import library */
+/* этого CLSID нет ни в одной import-библиотеке mingw, объявляю его сам */
 static const GUID CLSID_H264Decoder = {0x62ce7e72, 0x4c71, 0x4d20, {0xb1, 0x5d, 0x45, 0x28, 0x31, 0xa8, 0x7d, 0x9d}};
 #include <stdlib.h>
 
@@ -15,7 +15,7 @@ struct decoder {
 	IMFTransform *mft;
 	decoder_frame_cb cb;
 	void *opaque;
-	IMFSample *out_sample; /* reused when the decoder does not provide samples */
+	IMFSample *out_sample; /* свой сэмпл на выход, если декодер не выдаёт их сам */
 	DWORD out_size;
 	bool provides_samples;
 	UINT32 w, h, stride, vis_w, vis_h;
@@ -28,7 +28,6 @@ static UINT64 get_u64(IMFMediaType *t, REFGUID key)
 	return v;
 }
 
-/* Picks NV12 as output and reads its geometry. */
 static HRESULT set_output_nv12(struct decoder *d)
 {
 	IMFMediaType *t = NULL;
@@ -147,7 +146,6 @@ static void emit(struct decoder *d, IMFSample *s)
 	IMFMediaBuffer_Release(b);
 }
 
-/* Pulls every frame the decoder has ready. */
 static bool drain(struct decoder *d)
 {
 	for (;;) {

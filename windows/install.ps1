@@ -1,6 +1,6 @@
-﻿# Installs the MagerCam Windows client and registers the virtual camera (run elevated).
-#   -Src        folder with MagerCam.exe, magercam-vcam.dll and adb\ (default: dist\windows next to this repo)
-#   -Uninstall  remove everything
+﻿# Ставлю клиент MagerCam и регистрирую виртуальную камеру, нужны права администратора.
+#   -Src        папка с MagerCam.exe, magercam-vcam.dll и adb\ (по умолчанию dist\windows рядом с репозиторием)
+#   -Uninstall  удалить всё
 param(
 	[string]$Src = (Join-Path $PSScriptRoot '..\dist\windows'),
 	[switch]$Uninstall
@@ -18,7 +18,7 @@ function Copy-Locked([string]$from, [string]$to) {
 	try {
 		Copy-Item -Force $from $to
 	} catch {
-		# the Frame Server keeps the DLL loaded while a camera app is open
+		# Frame Server держит DLL загруженной, пока открыто любое приложение с камерой, поэтому перезапускаю службу
 		Write-Host 'Файл занят службой камер Windows, перезапускаю её...'
 		Stop-Service FrameServerMonitor -Force -ErrorAction SilentlyContinue
 		Stop-Service FrameServer -Force -ErrorAction SilentlyContinue
@@ -27,8 +27,8 @@ function Copy-Locked([string]$from, [string]$to) {
 	}
 }
 
-# only an installed copy blocks the files; a copy started from elsewhere (e.g. the one that
-# launched this installer) keeps running
+# закрываю только установленную копию, она держит файлы; копия из другого места
+# (например, та, что запустила установщик) пусть работает
 function Stop-Installed {
 	Get-Process MagerCam -ErrorAction SilentlyContinue |
 		Where-Object { $_.Path -and $_.Path.StartsWith($dest, [StringComparison]::OrdinalIgnoreCase) } |
@@ -61,7 +61,7 @@ if ($Src -ne $dest.TrimEnd('\')) {
 	}
 }
 
-# adb for USB mode: not redistributed with MagerCam, fetched from Google's official platform-tools
+# adb для USB я не распространяю вместе с MagerCam, а скачиваю официальные platform-tools с сайта Google
 $adbDir = Join-Path $dest 'adb'
 if (-not (Test-Path (Join-Path $adbDir 'adb.exe'))) {
 	try {
@@ -82,7 +82,7 @@ if (-not (Test-Path (Join-Path $adbDir 'adb.exe'))) {
 	}
 }
 
-# COM registration of the media source (HKLM: the Frame Server service cannot see HKCU)
+# регистрирую COM-объект именно в HKLM: служба Frame Server не видит HKCU пользователя
 New-Item -Force $key -Value 'MagerCam Virtual Camera' | Out-Null
 New-Item -Force "$key\InprocServer32" -Value (Join-Path $dest 'magercam-vcam.dll') | Out-Null
 New-ItemProperty -Force -Path "$key\InprocServer32" -Name ThreadingModel -Value 'Both' | Out-Null

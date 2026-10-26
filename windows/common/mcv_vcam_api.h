@@ -1,12 +1,12 @@
 /*
- * Minimal C declaration of the Windows 11 virtual camera API (mfvirtualcamera.h is not part of
- * mingw). MFCreateVirtualCamera is resolved at run time so the program still starts on Windows 10.
+ * Минимальное C-объявление API виртуальной камеры Windows 11: mfvirtualcamera.h в mingw нет.
+ * MFCreateVirtualCamera ищу во время выполнения, чтобы программа запускалась и на Windows 10.
  */
 #pragma once
 #include <windows.h>
 #include <mfobjects.h>
 
-/* {6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E41}: CLSID of the media source in magercam-vcam.dll */
+/* CLSID медиаисточника из magercam-vcam.dll, должен совпадать с CLSID_MagerCamSource в vcam.cpp */
 #define MCV_CLSID_STR L"{6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E41}"
 #define MCV_FRIENDLY_NAME L"MagerCam"
 
@@ -20,7 +20,7 @@ typedef struct IMcVirtualCameraVtbl {
 	HRESULT(STDMETHODCALLTYPE *QueryInterface)(IMcVirtualCamera *, REFIID, void **);
 	ULONG(STDMETHODCALLTYPE *AddRef)(IMcVirtualCamera *);
 	ULONG(STDMETHODCALLTYPE *Release)(IMcVirtualCamera *);
-	/* IMFAttributes: 30 methods, unused here */
+	/* IMFAttributes: 30 методов, мне они не нужны, но место в vtable должно совпадать */
 	void *attributes[30];
 	/* IMFVirtualCamera */
 	HRESULT(STDMETHODCALLTYPE *AddDeviceSourceInfo)(IMcVirtualCamera *, LPCWSTR);

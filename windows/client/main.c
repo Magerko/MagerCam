@@ -1,7 +1,3 @@
-/*
- * MagerCam for Windows: connects to the phone (Wi-Fi or USB), shows a preview, feeds the
- * "MagerCam" virtual camera and optionally plays the phone microphone into a playback device.
- */
 #define COBJMACROS
 #include "net.h"
 #include <windows.h>
@@ -38,21 +34,18 @@ enum {
 	ID_TRAY_OPEN = 300, ID_TRAY_CONNECT, ID_TRAY_EXIT,
 };
 
-/* ------------------------------------------------------------------------- */
-/* State                                                                     */
-
 struct settings {
-	int conn; /* 0 Wi-Fi, 1 USB */
+	int conn; /* 0 — Wi-Fi, 1 — USB */
 	char host[128];
 	int port;
 	char camera[64];
 	int width, height, fps, bitrate_kbps;
-	int rotation; /* -1 auto */
+	int rotation; /* -1 — беру ориентацию с телефона */
 	bool mirror, fill;
 	bool audio;
 	wchar_t audio_dev[256];
 	bool autoconnect;
-	bool to_tray; /* close / minimize hides the window to the notification area */
+	bool to_tray; /* закрытие и сворачивание прячут окно в трей */
 };
 
 struct cam_entry {
@@ -83,19 +76,20 @@ static struct {
 	HFONT font, font_bold;
 	int dpi;
 
+	/* cfg, ph, net_status, connected, превью и sock трогаю только под lock */
 	CRITICAL_SECTION lock;
-	struct settings cfg;       /* guarded by lock */
-	struct phone_status ph;    /* guarded by lock */
-	wchar_t net_status[256];   /* guarded by lock */
-	bool connected;            /* guarded by lock */
-	uint32_t *preview_bgra;    /* guarded by lock */
-	bool preview_valid;        /* guarded by lock */
+	struct settings cfg;
+	struct phone_status ph;
+	wchar_t net_status[256];
+	bool connected;
+	uint32_t *preview_bgra;
+	bool preview_valid;
 
 	volatile bool want_connect;
 	volatile bool quit;
 	volatile LONG gen;
 	HANDLE wake, net_thread;
-	SOCKET sock;               /* guarded by lock */
+	SOCKET sock;
 
 	enum vcam_state vcam;
 	long vcam_hr;
@@ -110,9 +104,6 @@ static struct {
 } app;
 
 #define S(x) MulDiv((x), app.dpi, 96)
-
-/* ------------------------------------------------------------------------- */
-/* Settings                                                                  */
 
 static void ini_get(const wchar_t *key, const wchar_t *def, wchar_t *out, int n)
 {
@@ -144,7 +135,8 @@ static void load_settings(void)
 		CreateDirectoryW(app.ini, NULL);
 		_snwprintf(app.ini, MAX_PATH, L"%ls\\MagerCam\\client.ini", dir);
 		if (GetFileAttributesW(app.ini) == INVALID_FILE_ATTRIBUTES) {
-			/* UTF-16 file so non-ASCII values survive */
+			/* создаю файл заранее в UTF-16 с BOM: только тогда WritePrivateProfileStringW
+			 * пишет Unicode, иначе кириллица в настройках ломается */
 			HANDLE f = CreateFileW(app.ini, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
 			if (f != INVALID_HANDLE_VALUE) {
 				DWORD w;
@@ -229,9 +221,6 @@ static void set_autostart(bool on)
 	}
 	RegCloseKey(k);
 }
-
-/* ------------------------------------------------------------------------- */
-/* Network session                                                           */
 
 static void set_net_status(const wchar_t *fmt, ...)
 {
@@ -324,7 +313,7 @@ struct session {
 	struct decoder *dec;
 	struct audio_out *aout;
 	int a_rate, a_ch;
-	uint8_t *small; /* preview NV12 */
+	uint8_t *small;
 	ULONGLONG last_preview;
 	int frames;
 	ULONGLONG fps_t0;
@@ -351,7 +340,7 @@ static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stri
 		s->fps_count = 0;
 		s->fps_t0 = now;
 	}
-	/* preview: ~25 fps is plenty and keeps CPU low */
+	/* превью хватает ~25 кадров в секунду, так меньше грузится процессор */
 	if (now - s->last_preview < 38 || IsIconic(app.wnd) || !IsWindowVisible(app.wnd))
 		return;
 	s->last_preview = now;
@@ -457,7 +446,7 @@ static void stream_session(const struct settings *cfg, LONG gen)
 
 		switch (type) {
 		case PKT_VIDEO_CONFIG:
-			/* new encoder session (resolution / camera change): fresh decoder */
+			/* конфиг приходит заново при смене разрешения или камеры, поэтому декодер пересоздаю */
 			decoder_destroy(s.dec);
 			s.dec = decoder_create(on_frame, &s);
 			if (!s.dec) {
@@ -470,7 +459,7 @@ static void stream_session(const struct settings *cfg, LONG gen)
 		case PKT_VIDEO_FRAME:
 			if (s.dec && !decoder_feed(s.dec, payload, len, pts)) {
 				decoder_destroy(s.dec);
-				s.dec = NULL; /* wait for the next config */
+				s.dec = NULL; /* жду следующий конфиг */
 			}
 			break;
 		case PKT_AUDIO_CONFIG:
@@ -571,7 +560,7 @@ static void reconnect(void)
 	SetEvent(app.wake);
 }
 
-/* /api/set requests run on short-lived threads so the UI never blocks */
+/* запросы /api/set гоняю в коротких потоках, чтобы интерфейс не подвисал */
 struct control_req {
 	char host[128];
 	int port;
@@ -611,9 +600,6 @@ static void send_control(const char *fmt, ...)
 		free(r);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Discovery and installer (worker threads)                                  */
-
 static DWORD WINAPI discover_main(void *arg)
 {
 	(void)arg;
@@ -652,9 +638,6 @@ static DWORD WINAPI install_main(void *arg)
 	PostMessageW(app.wnd, WM_APP_INSTALLED, code, 0);
 	return 0;
 }
-
-/* ------------------------------------------------------------------------- */
-/* UI                                                                        */
 
 static HWND mk(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id)
 {
@@ -767,7 +750,6 @@ static int pos_from_zoom(double z, double zmin, double zmax)
 	return (int)lround(100.0 * log(z / zmin) / log(zmax / zmin));
 }
 
-/* Refreshes the controls that mirror the phone state. */
 static void sync_phone_controls(void)
 {
 	EnterCriticalSection(&app.lock);
@@ -777,7 +759,6 @@ static void sync_phone_controls(void)
 	LeaveCriticalSection(&app.lock);
 	app.updating_ui = true;
 
-	/* camera list */
 	SendMessageW(app.camera, CB_RESETCONTENT, 0, 0);
 	if (ph.valid && ph.ncams > 0) {
 		int sel = -1;
@@ -869,7 +850,6 @@ static void build_ui(void)
 			  12, 524, PREVIEW_W, 40);
 	(void)hint;
 
-	/* values */
 	static const struct { const wchar_t *t; int w, h; } res[] = {
 		{L"640×480", 640, 480}, {L"1280×720", 1280, 720}, {L"1920×1080", 1920, 1080}};
 	for (int i = 0; i < 3; i++)
@@ -919,15 +899,13 @@ static void read_host_field(void)
 {
 	wchar_t w[128];
 	GetWindowTextW(app.host, w, 128);
-	/* "Имя — 192.168.1.5" from the discovery list: keep the address */
+	/* из списка поиска приходит «Имя — 192.168.1.5», мне нужен только адрес */
 	wchar_t *dash = wcsrchr(w, L' ');
 	const wchar_t *ip = dash ? dash + 1 : w;
 	EnterCriticalSection(&app.lock);
 	wide_to_utf8(ip, app.cfg.host, sizeof(app.cfg.host));
 	LeaveCriticalSection(&app.lock);
 }
-
-/* ---- notification area icon ---- */
 
 static void tray_add(void)
 {
@@ -1107,7 +1085,7 @@ static void on_command(int id, int code)
 		LeaveCriticalSection(&app.lock);
 		save_settings();
 		if (app.want_connect)
-			reconnect(); /* the phone only sends audio when asked for it at connect time */
+			reconnect(); /* звук телефон шлёт, только если попросить его при подключении */
 		break;
 	}
 	case ID_AUDIO_DEV:
@@ -1229,7 +1207,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 				_snwprintf(b, 64, L"Экспозиция: %+.1f", ev);
 				SetWindowTextW(app.ev_label, b);
 			}
-			/* let the phone confirm before the status may move the sliders again */
+			/* даю телефону подтвердить значение, иначе старый статус дёрнет ползунки обратно */
 			SetTimer(w, TIMER_CONTROLS + 10, 1500, NULL);
 		} else if (wp == TIMER_CONTROLS + 10) {
 			KillTimer(w, wp);
@@ -1292,7 +1270,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 		return 0;
 	}
 	if (msg == app.taskbar_created && msg) {
-		tray_add(); /* Explorer restarted */
+		tray_add(); /* Проводник перезапустился, иконку в трей добавляю заново */
 		return 0;
 	}
 	return DefWindowProcW(w, msg, wp, lp);
@@ -1301,7 +1279,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 {
 	(void)prev;
-	/* one instance: the virtual camera and the phone connection are exclusive */
+	/* держу один экземпляр: виртуальную камеру и подключение к телефону не поделить между копиями */
 	CreateMutexW(NULL, TRUE, L"Local\\MagerCamClient");
 	if (GetLastError() == ERROR_ALREADY_EXISTS) {
 		HWND other = FindWindowW(L"MagerCamClient", NULL);
@@ -1347,8 +1325,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 	AdjustWindowRect(&r, style, FALSE);
 	HWND w = CreateWindowExW(0, wc.lpszClassName, L"MagerCam — телефон как веб-камера", style, CW_USEDEFAULT,
 				 CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
-	/* --minimized (autostart): only the tray icon, or a minimized window without tray */
-	/* the first ShowWindow call takes the launcher's show mode, so for the tray case just never show it */
+	/* --minimized (автозапуск): только иконка в трее или свёрнутое окно без трея.
+	 * Первый ShowWindow всё равно берёт режим показа от того, кто меня запустил,
+	 * поэтому в случае трея окно просто ни разу не показываю. */
 	if (!minimized) {
 		ShowWindow(w, show);
 		UpdateWindow(w);

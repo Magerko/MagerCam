@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem Ставит MagerCam.apk на телефон по USB (нужна включённая "Отладка по USB").
+rem На телефоне должна быть включена "Отладка по USB", иначе adb его не увидит.
 echo Установка MagerCam на телефон через USB...
 set "APK=%~dp0dist\MagerCam.apk"
 if not exist "%APK%" set "APK=%~dp0MagerCam.apk"

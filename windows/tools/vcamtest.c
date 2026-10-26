@@ -1,10 +1,10 @@
 /*
- * Test tool for the MagerCam virtual camera.
- *   vcamtest direct <dll>   load the media source in-process (no registration) and read frames
- *   vcamtest create         create a session virtual camera, open it as a normal app would, read frames
- *   vcamtest read           open the "MagerCam" camera of a running MagerCam.exe and read frames
- *   vcamtest feed           only write a moving test pattern into the shared memory
- * A test pattern is fed into the shared memory meanwhile; one frame is saved as vcamtest.bmp.
+ * Утилита для проверки виртуальной камеры MagerCam.
+ *   vcamtest direct <dll>   гружу медиаисточник в свой процесс (без регистрации) и читаю кадры
+ *   vcamtest create         создаю камеру на сессию, открываю её как обычное приложение, читаю кадры
+ *   vcamtest read           открываю камеру "MagerCam" запущенного MagerCam.exe и читаю кадры
+ *   vcamtest feed           только пишу бегущую тестовую картинку в общую память
+ * Параллельно в общую память идёт тестовая картинка, один кадр сохраняю в vcamtest.bmp.
  */
 #define COBJMACROS
 #define _WIN32_WINNT 0x0A00
@@ -104,7 +104,6 @@ static int read_frames(IMFMediaSource *src, int want_w, int want_h)
 		printf("MFCreateSourceReaderFromMediaSource: %08lx\n", hr);
 		return 1;
 	}
-	/* list native types, pick the requested size */
 	IMFMediaType *t = NULL;
 	DWORD pick = 0;
 	for (DWORD i = 0; SUCCEEDED(IMFSourceReader_GetNativeMediaType(rd, 0, i, &t)); i++) {
@@ -166,7 +165,7 @@ int wmain(int argc, wchar_t **argv)
 	}
 	CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	MFStartup(MF_VERSION, MFSTARTUP_FULL);
-	bool read_only = !wcscmp(argv[1], L"read"); /* frames come from MagerCam.exe */
+	bool read_only = !wcscmp(argv[1], L"read"); /* тут кадры пишет MagerCam.exe, свой фидер не запускаю */
 	HANDLE th = read_only ? NULL : CreateThread(NULL, 0, feeder, NULL, 0, NULL);
 	int rc = 1;
 

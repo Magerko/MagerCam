@@ -1,6 +1,6 @@
 /*
- * MagerCam OBS plugin — телефон как камера для OBS.
- * Принимает H.264 + PCM с приложения MagerCam (см. docs/PROTOCOL.md) по Wi-Fi или USB (adb forward).
+ * Плагин MagerCam для OBS: телефон как камера.
+ * Принимаю H.264 + PCM от приложения MagerCam (см. docs/PROTOCOL.md) по Wi-Fi или по USB через adb forward.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -16,7 +16,7 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 #include <util/bmem.h>
-/* from util/threading.h (header itself needs MSVC intrinsics) */
+/* беру объявление из util/threading.h: сам заголовок требует интринсиков MSVC */
 EXPORT void os_set_thread_name(const char *name);
 
 #include <libavcodec/avcodec.h>
@@ -40,9 +40,6 @@ enum pkt_type {
 	PKT_PING = 6,
 };
 
-/* ------------------------------------------------------------------------- */
-/* Discovery results (shared by all sources)                                 */
-
 struct found_device {
 	char name[96];
 	char ip[64];
@@ -54,8 +51,6 @@ static struct found_device g_found[MAX_FOUND];
 static int g_found_count;
 static CRITICAL_SECTION g_found_lock;
 
-/* ------------------------------------------------------------------------- */
-
 struct mc_config {
 	char host[128];
 	int port;
@@ -63,7 +58,7 @@ struct mc_config {
 	char adb_path[512];
 	int width, height, fps, bitrate_kbps;
 	bool audio;
-	char camera[64]; /* "back", "front" or a lens id from the phone status */
+	char camera[64]; /* "back", "front" или id объектива из статуса телефона */
 	bool hw_decode;
 	bool control;
 	double zoom, ev;
@@ -76,7 +71,7 @@ struct mc_source {
 
 	CRITICAL_SECTION lock;
 	struct mc_config cfg;
-	int rotation; /* -1 = auto */
+	int rotation; /* -1 — авто */
 	bool mirror;
 	bool low_latency;
 	bool deactivate_hidden;
@@ -90,15 +85,15 @@ struct mc_source {
 	HANDLE wake;
 	SOCKET sock;
 
-	/* status from phone (guarded by lock) */
+	/* статус от телефона, трогаю только под lock */
 	char status[256];
 	char phone_name[96];
 	int phone_orient;
 	int battery;
 	bool connected;
-	obs_data_array_t *cameras; /* lenses reported by the phone */
+	obs_data_array_t *cameras;
 
-	/* net thread only */
+	/* это трогает только сетевой поток */
 	AVCodecContext *dec;
 	AVBufferRef *hw_dev;
 	AVPacket *pkt;
@@ -115,9 +110,6 @@ struct mc_source {
 	size_t payload_cap;
 	bool had_video;
 };
-
-/* ------------------------------------------------------------------------- */
-/* Small utils                                                               */
 
 static wchar_t *utf8_to_wide(const char *s)
 {
@@ -168,9 +160,6 @@ static void url_encode(struct dstr *d, const char *v)
 		}
 	}
 }
-
-/* ------------------------------------------------------------------------- */
-/* Sockets                                                                   */
 
 static SOCKET tcp_connect(const char *host, int port, int timeout_ms)
 {
@@ -248,7 +237,6 @@ static bool send_all(SOCKET sock, const char *buf, size_t n)
 	return true;
 }
 
-/* Reads HTTP response headers, returns status code or -1. */
 static int read_http_header(SOCKET sock)
 {
 	char hdr[4096];
@@ -267,7 +255,6 @@ static int read_http_header(SOCKET sock)
 	return code;
 }
 
-/* Simple blocking GET, response body discarded. */
 static bool http_get(const char *host, int port, const char *path)
 {
 	SOCKET sock = tcp_connect(host, port, 2000);
@@ -282,9 +269,6 @@ static bool http_get(const char *host, int port, const char *path)
 	closesocket(sock);
 	return code == 200;
 }
-
-/* ------------------------------------------------------------------------- */
-/* ADB (USB mode)                                                            */
 
 static bool run_process(const char *exe, const char *args, char *out, size_t outsz, DWORD timeout_ms)
 {
@@ -334,7 +318,6 @@ static bool run_process(const char *exe, const char *args, char *out, size_t out
 			continue;
 		}
 		if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
-			/* drain the rest */
 			DWORD got = 0;
 			char tmp[512];
 			while (PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL) && avail > 0 &&
@@ -383,7 +366,7 @@ static bool find_adb(const char *configured, char *out, size_t sz)
 			return true;
 	}
 
-	/* installed with MagerCam for Windows */
+	/* сюда adb кладёт установщик MagerCam для Windows */
 	wchar_t pf[MAX_PATH];
 	if (GetEnvironmentVariableW(L"ProgramFiles", pf, MAX_PATH)) {
 		wchar_t full[MAX_PATH * 2];
@@ -410,7 +393,6 @@ static bool find_adb(const char *configured, char *out, size_t sz)
 	return false;
 }
 
-/* Returns true when a forward to localhost:port is set up. */
 static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 {
 	char adb[1024];
@@ -426,7 +408,7 @@ static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 		return false;
 	}
 
-	/* candidates in state "device": USB serials (no ':') first, then wireless */
+	/* беру устройства в состоянии "device": сначала USB (серийник без ':'), потом беспроводные */
 	char cand[8][128];
 	int ncand = 0;
 	bool unauthorized = false;
@@ -452,7 +434,7 @@ static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 		return false;
 	}
 
-	/* several devices: take the one where MagerCam is running */
+	/* если устройств несколько, выбираю то, где запущен MagerCam */
 	const char *serial = cand[0];
 	if (ncand > 1) {
 		for (int i = 0; i < ncand; i++) {
@@ -479,9 +461,6 @@ static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 	return true;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Discovery                                                                 */
-
 static void discovery_run(int timeout_ms)
 {
 	SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -500,7 +479,7 @@ static void discovery_run(int timeout_ms)
 	dst.sin_addr.s_addr = INADDR_BROADCAST;
 	sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
 
-	/* directed broadcast on every adapter: 255.255.255.255 goes out of one NIC only */
+	/* шлю направленный broadcast на каждый адаптер: 255.255.255.255 уходит только через одну сетевуху */
 	ULONG size = 32 * 1024;
 	IP_ADAPTER_ADDRESSES *addrs = bmalloc(size);
 	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
@@ -574,9 +553,6 @@ static void discovery_run(int timeout_ms)
 	LOG(LOG_INFO, "discovery: found %d device(s)", count);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Video decoding                                                            */
-
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmts)
 {
 	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
@@ -627,12 +603,12 @@ static bool decoder_open(struct mc_source *s, bool hw)
 	return true;
 }
 
-/* Rotates/mirrors one 8-bit plane. src_step=2 extracts every second byte (NV12 UV). */
+/* Поворачиваю и отражаю одну 8-битную плоскость. src_step=2 беру для NV12, где U и V идут в одной плоскости через байт. */
 static void transform_plane(const uint8_t *src, int sstride, int src_step, int w, int h, uint8_t *dst, int rot,
 			    bool mirror)
 {
 	int dw = (rot == 90 || rot == 270) ? h : w;
-	/* dx = bx + x*ax + y*ay ; dy = by + x*cx + y*cy */
+	/* координаты в выходной плоскости: dx = bx + x*ax + y*ay ; dy = by + x*cx + y*cy */
 	int bx, ax, ay, by, cx, cy;
 	switch (rot) {
 	case 90:
@@ -662,8 +638,9 @@ static void transform_plane(const uint8_t *src, int sstride, int src_step, int w
 	}
 }
 
-/* Maps phone pts (us, shared by audio and video) to OBS time. A small lead keeps network jitter
- * from producing past audio timestamps, which would grow OBS' global audio buffering. */
+/* pts телефона (мкс, общие часы у звука и видео) перевожу во время OBS, так звук и картинка остаются в синхроне.
+ * Держу небольшой запас вперёд: иначе из-за сетевого джиттера метки звука окажутся в прошлом,
+ * и OBS начнёт раздувать глобальную буферизацию звука. */
 #define TS_LEAD_NS 80000000LL
 static uint64_t map_timestamp(struct mc_source *s, int64_t pts_us, bool audio)
 {
@@ -723,7 +700,7 @@ static void output_frame(struct mc_source *s, AVFrame *f, int rot, bool mirror)
 			out.linesize[i] = f->linesize[i];
 		}
 	} else {
-		/* rotated output is always I420, planes packed with stride == width */
+		/* повёрнутый кадр всегда отдаю в I420, плоскости плотно, stride == width */
 		w &= ~1;
 		h &= ~1;
 		int ow = (rot == 90 || rot == 270) ? h : w;
@@ -810,9 +787,6 @@ static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, 
 		av_frame_unref(s->frame);
 	}
 }
-
-/* ------------------------------------------------------------------------- */
-/* Network thread                                                            */
 
 static void apply_status_json(struct mc_source *s, const char *json)
 {
@@ -943,7 +917,7 @@ static void stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 
 		switch (type) {
 		case PKT_VIDEO_CONFIG:
-			/* new encoder session: reset decoder to handle resolution change */
+			/* новая сессия кодера: пересоздаю декодер, вдруг сменилось разрешение */
 			decoder_open(s, cfg->hw_decode);
 			decode_packet(s, s->payload, len, pts, true, rot, mirror);
 			s->need_key = true;
@@ -1042,8 +1016,7 @@ static void force_reconnect(struct mc_source *s)
 	SetEvent(s->wake);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Control requests (/api/set), executed off the UI thread                   */
+/* Запросы /api/set шлю не из UI-потока, чтобы OBS не подвисал на сети. */
 
 struct control_req {
 	char host[128];
@@ -1078,9 +1051,6 @@ static void send_control(struct mc_source *s, const char *query)
 	else
 		bfree(r);
 }
-
-/* ------------------------------------------------------------------------- */
-/* OBS source callbacks                                                      */
 
 static const char *mc_get_name(void *unused)
 {
@@ -1119,7 +1089,6 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 {
 	memset(c, 0, sizeof(*c));
 	snprintf(c->host, sizeof(c->host), "%s", obs_data_get_string(st, "host"));
-	/* trim spaces */
 	char *h = c->host;
 	while (*h == ' ')
 		memmove(h, h + 1, strlen(h));
@@ -1138,7 +1107,7 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 	c->bitrate_kbps = (int)obs_data_get_int(st, "bitrate") * 1000;
 	c->audio = obs_data_get_bool(st, "audio");
 	const char *cam = obs_data_get_string(st, "camera_id");
-	if (!*cam) /* settings from older versions */
+	if (!*cam) /* старые версии хранили камеру числом */
 		cam = obs_data_get_int(st, "camera") == 1 ? "front" : "back";
 	snprintf(c->camera, sizeof(c->camera), "%s", cam);
 	c->hw_decode = obs_data_get_bool(st, "hw_decode");
@@ -1187,7 +1156,7 @@ static void mc_update(void *data, obs_data_t *st)
 		return;
 	}
 
-	SetEvent(s->wake); /* deactivate_hidden may have changed */
+	SetEvent(s->wake); /* deactivate_hidden мог поменяться */
 
 	if (!connected)
 		return;
@@ -1269,8 +1238,6 @@ static void mc_hide(void *data)
 	if (deact)
 		force_reconnect(s);
 }
-
-/* --- properties --- */
 
 static void fill_device_list(obs_property_t *list)
 {
@@ -1360,7 +1327,7 @@ static bool on_switch_camera(obs_properties_t *props, obs_property_t *p, void *d
 	char cur[64];
 	EnterCriticalSection(&s->lock);
 	snprintf(cur, sizeof(cur), "%s", s->cfg.camera);
-	/* next lens reported by the phone; plain back/front toggle until it has reported them */
+	/* переключаю на следующий объектив из списка телефона, а пока он его не прислал — просто back/front */
 	const char *next = strcmp(cur, "front") == 0 ? "back" : "front";
 	char buf[64];
 	size_t n = s->cameras ? obs_data_array_count(s->cameras) : 0;
@@ -1408,7 +1375,6 @@ static obs_properties_t *mc_properties(void *data)
 	p = obs_properties_add_text(props, "status", status, OBS_TEXT_INFO);
 	obs_properties_add_button(props, "refresh_status", "Обновить статус", on_refresh_status);
 
-	/* connection */
 	obs_properties_t *conn = obs_properties_create();
 	p = obs_properties_add_list(conn, "conn", "Подключение", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, "Wi-Fi / локальная сеть", 0);
@@ -1429,7 +1395,6 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_add_button(conn, "reconnect", "Переподключиться", on_reconnect);
 	obs_properties_add_group(props, "grp_conn", "Подключение", OBS_GROUP_NORMAL, conn);
 
-	/* video */
 	obs_properties_t *vid = obs_properties_create();
 	p = obs_properties_add_list(vid, "resolution", "Разрешение", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "640x480 (4:3)", "640x480");
@@ -1471,7 +1436,6 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_add_bool(vid, "audio", "Передавать звук с микрофона телефона");
 	obs_properties_add_group(props, "grp_video", "Видео и звук", OBS_GROUP_NORMAL, vid);
 
-	/* camera controls */
 	obs_properties_t *cam = obs_properties_create();
 	obs_properties_add_bool(cam, "control", "Управлять камерой из OBS");
 	obs_properties_add_button(cam, "torch", "Фонарик вкл/выкл", on_torch);
@@ -1499,7 +1463,6 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_add_bool(cam, "stab", "Стабилизация видео");
 	obs_properties_add_group(props, "grp_cam", "Управление камерой", OBS_GROUP_NORMAL, cam);
 
-	/* advanced */
 	obs_properties_t *adv = obs_properties_create();
 	obs_properties_add_bool(adv, "low_latency", "Минимальная задержка (без буферизации)");
 	obs_properties_add_bool(adv, "hw_decode", "Аппаратное декодирование (D3D11)");

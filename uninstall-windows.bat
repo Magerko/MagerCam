@@ -1,6 +1,5 @@
 @echo off
 chcp 65001 >nul
-rem Удаляет MagerCam для Windows (программу и виртуальную камеру).
 net session >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
   powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"

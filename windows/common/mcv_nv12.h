@@ -1,6 +1,6 @@
 /*
- * NV12 helpers shared by the client and the virtual camera: one affine bilinear resampler that
- * rotates, mirrors and fits/scales a frame into another in a single pass.
+ * Общие для клиента и виртуальной камеры функции NV12: один аффинный билинейный ресемплер,
+ * который за один проход поворачивает, отражает и вписывает кадр в другой.
  */
 #pragma once
 #include <stdint.h>
@@ -10,7 +10,7 @@
 
 struct nv12 {
 	uint8_t *y, *uv;
-	int ys, uvs; /* strides */
+	int ys, uvs; /* шаги строк */
 	int w, h;
 };
 
@@ -22,8 +22,8 @@ static inline void nv12_fill_black(struct nv12 *d)
 		memset(d->uv + (size_t)r * d->uvs, 128, d->w);
 }
 
-/* dst(X, Y) = src(ax + bx*X + cx*Y, ay + by*X + cy*Y), bilinear, for X in [x0,x1), Y in [y0,y1).
- * `ch` is 1 for Y and 2 for interleaved UV. Coordinates are in pixel centers of each plane. */
+/* dst(X, Y) = src(ax + bx*X + cx*Y, ay + by*X + cy*Y) билинейно, для X в [x0,x1), Y в [y0,y1).
+ * `ch` = 1 для Y и 2 для чередующихся UV. Координаты считаю по центрам пикселей своей плоскости. */
 static inline void nv12_map_plane(const uint8_t *src, int ss, int sw, int sh, uint8_t *dst, int ds, int x0, int y0,
 				  int x1, int y1, double ax, double bx, double cx, double ay, double by, double cy, int ch)
 {
@@ -53,22 +53,22 @@ static inline void nv12_map_plane(const uint8_t *src, int ss, int sw, int sh, ui
 }
 
 /*
- * Rotates `s` clockwise by `rot` degrees (0/90/180/270), mirrors it horizontally if asked and
- * scales it into `d` keeping the aspect ratio: letterboxed (fill == false) or cropped (fill == true).
- * Areas not covered are painted black.
+ * Поворачиваю `s` по часовой на `rot` градусов (0/90/180/270), при необходимости отражаю по
+ * горизонтали и вписываю в `d` с сохранением пропорций: с полями (fill == false) или с обрезкой
+ * (fill == true). Непокрытые области заливаю чёрным.
  */
 static inline void nv12_transform(const struct nv12 *s, struct nv12 *d, int rot, bool mirror, bool fill)
 {
 	rot = ((rot % 360) + 360) % 360;
 	bool swap = rot == 90 || rot == 270;
-	double rw = swap ? s->h : s->w, rh = swap ? s->w : s->h; /* rotated size */
+	double rw = swap ? s->h : s->w, rh = swap ? s->w : s->h; /* размер после поворота */
 	double scale = fill ? fmax(d->w / rw, d->h / rh) : fmin(d->w / rw, d->h / rh);
 	double ow = rw * scale, oh = rh * scale;
 	double ox = (d->w - ow) / 2, oy = (d->h - oh) / 2;
 
 	int x0 = (int)ceil(ox), y0 = (int)ceil(oy);
 	int x1 = (int)floor(ox + ow), y1 = (int)floor(oy + oh);
-	x0 &= ~1; y0 &= ~1; /* keep chroma aligned */
+	x0 &= ~1; y0 &= ~1; /* держу границы чётными, иначе съедет выравнивание хромы */
 	if (x0 < 0) x0 = 0;
 	if (y0 < 0) y0 = 0;
 	if (x1 > d->w) x1 = d->w;
@@ -80,19 +80,19 @@ static inline void nv12_transform(const struct nv12 *s, struct nv12 *d, int rot,
 		return;
 
 	for (int plane = 0; plane < 2; plane++) {
-		double k = plane ? 0.5 : 1.0; /* plane resolution relative to luma */
+		double k = plane ? 0.5 : 1.0; /* разрешение плоскости относительно яркости */
 		double sw = s->w * k, sh = s->h * k;
 		double prw = rw * k, prh = rh * k;
-		/* dest plane pixel X -> rotated plane coordinate u = (X + .5 - ox*k) / scale - .5 */
+		/* пиксель X плоскости назначения -> координата в повёрнутой плоскости u = (X + .5 - ox*k) / scale - .5 */
 		double ub = 1 / scale, ua = (0.5 - ox * k) / scale - 0.5;
 		double vb = 1 / scale, va = (0.5 - oy * k) / scale - 0.5;
-		/* u = ua + ub*X, v = va + vb*Y; mirror: u -> prw-1-u */
+		/* u = ua + ub*X, v = va + vb*Y; отражение: u -> prw-1-u */
 		double uA = ua, uB = ub;
 		if (mirror) {
 			uA = prw - 1 - ua;
 			uB = -ub;
 		}
-		/* rotated (u, v) -> source (sx, sy) */
+		/* повёрнутые (u, v) -> исходные (sx, sy) */
 		double ax, bx, cx, ay, by, cy;
 		switch (rot) {
 		case 90: /* sx = v, sy = sh-1-u */

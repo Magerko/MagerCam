@@ -18,7 +18,6 @@ import java.net.NetworkInterface
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 
-/** Glue between camera, encoder, audio, server and UI. Lives as long as [CameraService]. */
 class Core(val context: Context) : CameraEngine.Listener {
     val settings = Settings(context)
     val server = StreamServer(this)
@@ -29,7 +28,7 @@ class Core(val context: Context) : CameraEngine.Listener {
     private val worker = HandlerThread("mc-core").apply { start() }
     private val handler = Handler(worker.looper)
 
-    /** UI callbacks, invoked on the core worker thread. */
+    /** Колбэки UI дёргаю на рабочем потоке ядра, не на главном. */
     val uiListeners = CopyOnWriteArrayList<() -> Unit>()
     @Volatile var previewSizeListener: ((Size) -> Unit)? = null
 
@@ -44,7 +43,7 @@ class Core(val context: Context) : CameraEngine.Listener {
             val cur = deviceOrientation
             var diff = abs(o - cur) % 360
             if (diff > 180) diff = 360 - diff
-            if (diff < 60) return // hysteresis
+            if (diff < 60) return // гистерезис, чтобы поворот не дёргался на границе 45°
             val snapped = ((o + 45) / 90 * 90) % 360
             if (snapped != cur) {
                 deviceOrientation = snapped
@@ -88,8 +87,6 @@ class Core(val context: Context) : CameraEngine.Listener {
         worker.quitSafely()
     }
 
-    // ---------------------------------------------------------------- demand
-
     fun onClientsChanged() {
         engine.setStreamDemand(server.streamClients.isNotEmpty())
         engine.setMjpegDemand(server.wantsJpeg)
@@ -113,9 +110,7 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     val clientCount get() = server.streamClients.size + server.mjpegClients.size
 
-    // ---------------------------------------------------------------- settings
-
-    /** Applies /api/set (and /stream) parameters. See docs/PROTOCOL.md. */
+    /** Параметры /api/set и /stream описываю в docs/PROTOCOL.md. */
     fun applyParams(p: Map<String, String>) {
         if (p.isEmpty()) return
         var restart = false
@@ -135,7 +130,7 @@ class Core(val context: Context) : CameraEngine.Listener {
             if (v != settings.bitrateKbps) { settings.bitrateKbps = v; engine.setBitrate(v) }
         }
         p["camera"]?.let {
-            // "back"/"front" keep the currently chosen lens if it already faces that way
+            // на "back"/"front" оставляю текущий объектив, если он уже смотрит в эту сторону
             val cur = engine.cameras.firstOrNull { c -> c.id == engine.resolveCameraId(settings.cameraId) }
             val keep = cur != null && ((it == "back" && !cur.front) || (it == "front" && cur.front))
             val id = if (keep) cur!!.id else engine.resolveCameraId(it)
@@ -176,9 +171,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         pushStatus()
     }
 
-    // ---------------------------------------------------------------- status
-
-    /** Clockwise rotation the receiver must apply to the stream to make it upright. */
+    /** Отдаю поворот по часовой, который приёмник должен применить, чтобы картинка встала ровно. */
     fun streamOrientation(): Int {
         val dev = when (settings.orientationMode) {
             "landscape" -> return 0
@@ -188,7 +181,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         val ch = engine.characteristics(engine.resolveCameraId(settings.cameraId))
         val sensor = ch?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
         val front = ch?.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
-        // Same formula as Camera2 JPEG_ORIENTATION
+        // считаю так же, как Camera2 считает JPEG_ORIENTATION
         return if (front) (sensor - dev + 360) % 360 else (sensor + dev) % 360
     }
 
@@ -202,7 +195,6 @@ class Core(val context: Context) : CameraEngine.Listener {
                 }
             }
         } catch (_: Exception) {}
-        // Wi-Fi first
         return out.sortedBy { if (it.first.startsWith("wlan")) 0 else if (it.first.startsWith("ap") || it.first.startsWith("swlan")) 1 else 2 }
     }
 
@@ -261,8 +253,6 @@ class Core(val context: Context) : CameraEngine.Listener {
     private fun notifyUiNow() {
         for (l in uiListeners) try { l() } catch (e: Exception) { Log.w(TAG, "ui listener: $e") }
     }
-
-    // ---------------------------------------------------------------- engine listener
 
     override fun onEncoderPacket(type: Int, packet: ByteArray, key: Boolean) =
         server.broadcastVideo(type, packet, key)

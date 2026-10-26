@@ -1,4 +1,3 @@
-/* Plays the phone microphone into a playback device (e.g. VB-Audio "CABLE Input") with WASAPI. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>

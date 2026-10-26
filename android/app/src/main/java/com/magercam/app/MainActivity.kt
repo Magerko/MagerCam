@@ -78,8 +78,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         override fun onReceive(c: Context?, i: Intent?) = finish()
     }
 
-    // ------------------------------------------------------------------ lifecycle
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
@@ -145,8 +143,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         refreshUi()
     }
 
-    // ------------------------------------------------------------------ surface
-
     override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -176,7 +172,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return c.engine.characteristics(c.engine.resolveCameraId(c.settings.cameraId))
     }
 
-    /** Rotation of the on-screen preview relative to the sensor image. */
+    /** Насколько повернуть превью на экране относительно кадра сенсора. */
     private fun relativeRotation(): Int {
         val ch = cameraChars()
         val sensor = ch?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
@@ -213,8 +209,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             focusRing.animate().alpha(0f).setStartDelay(700).setDuration(300).start()
         }.start()
     }
-
-    // ------------------------------------------------------------------ UI
 
     private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics)
     private fun dpi(v: Int) = dp(v).roundToInt()
@@ -255,7 +249,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         root.addView(focusRing, FrameLayout.LayoutParams(dpi(64), dpi(64)))
 
-        // top-left info panel
         val info = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dpi(12), dpi(8), dpi(12), dpi(8))
@@ -272,7 +265,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setMargins(dpi(12), dpi(12), dpi(12), dpi(12))
         })
 
-        // right column of buttons
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
         col.addView(roundButton("⇄") { switchCamera() })
         btnTorch = roundButton("🔦") { core?.applyParams(mapOf("torch" to "toggle")) }
@@ -288,12 +280,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val scrollCol = ScrollView(this).apply { addView(col); isVerticalScrollBarEnabled = false }
         val portraitUi = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
         root.addView(scrollCol, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END or Gravity.CENTER_VERTICAL).apply {
-            // portrait: keep clear of the full-width sliders at the bottom (column scrolls if short)
+            // в портрете не залезаю на ползунки внизу во всю ширину; если места мало, колонка прокручивается
             setMargins(dpi(8), dpi(8), dpi(8), dpi(if (portraitUi) 150 else 8))
         })
 
-        // bottom sliders: side by side in landscape; in portrait the screen is narrow,
-        // so each gets its own full-width row with a bigger touch area
+        // в альбомной ползунки стоят рядом, а в портрете экран узкий, поэтому каждому даю
+        // свою строку во всю ширину, чтобы в него было проще попасть пальцем
         val portrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
         val bottom = LinearLayout(this).apply {
             orientation = if (portrait) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
@@ -315,7 +307,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 else LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         root.addView(bottom, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
-            // portrait: the button column sits higher, so the sliders can use the full width
+            // в портрете колонка кнопок выше, так что ползункам отдаю всю ширину
             setMargins(dpi(12), dpi(8), dpi(if (portrait) 12 else 80), dpi(12))
         })
         zoomBar.setOnSeekBarChangeListener(seekListener { p ->
@@ -434,8 +426,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (r != aspect.ratio) aspect.ratio = r
     }
 
-    // ------------------------------------------------------------------ actions
-
     private fun switchCamera() {
         val c = core ?: return
         val cams = c.engine.cameras
@@ -513,8 +503,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         """.trimMargin()
         AlertDialog.Builder(this).setTitle("Как подключиться").setMessage(text).setPositiveButton("OK", null).show()
     }
-
-    // ------------------------------------------------------------------ settings dialog
 
     private fun showSettings() {
         val c = core ?: return
@@ -631,7 +619,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 }
 
-/** FrameLayout that fits its children into the largest centered box with the given aspect ratio. */
 class AspectFrame(ctx: Context) : FrameLayout(ctx) {
     var ratio = 0f
         set(v) { field = v; requestLayout() }

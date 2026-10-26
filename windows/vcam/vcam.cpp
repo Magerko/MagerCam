@@ -1,10 +1,10 @@
 /*
- * MagerCam virtual camera: a Media Foundation media source registered as a Windows 11 virtual
- * camera (MFCreateVirtualCamera). The Frame Server service loads this DLL and shares the camera with
- * every application (Zoom, Discord, Teams, browsers, "Camera"...).
+ * Виртуальная камера MagerCam: медиаисточник Media Foundation, который я регистрирую как
+ * виртуальную камеру Windows 11 (MFCreateVirtualCamera). DLL грузит служба Frame Server и раздаёт
+ * камеру всем приложениям сразу.
  *
- * Frames come from MagerCam.exe through shared memory (see mcv_shared.h). When the client is not
- * running the camera shows a "no signal" picture instead of failing.
+ * Кадры беру из общей памяти от MagerCam.exe (см. mcv_shared.h). Если клиент не запущен, показываю
+ * картинку «Нет сигнала», а не роняю поток.
  */
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0A00
@@ -21,10 +21,9 @@ extern "C" {
 #include "../common/mcv_nv12.h"
 }
 
-// {6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E41}
 static const GUID CLSID_MagerCamSource = {0x6b1e3c7a, 0x4d2f, 0x4a8b, {0x9c, 0x5e, 0x2f, 0x7a, 0x1d, 0x3b, 0x8e, 0x41}};
 
-// GUIDs missing from the mingw headers (values from the Windows SDK)
+// Этих GUID нет в заголовках mingw, значения беру из Windows SDK
 static const GUID MY_MF_DEVICESTREAM_STREAM_ID = {0x11bd5120, 0xd124, 0x446b, {0x88, 0xe6, 0x17, 0x06, 0x02, 0x57, 0xff, 0xf9}};
 static const GUID MY_MF_DEVICESTREAM_STREAM_CATEGORY = {0x2939e7b8, 0xa62e, 0x4579, {0xb6, 0x74, 0xd4, 0x07, 0x3d, 0xfa, 0xbb, 0xba}};
 static const GUID MY_MF_DEVICESTREAM_FRAMESERVER_SHARED = {0x1cb378e9, 0xb279, 0x41d4, {0xaf, 0x97, 0x34, 0xa2, 0x43, 0xe6, 0x83, 0x20}};
@@ -35,7 +34,7 @@ static const IID IID_MyKsControl = {0x28f54685, 0x06fd, 0x11d2, {0xb2, 0x7a, 0x0
 static const IID IID_MyMFMediaStream2 = {0xc5bc37d6, 0x75c7, 0x46a1, {0xa1, 0x32, 0x81, 0xb5, 0xf7, 0x23, 0xc2, 0x0f}};
 static const IID IID_MyMFSampleAllocatorControl = {0xda62b958, 0x3a38, 0x4a97, {0xbd, 0x27, 0x14, 0x9c, 0x64, 0x0c, 0x07, 0x71}};
 
-// Interfaces missing from the mingw headers
+// Этих интерфейсов в mingw тоже нет, объявляю их сам
 struct IMyKsControl : public IUnknown {
 	virtual HRESULT STDMETHODCALLTYPE KsProperty(void *prop, ULONG propLen, void *data, ULONG dataLen, ULONG *ret) = 0;
 	virtual HRESULT STDMETHODCALLTYPE KsMethod(void *m, ULONG mLen, void *data, ULONG dataLen, ULONG *ret) = 0;
@@ -77,27 +76,25 @@ static void dbg(const char *fmt, ...)
 	OutputDebugStringA(buf);
 }
 
-/* ------------------------------------------------------------------------------------------- */
-/* Frame provider: shared memory from the client, "no signal" picture otherwise                 */
-
 struct FrameProvider {
 	HANDLE map = nullptr;
 	uint8_t *base = nullptr;
-	uint8_t *copy = nullptr;       // last consistent frame from the client
+	uint8_t *copy = nullptr;       // последний целый кадр клиента, прочитанный по seqlock
 	uint32_t copy_w = 0, copy_h = 0;
 	int32_t copy_seq = -1;
-	uint8_t *placeholder = nullptr; // MCV_MAX_W x MCV_MAX_H NV12
+	uint8_t *placeholder = nullptr; // заглушка «Нет сигнала», NV12 MCV_MAX_W x MCV_MAX_H
 
 	bool open()
 	{
 		if (base)
 			return true;
 		SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, FALSE};
-		// SYSTEM, LOCAL SERVICE, admins and interactive users (the client) get full access
+		// Даю полный доступ SYSTEM, LOCAL SERVICE, админам и интерактивным пользователям. Без этой DACL
+		// клиент из пользовательской сессии не откроет объект, который создала служба.
 		ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GA;;;IU)",
 								     SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
 		map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE, MCV_SHM_NAME);
-		if (!map) // not a service (e.g. loaded by a test app): session-local fallback
+		if (!map) // в Global\ создавать может только служба; если меня грузит обычное приложение (тест), беру Local\ как запасной вариант
 			map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE,
 						 L"Local\\MagerCamVirtualCamera");
 		if (sa.lpSecurityDescriptor)
@@ -147,7 +144,9 @@ struct FrameProvider {
 		hd->streaming = on ? 1 : 0;
 	}
 
-	/* Takes the newest client frame if there is one. Returns true if the client is alive. */
+	/* Забираю свежий кадр клиента по seqlock: нечётный seq значит, что запись идёт, а если seq
+	 * поменялся во время копирования, кадр порван и я пробую снова. Клиента считаю живым, если он
+	 * писал кадр за последние 3 с. */
 	bool poll_client()
 	{
 		if (!base)
@@ -236,7 +235,7 @@ struct FrameProvider {
 			  L"\x0442\x0435\x043B\x0435\x0444\x043E\x043D",
 			  -1, &t3, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 		GdiFlush();
-		// BGRA -> NV12 (BT.709 limited range)
+		// Перевожу BGRA в NV12 (BT.709, ограниченный диапазон)
 		const uint8_t *px = (const uint8_t *)bits;
 		uint8_t *Y = placeholder, *UV = placeholder + (size_t)W * H;
 		for (int y = 0; y < H; y++) {
@@ -260,7 +259,6 @@ struct FrameProvider {
 		DeleteDC(dc);
 	}
 
-	/* Renders the current picture into an NV12 destination of any size. */
 	void render(struct nv12 *dst)
 	{
 		bool live = poll_client() && copy_seq >= 0;
@@ -292,8 +290,6 @@ struct FrameProvider {
 	}
 };
 
-/* ------------------------------------------------------------------------------------------- */
-
 class MagerSource;
 
 class MagerStream final : public IMyMFMediaStream2, public IMyKsControl {
@@ -304,7 +300,6 @@ public:
 	}
 	HRESULT init();
 
-	// IUnknown
 	STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
 	{
 		if (!ppv)
@@ -330,7 +325,6 @@ public:
 		return r;
 	}
 
-	// IMFMediaEventGenerator
 	STDMETHODIMP GetEvent(DWORD flags, IMFMediaEvent **ev) override
 	{
 		IMFMediaEventQueue *q;
@@ -369,7 +363,6 @@ public:
 		return hr;
 	}
 
-	// IMFMediaStream
 	STDMETHODIMP GetMediaSource(IMFMediaSource **ppSource) override;
 	STDMETHODIMP GetStreamDescriptor(IMFStreamDescriptor **sd) override
 	{
@@ -406,7 +399,6 @@ public:
 		return hr;
 	}
 
-	// IMFMediaStream2
 	STDMETHODIMP SetStreamState(MF_STREAM_STATE value) override
 	{
 		EnterCriticalSection(m_lock);
@@ -430,12 +422,10 @@ public:
 		return S_OK;
 	}
 
-	// IKsControl
 	STDMETHODIMP KsProperty(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 	STDMETHODIMP KsMethod(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 	STDMETHODIMP KsEvent(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 
-	// used by the source
 	HRESULT start(IMFMediaType *type);
 	HRESULT stop();
 	void shutdown();
@@ -465,7 +455,7 @@ private:
 
 	enum { MAX_PENDING = 16 };
 	volatile LONG m_ref = 1;
-	MagerSource *m_source; // weak: the source owns the stream
+	MagerSource *m_source; // слабая ссылка: стрим принадлежит источнику, иначе получится цикл ссылок
 	CRITICAL_SECTION *m_lock;
 	IMFMediaEventQueue *m_queue = nullptr;
 	IMFStreamDescriptor *m_desc = nullptr;
@@ -479,11 +469,9 @@ private:
 	HANDLE m_wake = nullptr, m_thread = nullptr;
 	volatile bool m_quit = false;
 	UINT32 m_w = 1920, m_h = 1080;
-	UINT64 m_interval = 333333; // 100 ns units
+	UINT64 m_interval = 333333; // в единицах по 100 нс
 	FrameProvider m_frames;
 };
-
-/* ------------------------------------------------------------------------------------------- */
 
 class MagerSource final : public IMFMediaSourceEx, public IMFGetService, public IMyKsControl, public IMySampleAllocatorControl {
 public:
@@ -515,7 +503,6 @@ public:
 		return m_pd->SelectStream(0);
 	}
 
-	// IUnknown
 	STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
 	{
 		if (!ppv)
@@ -545,7 +532,6 @@ public:
 		return r;
 	}
 
-	// IMFMediaEventGenerator
 	STDMETHODIMP GetEvent(DWORD flags, IMFMediaEvent **ev) override
 	{
 		IMFMediaEventQueue *q;
@@ -582,7 +568,6 @@ public:
 		return hr;
 	}
 
-	// IMFMediaSource
 	STDMETHODIMP GetCharacteristics(DWORD *c) override
 	{
 		if (!c)
@@ -672,7 +657,6 @@ public:
 		return S_OK;
 	}
 
-	// IMFMediaSourceEx
 	STDMETHODIMP GetSourceAttributes(IMFAttributes **a) override
 	{
 		if (!a)
@@ -697,15 +681,12 @@ public:
 	}
 	STDMETHODIMP SetD3DManager(IUnknown *) override { return m_shutdown ? MF_E_SHUTDOWN : S_OK; }
 
-	// IMFGetService
 	STDMETHODIMP GetService(REFGUID, REFIID, LPVOID *) override { return MF_E_UNSUPPORTED_SERVICE; }
 
-	// IKsControl
 	STDMETHODIMP KsProperty(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 	STDMETHODIMP KsMethod(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 	STDMETHODIMP KsEvent(void *, ULONG, void *, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 
-	// IMFSampleAllocatorControl
 	STDMETHODIMP SetDefaultAllocator(DWORD id, IUnknown *alloc) override
 	{
 		if (id != 0)
@@ -749,9 +730,6 @@ private:
 	volatile bool m_shutdown = false;
 	bool m_started_once = false;
 };
-
-/* ------------------------------------------------------------------------------------------- */
-/* MagerStream implementation                                                                   */
 
 static HRESULT make_type(UINT32 w, UINT32 h, UINT32 fps, IMFMediaType **out)
 {
@@ -935,7 +913,7 @@ DWORD MagerStream::worker()
 	EnterCriticalSection(m_lock);
 	m_frames.set_streaming(true, m_w, m_h);
 	LeaveCriticalSection(m_lock);
-	// 1 ms resolution ticks: the default 15.6 ms timer would cap 30 fps at ~21
+	// Беру таймер высокого разрешения: со стандартным тиком 15,6 мс вместо 30 кадров/с выходит около 21
 	HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
 	if (!timer)
 		timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
@@ -956,8 +934,8 @@ DWORD MagerStream::worker()
 		if (!have)
 			continue;
 		LONGLONG now = MFGetSystemTime();
-		// Steady cadence at the negotiated frame rate; a fresh client frame may go out up to half a
-		// frame early so the phone's timing is followed without adding latency.
+		// Держу ровный темп по согласованной частоте кадров, но свежий кадр клиента отдаю до полкадра
+		// раньше срока: так следую таймингу телефона и не добавляю задержку.
 		bool fresh = false;
 		if (m_frames.base) {
 			auto *h = (mcv_header *)m_frames.base;
@@ -1071,9 +1049,7 @@ HRESULT MagerStream::deliver(IUnknown *token)
 	return hr;
 }
 
-/* ------------------------------------------------------------------------------------------- */
-/* Activator: what the Frame Server creates through COM                                         */
-
+// Активатор: именно его Frame Server создаёт через COM
 class MagerActivate final : public IMFActivate {
 public:
 	MagerActivate() { InterlockedIncrement(&g_objects); }
@@ -1100,7 +1076,6 @@ public:
 		return r;
 	}
 
-	// IMFActivate
 	STDMETHODIMP ActivateObject(REFIID riid, void **ppv) override
 	{
 		if (!ppv)
@@ -1136,7 +1111,6 @@ public:
 		return S_OK;
 	}
 
-	// IMFAttributes: forwarded to an internal store
 #define FWD(name, params, args) \
 	STDMETHODIMP name params override { return m_attrs->name args; }
 	FWD(GetItem, (REFGUID k, PROPVARIANT *v), (k, v))
@@ -1182,9 +1156,6 @@ private:
 	IMFAttributes *m_attrs = nullptr;
 	MagerSource *m_source = nullptr;
 };
-
-/* ------------------------------------------------------------------------------------------- */
-/* COM plumbing                                                                                 */
 
 class ClassFactory : public IClassFactory {
 public:
@@ -1262,6 +1233,7 @@ HRESULT WINAPI DllRegisterServer(void)
 	wchar_t clsid[64], key[160], path[MAX_PATH];
 	clsid_string(clsid, 64);
 	GetModuleFileNameW(g_module, path, MAX_PATH);
+	// Регистрирую в HKLM, а не в HKCU: Frame Server работает под LOCAL SERVICE и HKCU пользователя не видит
 	wsprintfW(key, L"Software\\Classes\\CLSID\\%s", clsid);
 	HKEY k;
 	if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
@@ -1288,4 +1260,4 @@ HRESULT WINAPI DllUnregisterServer(void)
 	return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND ? S_OK : SELFREG_E_CLASS;
 }
 
-} // extern "C"
+}
