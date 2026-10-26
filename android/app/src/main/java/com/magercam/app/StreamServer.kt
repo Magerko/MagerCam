@@ -156,7 +156,9 @@ class StreamServer(private val core: Core) {
 
     private fun serveStream(sock: Socket, query: Map<String, String>) {
         sock.soTimeout = 0
-        sock.sendBufferSize = 512 * 1024
+        // буфер ядра в очередь не виден, и всё, что в нём лежит, — чистая задержка; 256 КБ хватает на 40 Мбит/с даже при пинге 50 мс
+        sock.sendBufferSize = 256 * 1024
+        sock.tcpNoDelay = true
         val wantsAudio = query["audio"] != "0"
         val wantsHevc = query["codec"] == "hevc"
         core.applyParams(query - "codec" - "key")
@@ -261,19 +263,21 @@ class StreamServer(private val core: Core) {
         }
     }
 
-    /** Сумма по всем клиентам: сколько раз сеть не успела и пришлось выкинуть кадры, плюс самая длинная очередь. */
+    /** Сумма по всем клиентам: сколько раз сеть не успела и пришлось выкинуть кадры, плюс возраст самой старой очереди в мс. */
     fun takeCongestion(): Pair<Int, Long> {
         var drops = 0
-        var maxQueued = 0L
+        var maxAge = 0L
         for (c in streamClients) {
             drops += c.drops.getAndSet(0)
-            maxQueued = maxOf(maxQueued, c.queuedBytes)
+            maxAge = maxOf(maxAge, c.queueAgeMs)
         }
-        return drops to maxQueued
+        return drops to maxAge
     }
 
+    private class Item(val pkt: ByteArray, val video: Boolean, val t: Long = System.nanoTime())
+
     class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean, val wantsHevc: Boolean) {
-        private val queue = LinkedBlockingDeque<ByteArray>()
+        private val queue = LinkedBlockingDeque<Item>()
         private val queued = AtomicLong(0)
         val drops = java.util.concurrent.atomic.AtomicInteger(0)
         val queuedBytes get() = queued.get()
@@ -281,13 +285,18 @@ class StreamServer(private val core: Core) {
         @Volatile private var waitingKey = true
         @Volatile private var hasConfig = false
         @Volatile private var keyRequested = false
+        private var lastKeyRequest = 0L
+        /** Сколько миллисекунд ждёт самый старый пакет в очереди. Байты тут плохая мера: на 2 Мбит/с полтора мегабайта — это шесть секунд. */
+        val queueAgeMs: Long get() = queue.peekFirst()?.let { (System.nanoTime() - it.t) / 1_000_000 } ?: 0
 
         fun enqueueVideo(pkt: ByteArray, type: Int, key: Boolean) {
             if (closed) return
             if (type == PKT_VIDEO_CONFIG) {
                 hasConfig = true
                 waitingKey = true
-                push(pkt)
+                // новый кодер: старые кадры от прежнего разрешения клиенту уже не нужны
+                flushVideo()
+                push(Item(pkt, false))
                 return
             }
             if (!hasConfig) return
@@ -295,39 +304,54 @@ class StreamServer(private val core: Core) {
                 if (!key) return
                 waitingKey = false
             }
-            if (queued.get() > MAX_QUEUE_BYTES) {
-                // сеть не успевает: выкидываю кадры до следующего ключевого, чтобы задержка не росла
-                waitingKey = true
-                keyRequested = true
+            if (queueAgeMs > MAX_QUEUE_MS || queued.get() > MAX_QUEUE_BYTES) {
+                // Сеть или ПК не успевают. Выкидываю всё накопленное видео и жду свежий ключевой кадр:
+                // задержка сразу возвращается к нулю, а не висит, пока очередь сама не рассосётся.
+                flushVideo()
+                waitingKey = !key
+                // Ключевой кадр в 4K весит сотни килобайт и сам по себе даёт очередь. Если просить его на каждом
+                // сбросе, получится карусель из одних ключевых, поэтому прошу не чаще раза в две секунды,
+                // а в остальное время жду очередного по расписанию кодера.
+                val now = System.nanoTime()
+                if (!key && now - lastKeyRequest > 2_000_000_000L) {
+                    lastKeyRequest = now
+                    keyRequested = true
+                }
                 drops.incrementAndGet()
-                return
+                if (!key) return
             }
-            push(pkt)
+            push(Item(pkt, true))
         }
 
         fun enqueueOther(pkt: ByteArray, droppable: Boolean) {
             if (closed) return
-            if (droppable && queued.get() > MAX_QUEUE_BYTES * 2) return
-            push(pkt)
+            if (droppable && (queueAgeMs > MAX_QUEUE_MS * 2 || queued.get() > MAX_QUEUE_BYTES * 2)) return
+            push(Item(pkt, false))
         }
 
-        private fun push(pkt: ByteArray) {
-            queued.addAndGet(pkt.size.toLong())
-            queue.offer(pkt)
+        private fun push(item: Item) {
+            queued.addAndGet(item.pkt.size.toLong())
+            queue.offer(item)
+        }
+
+        private fun flushVideo() {
+            for (it in queue.toArray(arrayOfNulls<Item>(0))) {
+                if (it != null && it.video && queue.removeFirstOccurrence(it)) queued.addAndGet(-it.pkt.size.toLong())
+            }
         }
 
         fun runWriter(onKeyNeeded: () -> Unit) {
             try {
                 while (!closed) {
                     if (keyRequested) { keyRequested = false; onKeyNeeded() }
-                    val p = queue.poll(1000, TimeUnit.MILLISECONDS)
-                    if (p == null) {
+                    val item = queue.poll(1000, TimeUnit.MILLISECONDS)
+                    if (item == null) {
                         out.write(packet(PKT_PING, ByteArray(0), 0, false))
                         out.flush()
                         continue
                     }
-                    queued.addAndGet(-p.size.toLong())
-                    out.write(p)
+                    queued.addAndGet(-item.pkt.size.toLong())
+                    out.write(item.pkt)
                     if (queue.isEmpty()) out.flush()
                 }
             } catch (_: Exception) {
@@ -338,7 +362,7 @@ class StreamServer(private val core: Core) {
 
         fun close() {
             closed = true
-            queue.offer(ByteArray(0))
+            queue.offer(Item(ByteArray(0), false))
             try { sock.close() } catch (_: Exception) {}
         }
     }
@@ -400,7 +424,8 @@ class StreamServer(private val core: Core) {
         const val PKT_PING = 6
         const val FLAG_HEVC = 2
         private const val BOUNDARY = "magercamframe"
-        private const val MAX_QUEUE_BYTES = 1_500_000L
+        private const val MAX_QUEUE_BYTES = 6_000_000L
+        private const val MAX_QUEUE_MS = 500L
 
         fun writeHeader(dst: ByteArray, type: Int, len: Int, ptsUs: Long, key: Boolean) {
             ByteBuffer.wrap(dst, 0, 16)

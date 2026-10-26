@@ -711,16 +711,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val fpsValues = listOf(15, 24, 25, 30, 50, 60)
         val fpsSp = spinner("Кадров в секунду", fpsValues.map { "$it" }, fpsValues, s.fps)
 
-        header("Битрейт")
-        val brLabel = TextView(this)
-        val brBar = SeekBar(this).apply { max = 49; progress = (s.bitrateKbps / 1000 - 1).coerceIn(0, 49) }
-        brLabel.text = "${brBar.progress + 1} Мбит/с"
-        brBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar, p: Int, u: Boolean) { brLabel.text = "${p + 1} Мбит/с" }
-            override fun onStartTrackingTouch(sb: SeekBar) {}
-            override fun onStopTrackingTouch(sb: SeekBar) {}
-        })
-        box.addView(brLabel); box.addView(brBar)
+        // ползунком на 50 делений точно не попасть, поэтому даю готовые значения с подсказкой, что под что
+        val brValues = (listOf(2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000, 25000, 30000, 40000, 50000) + s.bitrateKbps)
+            .distinct().sorted()
+        val brSp = spinner("Битрейт (верхняя граница)", brValues.map { kb ->
+            val mb = if (kb % 1000 == 0) "${kb / 1000}" else "%.1f".format(kb / 1000f)
+            mb + " Мбит/с" + when (kb) {
+                3000 -> " — 720p"
+                8000 -> " — 1080p 30"
+                12000 -> " — 1080p 60"
+                25000 -> " — 4K 30"
+                40000 -> " — 4K 60, нужен хороший Wi-Fi"
+                else -> ""
+            }
+        }, brValues, s.bitrateKbps)
 
         val audioSrcValues = listOf("camcorder", "mic", "voice", "unprocessed")
         val audioSp = spinner("Источник звука", listOf("Видеокамера (по умолчанию)", "Микрофон", "Голос (шумоподавление)", "Без обработки"), audioSrcValues, s.audioSource)
@@ -794,7 +798,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (cams.isNotEmpty()) p["camera"] = cams[camSp.selectedItemPosition].id
                 sizes.getOrNull(resSp.selectedItemPosition)?.let { p["w"] = "${it.width}"; p["h"] = "${it.height}" }
                 p["fps"] = "${fpsValues[fpsSp.selectedItemPosition]}"
-                p["bitrate"] = "${(brBar.progress + 1) * 1000}"
+                p["bitrate"] = "${brValues[brSp.selectedItemPosition]}"
                 p["audio_source"] = audioSrcValues[audioSp.selectedItemPosition]
                 p["wb"] = wbValues[wbSp.selectedItemPosition]
                 p["antibanding"] = abValues[abSp.selectedItemPosition]

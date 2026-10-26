@@ -1,6 +1,6 @@
 // Притворяюсь телефоном MagerCam, чтобы проверять плагин OBS без настоящего телефона.
 // Тестовую картинку и тон 440 Гц генерирую через ffmpeg и отдаю по протоколу docs/PROTOCOL.md.
-// Запуск: node tools/fake-phone.js [port] [--key 123456]
+// Запуск: node tools/fake-phone.js [port] [--key 123456] [--stall]
 // С --key требую код доступа даже с localhost, иначе проверить его на одном компьютере нельзя.
 'use strict';
 const net = require('net');
@@ -11,7 +11,8 @@ const os = require('os');
 const args = process.argv.slice(2);
 const keyAt = args.indexOf('--key');
 const KEY = keyAt >= 0 ? String(args[keyAt + 1] || '') : '';
-const PORT = Number(args.find((a, i) => /^\d+$/.test(a) && i !== keyAt + 1) || 4848);
+const PORT = Number(args.find((a, i) => /^\d+$/.test(a) && (keyAt < 0 || i !== keyAt + 1)) || 4848);
+const STALL = args.includes('--stall');
 const state = {
   name: 'Fake Phone (' + os.hostname() + ')', ver: 2, auth: !!KEY,
   profile: '', codec: 'h264', codec_pref: 'auto', hevc: true, abr: true, bitrate_now: 4000,
@@ -86,7 +87,14 @@ function startStream(sock, query) {
   state.clients++;
   console.log(`[stream] client ${sock.remoteAddress} ${state.w}x${state.h}@${state.fps} ${state.bitrate}kbps front=${state.front} ${state.codec}`);
   sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/x-magercam\r\n\r\n');
-  const send = (b) => { if (!sock.destroyed) sock.write(b); };
+  // --stall: каждые 15 с на 3 с придерживаю пакеты, потом отдаю пачкой — так выглядит пробка в Wi-Fi
+  let held = null;
+  const send = (b) => { if (sock.destroyed) return; if (held) held.push(b); else sock.write(b); };
+  const stall = STALL ? setInterval(() => {
+    held = [];
+    setTimeout(() => { const h = held; held = null; console.log(`[stall] flushing ${h.length} packets`); for (const b of h) send(b); }, 3000);
+  }, 15000) : null;
+  sock.on('close', () => clearInterval(stall));
 
   const label = (state.front ? 'FRONT' : 'BACK') + ' cam ' + state.camera.replace(':', '-');
   const vf = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-re', '-f', 'lavfi',

@@ -186,6 +186,19 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
         fun isSizeSupported(w: Int, h: Int): Boolean =
             avcEncoderCaps.isEmpty() || avcEncoderCaps.any { it.isSizeSupported(w, h) }
 
+        /** Сколько кадров в секунду аппаратный кодер заявляет для этого размера; если не заявляет ничего, не ограничиваю. */
+        fun maxFps(w: Int, h: Int): Int {
+            // замеры производителей бывают осторожными, а 1080p 60 тянут все живые телефоны, поэтому смотрю только выше 1080p
+            if (w.toLong() * h <= 1920L * 1088) return 60
+            val best = avcEncoderCaps.mapNotNull {
+                try {
+                    if (Build.VERSION.SDK_INT >= 23) it.getAchievableFrameRatesFor(w, h)?.upper ?: it.getSupportedFrameRatesFor(w, h).upper
+                    else it.getSupportedFrameRatesFor(w, h).upper
+                } catch (_: Exception) { null }
+            }.maxOrNull() ?: return 60
+            return best.toInt().coerceIn(15, 60)
+        }
+
         /** Программный HEVC-кодер на телефоне слишком медленный для живого видео, поэтому беру только аппаратный. */
         fun isHevcSupported(w: Int = 1280, h: Int = 720): Boolean = hevcEncoderCaps.any { it.isSizeSupported(w, h) }
     }

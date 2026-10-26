@@ -134,16 +134,16 @@ class Core(val context: Context) : CameraEngine.Listener {
      * становится мягче, но не замирает.
      */
     private fun adaptBitrate() {
-        val (drops, queued) = server.takeCongestion()
+        val (drops, ageMs) = server.takeCongestion()
         val target = targetBitrate()
         var cur = bitrateNow
         if (!settings.abr || server.streamClients.isEmpty()) {
             cur = target
             calmTicks = 0
-        } else if (drops > 0 || queued > 600_000) {
+        } else if (drops > 0 || ageMs > 200) {
             cur = maxOf(MIN_BITRATE, (cur * 0.7f).toInt())
             calmTicks = 0
-        } else if (queued < 100_000) {
+        } else if (ageMs < 60) {
             if (++calmTicks >= 4 && cur < target) {
                 cur = (cur * 1.15f).toInt() + 100
                 calmTicks = 2

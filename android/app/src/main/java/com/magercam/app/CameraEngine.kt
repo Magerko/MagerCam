@@ -407,7 +407,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val ch = streamChars ?: return
 
         val size = chooseVideoSize(ch, settings.width, settings.height)
-        val wantFps = if (fpsCap > 0) minOf(settings.fps, fpsCap) else settings.fps
+        // 4K 60 многие кодеры принимают, но не вытягивают: кадры копятся внутри, и задержка растёт без предела
+        val wantFps = minOf(if (fpsCap > 0) minOf(settings.fps, fpsCap) else settings.fps, VideoEncoder.maxFps(size.width, size.height))
         val range = chooseFpsRange(ch, wantFps)
         fpsRange = range
         val fps = minOf(wantFps, range.upper)

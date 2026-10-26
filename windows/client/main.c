@@ -17,7 +17,7 @@
 #include "../common/mcv_nv12.h"
 #include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.1.1"
+#define APP_VERSION "1.1.3"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
@@ -448,7 +448,38 @@ struct session {
 	ULONGLONG fps_t0;
 	int fps_count;
 	double fps_now;
+	/* наименьшая разница «время прихода − pts», то есть задержка сети без очереди; от неё меряю отставание */
+	int64_t lat_base;
+	bool lat_valid, lagging, wait_key;
 };
+
+/* Если декодер или сеть не успевают (4K, слабый Wi-Fi), кадры приходят всё позже, и задержка сама уже не уходит.
+ * Тогда пропускаю кадры до ключевого: читать сокет без декодирования быстро, хвост выбирается за доли секунды. */
+#define LAG_LIMIT_US 400000LL
+static bool video_lagging(struct session *s, int64_t pts_us, bool key)
+{
+	LARGE_INTEGER c, f;
+	QueryPerformanceCounter(&c);
+	QueryPerformanceFrequency(&f);
+	int64_t now_us = (int64_t)(c.QuadPart / f.QuadPart * 1000000 + c.QuadPart % f.QuadPart * 1000000 / f.QuadPart);
+	int64_t d = now_us - pts_us;
+	/* базу понемногу поднимаю, чтобы уход часов телефона и ПК не копился; реальный минимум её тут же опустит */
+	if (!s->lat_valid || d < s->lat_base) {
+		s->lat_base = d;
+		s->lat_valid = true;
+	} else {
+		s->lat_base += 20;
+	}
+	int64_t lag = d - s->lat_base;
+	if (lag > LAG_LIMIT_US && !key) {
+		s->lagging = true;
+		return true;
+	}
+	/* ключевой кадр показываю, даже если он опоздал, иначе при постоянном отставании картинка встанет совсем */
+	if (s->lagging && lag <= LAG_LIMIT_US / 2)
+		s->lagging = false;
+	return s->lagging && !key;
+}
 
 static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h)
 {
@@ -592,7 +623,11 @@ static int stream_session(const struct settings *cfg, LONG gen)
 	ULONGLONG last_ui = 0;
 	wchar_t audio_dev[256] = L"";
 
+	/* телефон может жить и слать PING, а кодер у него встал: без кадров дольше 8 с переподключаюсь */
+	ULONGLONG last_video = GetTickCount64();
 	while (ok && !app.quit && app.gen == gen) {
+		if (GetTickCount64() - last_video > 8000)
+			break;
 		uint8_t hdr[16];
 		if (!recv_all(sock, hdr, sizeof(hdr)))
 			break;
@@ -627,8 +662,18 @@ static int stream_session(const struct settings *cfg, LONG gen)
 				break;
 			}
 			decoder_feed(s.dec, payload, len, pts);
+			s.lat_valid = false;
+			s.lagging = false;
+			s.wait_key = false;
 			break;
 		case PKT_VIDEO_FRAME:
+			last_video = GetTickCount64();
+			/* после пропуска кормлю декодер только с ключевого кадра, иначе он покажет мазню из битых ссылок */
+			if (video_lagging(&s, pts, flags & 1) || (s.wait_key && !(flags & 1))) {
+				s.wait_key = true;
+				break;
+			}
+			s.wait_key = false;
 			if (s.dec && !decoder_feed(s.dec, payload, len, pts)) {
 				decoder_destroy(s.dec);
 				s.dec = NULL; /* жду следующий конфиг */

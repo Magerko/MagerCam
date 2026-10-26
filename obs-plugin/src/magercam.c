@@ -26,7 +26,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.1.2"
+#define PLUGIN_VERSION "1.1.3"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -119,6 +119,10 @@ struct mc_source {
 	bool had_video;
 	bool ever_video; /* был ли хоть один кадр; до первого показываю карточку со статусом */
 	bool stream_hevc; /* по флагу в VIDEO_CONFIG */
+	/* наименьшая разница «время прихода − pts», то есть задержка сети без очереди; от неё меряю отставание */
+	int64_t lat_base;
+	bool lat_valid;
+	bool lagging;
 	bool phone_rec;   /* под lock */
 	/* что умеют камера и кодер телефона, под lock: из этого строю списки в свойствах */
 	int phone_sizes[32][2], phone_nsizes;
@@ -997,6 +1001,33 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c)
 	}
 }
 
+/* Если декодер не успевает (4K в HEVC программно) или в сети скопился хвост, кадры приходят всё позже и позже,
+ * и задержка уже никогда не уходит. Тогда пропускаю кадры до ключевого: читать сокет без декодирования быстро,
+ * хвост выбирается за доли секунды, и картинка снова живая. */
+#define LAG_LIMIT_US 400000LL
+static bool video_lagging(struct mc_source *s, int64_t pts_us, bool key)
+{
+	int64_t d = (int64_t)(os_gettime_ns() / 1000) - pts_us;
+	/* базу понемногу поднимаю, чтобы уход часов телефона и ПК не копился; реальный минимум её тут же опустит */
+	if (!s->lat_valid || d < s->lat_base) {
+		s->lat_base = d;
+		s->lat_valid = true;
+	} else {
+		s->lat_base += 20;
+	}
+	int64_t lag = d - s->lat_base;
+	if (lag > LAG_LIMIT_US && !key) {
+		if (!s->lagging)
+			LOG(LOG_INFO, "video %lld ms behind, skipping to next keyframe", (long long)(lag / 1000));
+		s->lagging = true;
+		return true;
+	}
+	/* ключевой кадр показываю, даже если он опоздал, иначе при постоянном отставании картинка встанет совсем */
+	if (s->lagging && lag <= LAG_LIMIT_US / 2)
+		s->lagging = false;
+	return s->lagging && !key;
+}
+
 static void wait_or_wake(struct mc_source *s, DWORD ms)
 {
 	if (!s->stop)
@@ -1067,6 +1098,8 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		s->stream_hevc = false;
 		decoder_open(s, cfg->hw_decode);
 		s->ts_valid = false;
+		s->lat_valid = false;
+		s->lagging = false;
 		s->a_rate = 48000;
 		s->a_ch = 1;
 		EnterCriticalSection(&s->lock);
@@ -1075,7 +1108,14 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		set_status(s, "Подключено к %s", host);
 	}
 
+	/* телефон может жить и слать PING, но кодер у него встал (так бывало после 4K). Без кадров дольше 8 с
+	 * переподключаюсь: новое подключение заставляет телефон перезапустить поток. */
+	ULONGLONG last_video = GetTickCount64();
 	while (ok && !s->stop && s->gen == gen) {
+		if (GetTickCount64() - last_video > 8000) {
+			LOG(LOG_WARNING, "no video for 8 s, reconnecting");
+			break;
+		}
 		uint8_t hdr[16];
 		if (!recv_all(sock, hdr, sizeof(hdr)))
 			break;
@@ -1112,11 +1152,18 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		case PKT_VIDEO_CONFIG:
 			/* новая сессия кодера: пересоздаю декодер, вдруг сменилось разрешение или кодек */
 			s->stream_hevc = (hdr[3] & 2) != 0;
+			s->lat_valid = false;
+			s->lagging = false;
 			decoder_open(s, cfg->hw_decode);
 			decode_packet(s, s->payload, len, pts, true, rot, mirror);
 			s->need_key = true;
 			break;
 		case PKT_VIDEO_FRAME:
+			last_video = GetTickCount64();
+			if (video_lagging(s, pts, key)) {
+				s->need_key = true;
+				break;
+			}
 			decode_packet(s, s->payload, len, pts, key, rot, mirror);
 			break;
 		case PKT_AUDIO_CONFIG:
@@ -1283,7 +1330,8 @@ static void mc_defaults(obs_data_t *st)
 	obs_data_set_default_int(st, "rotation", -1);
 	obs_data_set_default_bool(st, "mirror", false);
 	obs_data_set_default_bool(st, "low_latency", true);
-	obs_data_set_default_bool(st, "hw_decode", false);
+	/* 4K в HEVC процессор декодирует впритык; если видеокарта не умеет, сам откачусь на программное */
+	obs_data_set_default_bool(st, "hw_decode", true);
 	obs_data_set_default_bool(st, "deactivate_hidden", false);
 	obs_data_set_default_bool(st, "clear_on_disconnect", false);
 	obs_data_set_default_bool(st, "control", true);
