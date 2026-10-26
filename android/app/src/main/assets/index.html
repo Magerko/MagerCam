@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MagerCam</title>
+<style>
+  :root { --bg:#111214; --panel:#1b1c20; --line:#2a2c31; --text:#e8e8ea; --dim:#9a9ca3; --acc:#ffb300; --red:#ff5a5a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header b { color:var(--acc); font-size:17px; }
+  header .st { color:var(--dim); margin-left:auto; text-align:right; font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1400px; margin:0 auto; }
+  @media (max-width:860px) { main { grid-template-columns:1fr; } }
+  .view { background:#000; border-radius:10px; overflow:hidden; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; position:relative; }
+  .view img { max-width:100%; max-height:100%; transition:transform .2s; cursor:crosshair; }
+  .view .hint { position:absolute; bottom:8px; left:10px; color:var(--dim); font-size:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:12px; }
+  label { display:flex; flex-direction:column; gap:4px; color:var(--dim); font-size:12px; }
+  select, input[type=range] { width:100%; }
+  select { background:#26282d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  button { flex:1; background:#26282d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px 10px; cursor:pointer; font:inherit; }
+  button.on { background:var(--acc); color:#111; border-color:var(--acc); }
+  .err { color:var(--red); }
+  .links { color:var(--dim); font-size:12px; word-break:break-all; }
+  .links code { color:var(--text); }
+</style>
+</head>
+<body>
+<header><b>MagerCam</b><span id="name"></span><span class="st" id="st">…</span></header>
+<main>
+  <div>
+    <div class="view" id="view"><img id="img" alt=""><span class="hint">Клик по картинке — фокус в точке</span></div>
+    <p class="links">
+      MJPEG для OBS «Медиаисточник» / VLC: <code id="l1"></code><br>
+      Снимок: <code id="l2"></code><br>
+      Для лучшего качества и звука используйте плагин MagerCam для OBS.
+    </p>
+  </div>
+  <div class="panel">
+    <div class="err" id="err"></div>
+    <div class="row">
+      <button id="bPlay">▶ Показать видео</button>
+    </div>
+    <label>Камера <select id="camera"></select></label>
+    <div class="row">
+      <label style="flex:2">Разрешение <select id="res"></select></label>
+      <label style="flex:1">FPS <select id="fps"><option>15</option><option>24</option><option>25</option><option>30</option><option>50</option><option>60</option></select></label>
+    </div>
+    <label>Битрейт (для OBS): <span id="brv"></span><input type="range" id="bitrate" min="1" max="50"></label>
+    <div class="row">
+      <button id="bTorch">🔦 Фонарик</button>
+      <button id="bMic">🎤 Микрофон</button>
+      <button id="bAf">◎ Фокус</button>
+    </div>
+    <label>Зум: <span id="zv"></span><input type="range" id="zoom" min="0" max="1000"></label>
+    <label>Экспозиция: <span id="ev"></span><input type="range" id="evr" min="0" max="100"></label>
+    <label>Фокус <select id="focus">
+      <option value="continuous">Непрерывный автофокус</option><option value="auto">По касанию</option>
+      <option value="infinity">Бесконечность</option><option value="macro">Макро</option><option value="manual">Ручной</option></select></label>
+    <label id="fdl">Дистанция фокуса <input type="range" id="fd" min="0" max="100"></label>
+    <label>Баланс белого <select id="wb">
+      <option value="auto">Авто</option><option value="daylight">Дневной свет</option><option value="cloudy">Облачно</option>
+      <option value="shade">Тень</option><option value="incandescent">Лампа накаливания</option>
+      <option value="fluorescent">Флуоресцентная</option><option value="twilight">Сумерки</option></select></label>
+    <label>Антимерцание <select id="antibanding">
+      <option value="auto">Авто</option><option value="50">50 Гц</option><option value="60">60 Гц</option><option value="off">Выкл</option></select></label>
+    <div class="row">
+      <button id="bStab">Стабилизация</button>
+      <button id="bAe">Фикс. экспозиции</button>
+      <button id="bAwb">Фикс. ББ</button>
+    </div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let st = null, playing = false, busy = 0;
+const base = location.origin;
+$('l1').textContent = base + '/video';
+$('l2').textContent = base + '/shot.jpg';
+
+async function set(params) {
+  busy = Date.now();
+  const q = new URLSearchParams(params).toString();
+  try { st = await (await fetch('/api/set?' + q)).json(); render(); } catch (e) {}
+}
+const zoomFrom = (p) => { const lo = Math.max(st.zoom_min, .1), hi = Math.max(st.zoom_max, lo); return hi <= lo ? lo : Math.exp(Math.log(lo) + (Math.log(hi) - Math.log(lo)) * p / 1000); };
+const zoomTo = (z) => { const lo = Math.max(st.zoom_min, .1), hi = Math.max(st.zoom_max, lo); return hi <= lo ? 0 : Math.round((Math.log(Math.min(Math.max(z, lo), hi)) - Math.log(lo)) / (Math.log(hi) - Math.log(lo)) * 1000); };
+
+function render() {
+  if (!st) return;
+  $('name').textContent = st.name;
+  $('st').textContent = `${st.w}×${st.h} @${st.fps} · OBS: ${st.clients} · 🔋${st.battery}%${st.charging ? '⚡' : ''} · ${Math.round(st.temp)}°C`;
+  $('err').textContent = st.error || '';
+  const fresh = Date.now() - busy > 1500; // don't fight the user while dragging
+  const cam = $('camera');
+  if (cam.options.length !== st.cameras.length) cam.innerHTML = st.cameras.map(c => `<option value="${c.id}">${c.label}</option>`).join('');
+  const res = $('res'), sizes = st.sizes || [];
+  if (res.dataset.k !== sizes.join()) { res.innerHTML = sizes.map(s => `<option>${s}</option>`).join(''); res.dataset.k = sizes.join(); }
+  if (fresh) {
+    cam.value = st.camera; res.value = `${st.w}x${st.h}`; $('fps').value = st.fps;
+    $('bitrate').value = Math.round(st.bitrate / 1000);
+    $('zoom').value = zoomTo(st.zoom);
+    const r = st.ev_max - st.ev_min; $('evr').value = r > 0 ? Math.round((st.ev - st.ev_min) / r * 100) : 50;
+    $('focus').value = st.focus; $('fd').value = Math.round(st.focus_dist * 100);
+    $('wb').value = st.wb; $('antibanding').value = st.antibanding;
+  }
+  $('brv').textContent = $('bitrate').value + ' Мбит/с';
+  $('zv').textContent = (+st.zoom).toFixed(1) + 'x';
+  $('ev').textContent = (st.ev >= 0 ? '+' : '') + (+st.ev).toFixed(1) + ' EV';
+  $('fdl').style.display = st.focus === 'manual' ? '' : 'none';
+  $('bTorch').classList.toggle('on', st.torch);
+  $('bMic').classList.toggle('on', st.audio);
+  $('bStab').classList.toggle('on', st.stab);
+  $('bAe').classList.toggle('on', st.ae_lock);
+  $('bAwb').classList.toggle('on', st.awb_lock);
+  const o = st.orient || 0;
+  $('img').style.transform = `rotate(${o}deg)` + (o % 180 ? ' scale(0.5625)' : '');
+}
+
+async function poll() {
+  try { st = await (await fetch('/api/status')).json(); render(); } catch (e) { $('st').textContent = 'нет связи с телефоном'; }
+  setTimeout(poll, 1500);
+}
+
+$('bPlay').onclick = () => {
+  playing = !playing;
+  $('img').src = playing ? '/video?t=' + Date.now() : '';
+  $('bPlay').textContent = playing ? '■ Скрыть видео' : '▶ Показать видео';
+};
+$('camera').onchange = (e) => set({ camera: e.target.value });
+$('res').onchange = (e) => { const [w, h] = e.target.value.split('x'); set({ w, h }); };
+$('fps').onchange = (e) => set({ fps: e.target.value });
+$('bitrate').oninput = (e) => { busy = Date.now(); $('brv').textContent = e.target.value + ' Мбит/с'; };
+$('bitrate').onchange = (e) => set({ bitrate: e.target.value * 1000 });
+$('zoom').oninput = (e) => set({ zoom: zoomFrom(+e.target.value).toFixed(3) });
+$('evr').oninput = (e) => set({ ev: (st.ev_min + (st.ev_max - st.ev_min) * e.target.value / 100).toFixed(2) });
+$('focus').onchange = (e) => set({ focus: e.target.value });
+$('fd').oninput = (e) => set({ focus_dist: (e.target.value / 100).toFixed(2) });
+$('wb').onchange = (e) => set({ wb: e.target.value });
+$('antibanding').onchange = (e) => set({ antibanding: e.target.value });
+$('bTorch').onclick = () => set({ torch: 'toggle' });
+$('bMic').onclick = () => set({ mic: st.audio ? 0 : 1 });
+$('bAf').onclick = () => set({ af: 'trigger', x: .5, y: .5 });
+$('bStab').onclick = () => set({ stab: st.stab ? 0 : 1 });
+$('bAe').onclick = () => set({ ae_lock: st.ae_lock ? 0 : 1 });
+$('bAwb').onclick = () => set({ awb_lock: st.awb_lock ? 0 : 1 });
+$('img').onclick = (e) => {
+  // click position -> unrotated sensor coordinates
+  const r = e.target.getBoundingClientRect();
+  let u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+  const o = (st && st.orient) || 0;
+  let x = u, y = v;
+  if (o === 90) { x = v; y = 1 - u; } else if (o === 180) { x = 1 - u; y = 1 - v; } else if (o === 270) { x = 1 - v; y = u; }
+  set({ af: 'trigger', x: x.toFixed(3), y: y.toFixed(3) });
+};
+poll();
+</script>
+</body>
+</html>

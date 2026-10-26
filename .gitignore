@@ -1,0 +1,21 @@
+# build output
+dist/
+build/
+*.apk
+*.res
+*.o
+
+# Android / Gradle
+android/.gradle/
+android/local.properties
+android/.kotlin/
+*.iml
+
+# IDE
+.idea/
+.vscode/
+
+# adb is downloaded from Google at install time, never committed
+adb.exe
+AdbWinApi.dll
+AdbWinUsbApi.dll
