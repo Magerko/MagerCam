@@ -13,7 +13,7 @@ mkdir -p "$HERE/build"
   -I"$DEPS/inc" -I"$DEPS/obs-studio/libobs" -I"$DEPS/ffmpeg" \
   "$HERE/src/magercam.c" \
   -L"$DEPS/implib" -lobs -lavcodec-61 -lavutil-59 \
-  -lws2_32 -liphlpapi \
+  -lws2_32 -liphlpapi -lgdi32 -luser32 \
   -static-libgcc -Wl,--no-insert-timestamp \
   -o "$HERE/build/magercam.dll"
 

@@ -26,7 +26,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.1.1"
+#define PLUGIN_VERSION "1.1.2"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -45,6 +45,7 @@ struct found_device {
 	char name[96];
 	char ip[64];
 	int port;
+	bool auth; /* на телефоне включён код доступа */
 };
 
 #define MAX_FOUND 32
@@ -116,6 +117,7 @@ struct mc_source {
 	uint8_t *payload;
 	size_t payload_cap;
 	bool had_video;
+	bool ever_video; /* был ли хоть один кадр; до первого показываю карточку со статусом */
 	bool stream_hevc; /* по флагу в VIDEO_CONFIG */
 	bool phone_rec;   /* под lock */
 	/* что умеют камера и кодер телефона, под lock: из этого строю списки в свойствах */
@@ -144,6 +146,63 @@ static bool file_exists_utf8(const char *path)
 	return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* Статус в свойствах никто не видит, пока не нажмёт «Обновить», поэтому до первого кадра пишу его прямо
+ * в картинку источника. После первого кадра молчу: на эфире короткий обрыв не должен закрывать видео. */
+static void show_card(struct mc_source *s, const char *msg)
+{
+	const int W = 1280, H = 720;
+	BITMAPINFO bi = {0};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = W;
+	bi.bmiHeader.biHeight = -H;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	void *bits = NULL;
+	HDC dc = CreateCompatibleDC(NULL);
+	HBITMAP bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
+	if (!bmp || !bits) {
+		if (dc)
+			DeleteDC(dc);
+		return;
+	}
+	HGDIOBJ old = SelectObject(dc, bmp);
+	RECT r = {0, 0, W, H};
+	HBRUSH bg = CreateSolidBrush(RGB(24, 26, 32));
+	FillRect(dc, &r, bg);
+	DeleteObject(bg);
+	SetBkMode(dc, TRANSPARENT);
+	HFONT big = CreateFontW(96, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+	HFONT small = CreateFontW(40, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+	SelectObject(dc, big);
+	SetTextColor(dc, RGB(255, 152, 0));
+	RECT t1 = {0, 180, W, 320};
+	DrawTextW(dc, L"MagerCam", -1, &t1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	SelectObject(dc, small);
+	SetTextColor(dc, RGB(220, 224, 232));
+	wchar_t *wmsg = NULL;
+	os_utf8_to_wcs_ptr(msg, 0, &wmsg);
+	RECT t2 = {120, 350, W - 120, H - 80};
+	if (wmsg)
+		DrawTextW(dc, wmsg, -1, &t2, DT_CENTER | DT_WORDBREAK);
+	bfree(wmsg);
+	GdiFlush();
+
+	struct obs_source_frame f = {0};
+	f.format = VIDEO_FORMAT_BGRX;
+	f.width = W;
+	f.height = H;
+	f.data[0] = bits;
+	f.linesize[0] = W * 4;
+	f.timestamp = os_gettime_ns();
+	obs_source_output_video(s->source, &f);
+
+	SelectObject(dc, old);
+	DeleteObject(big);
+	DeleteObject(small);
+	DeleteObject(bmp);
+	DeleteDC(dc);
+}
+
 static void set_status(struct mc_source *s, const char *fmt, ...)
 {
 	char buf[256];
@@ -152,11 +211,15 @@ static void set_status(struct mc_source *s, const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	EnterCriticalSection(&s->lock);
-	if (strcmp(buf, s->status) != 0) {
+	bool changed = strcmp(buf, s->status) != 0;
+	if (changed) {
 		strncpy(s->status, buf, sizeof(s->status) - 1);
 		LOG(LOG_INFO, "%s", buf);
 	}
+	bool card = changed && !s->ever_video;
 	LeaveCriticalSection(&s->lock);
+	if (card)
+		show_card(s, buf);
 }
 
 static void url_encode(struct dstr *d, const char *v)
@@ -576,6 +639,7 @@ static void discovery_run(int timeout_ms)
 					 obs_data_get_string(d, "name"));
 				snprintf(found[count].ip, sizeof(found[count].ip), "%s", ip);
 				found[count].port = (int)obs_data_get_int(d, "port");
+				found[count].auth = obs_data_get_bool(d, "auth");
 				if (!found[count].port)
 					found[count].port = DEFAULT_PORT;
 				count++;
@@ -780,6 +844,7 @@ static void output_frame(struct mc_source *s, AVFrame *f, int rot, bool mirror)
 	out.timestamp = map_timestamp(s, pts_us, false);
 	obs_source_output_video2(s->source, &out);
 	s->had_video = true;
+	s->ever_video = true;
 }
 
 static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, int64_t pts, bool key, int rot,
@@ -989,7 +1054,8 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	} else if (code == 401 || code == 429) {
 		set_status(s, code == 429 ? "Слишком много неверных кодов, телефон ждёт минуту"
 		           : cfg->key[0] ? "Неверный код доступа — введите код с экрана телефона"
-					 : "Телефон просит код доступа: введите его в поле «Код доступа»");
+					 : "Нужен код доступа: откройте свойства источника и впишите 6 цифр с экрана "
+					   "телефона в поле «Код доступа»");
 		retry = false;
 		ok = false;
 	} else if (code != 200) {
@@ -1409,14 +1475,21 @@ static void mc_hide(void *data)
 		force_reconnect(s);
 }
 
-static void fill_device_list(obs_property_t *list)
+/* Значение списка всегда сбрасываю в "", иначе при следующем открытии свойств старый выбор затёр бы
+ * IP, вписанный руками. Поэтому выбранный телефон показываю текстом первой строки. */
+static void fill_device_list(obs_property_t *list, const char *host)
 {
 	obs_property_list_clear(list);
-	obs_property_list_add_string(list, "— выберите найденный телефон —", "");
+	char first[200] = "— выберите найденный телефон —";
 	EnterCriticalSection(&g_found_lock);
+	for (int i = 0; i < g_found_count; i++)
+		if (host && *host && strcmp(g_found[i].ip, host) == 0)
+			snprintf(first, sizeof(first), "✓ %s (%s)", g_found[i].name, g_found[i].ip);
+	obs_property_list_add_string(list, first, "");
 	for (int i = 0; i < g_found_count; i++) {
 		char label[200], value[96];
-		snprintf(label, sizeof(label), "%s (%s)", g_found[i].name, g_found[i].ip);
+		snprintf(label, sizeof(label), "%s (%s)%s", g_found[i].name, g_found[i].ip,
+			 g_found[i].auth ? " — нужен код" : "");
 		snprintf(value, sizeof(value), "%s:%d", g_found[i].ip, g_found[i].port);
 		obs_property_list_add_string(list, label, value);
 	}
@@ -1429,7 +1502,6 @@ static bool on_device_selected(void *data, obs_properties_t *props, obs_property
 {
 	UNUSED_PARAMETER(data);
 	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
 	const char *v = obs_data_get_string(st, "device");
 	if (!v || !*v)
 		return false;
@@ -1439,6 +1511,7 @@ static bool on_device_selected(void *data, obs_properties_t *props, obs_property
 		obs_data_set_string(st, "host", ip);
 		obs_data_set_int(st, "port", port);
 		obs_data_set_int(st, "conn", 0);
+		fill_device_list(p, ip);
 	}
 	obs_data_set_string(st, "device", "");
 	return true;
@@ -1458,9 +1531,15 @@ static bool on_conn_changed(obs_properties_t *props, obs_property_t *p, obs_data
 static bool on_discover(obs_properties_t *props, obs_property_t *p, void *data)
 {
 	UNUSED_PARAMETER(p);
-	UNUSED_PARAMETER(data);
+	struct mc_source *s = data;
 	discovery_run(1500);
-	fill_device_list(obs_properties_get(props, "device"));
+	char host[128] = "";
+	if (s) {
+		EnterCriticalSection(&s->lock);
+		snprintf(host, sizeof(host), "%s", s->cfg.host);
+		LeaveCriticalSection(&s->lock);
+	}
+	fill_device_list(obs_properties_get(props, "device"), host);
 	return true;
 }
 
@@ -1567,7 +1646,13 @@ static obs_properties_t *mc_properties(void *data)
 				    OBS_COMBO_FORMAT_STRING);
 	if (g_found_count == 0)
 		discovery_run(800);
-	fill_device_list(p);
+	char cur_host[128] = "";
+	if (s) {
+		EnterCriticalSection(&s->lock);
+		snprintf(cur_host, sizeof(cur_host), "%s", s->cfg.host);
+		LeaveCriticalSection(&s->lock);
+	}
+	fill_device_list(p, cur_host);
 	obs_property_set_modified_callback2(p, on_device_selected, s);
 	obs_properties_add_button(conn, "discover", "Найти телефоны в сети", on_discover);
 	obs_properties_add_text(conn, "host", "IP телефона", OBS_TEXT_DEFAULT);
