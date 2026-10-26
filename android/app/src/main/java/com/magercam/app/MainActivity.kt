@@ -179,7 +179,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         pendingPair?.let { pendingPair = null; doPair(it) }
         if (surfaceReady) {
             val h = surfaceView.holder
-            c.engine.setPreviewSurface(h.surface, h.surfaceFrame.width(), h.surfaceFrame.height())
+            c.engine.setPreviewSurface(h.surface, h.surfaceFrame.width(), h.surfaceFrame.height(), displayDegrees())
         }
         refreshUi()
     }
@@ -188,7 +188,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         surfaceReady = true
-        core?.engine?.setPreviewSurface(holder.surface, width, height)
+        core?.engine?.setPreviewSurface(holder.surface, width, height, displayDegrees())
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {

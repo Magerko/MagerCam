@@ -86,6 +86,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var streamDemand = false
     private var mjpegDemand = false
     private var previewSurface: Surface? = null
+    private var previewDisplayDeg = 0
     private var previewSurfaceSize: Size? = null
 
     private var device: CameraDevice? = null
@@ -158,8 +159,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         if (mjpegDemand != on) { mjpegDemand = on; dropMjpeg = false; requestReconfigure() }
     }
 
-    fun setPreviewSurface(surface: Surface, w: Int, h: Int) = handler.post {
+    /** [displayDegrees] нужен, только когда превью рисует GL: поворот на экран камера тогда уже не применит. */
+    fun setPreviewSurface(surface: Surface, w: Int, h: Int, displayDegrees: Int) = handler.post {
         previewSurface = surface
+        previewDisplayDeg = displayDegrees
         previewSurfaceSize = Size(w, h)
         dropPreview = false
         requestReconfigure()
@@ -191,7 +194,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         recordAudio = withAudio
         recordOrientation = orientation
         recordError = null
-        if (!on) recorder.stop()
+        // кодер записи останавливаю в doReconfigure, уже после закрытия сессии: пока камера пишет
+        // в его поверхность, stop() на некоторых телефонах повисает
         requestReconfigure()
     }
 
@@ -376,7 +380,9 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         closeSession()
         // GL обязан отпустить поверхности кодера и превью раньше, чем их пересоздадут или отдадут камере
         gl?.setOutputs(emptyList())
-        val wantGl = settings.background != "off" && needCamera
+        // Превью, трансляция и запись — три потока с камеры, а на 60 к/с многие телефоны (OnePlus в том числе) такое
+        // не собирают. Тогда камера пишет в один GL-поток, а дальше кадр раздаю сама программа.
+        val wantGl = needCamera && (settings.background != "off" || recordRequested)
         if (wantGl != glActive) {
             // одна поверхность не может принадлежать и камере, и EGL, поэтому при смене режима кодер пересоздаю
             encoder.stop()
@@ -465,8 +471,14 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         if (glActive && outs.isNotEmpty()) {
             val g = gl ?: GlRenderer(ctx, settings).also { gl = it; it.orient = orientProvider() }
             val input = g.start(size.width, size.height)
-            bgError = g.error
+            bgError = if (settings.background != "off") g.error else null
             if (input != null) {
+                // то же, что камера делает с буфером превью сама: поворот сенсора к экрану, у фронталки ещё и отражение
+                val sensor = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                val front = ch.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+                val rel = if (front) (sensor + previewDisplayDeg) % 360 else (sensor - previewDisplayDeg + 360) % 360
+                // кадр фронталки в SurfaceTexture уже приходит отражённым, второй раз отражать не нужно (проверено на эмуляторе)
+                g.setPreview(ps, rel, false)
                 g.setOutputs(outs)
                 surfaces += input
             } else surfaces += outs

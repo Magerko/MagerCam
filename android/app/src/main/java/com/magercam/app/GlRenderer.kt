@@ -105,11 +105,39 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
         for (o in outputs) if (o !in keep) EGL14.eglDestroySurface(display, o.egl)
         outputs.clear()
         outputs.addAll(keep)
-        for (s in list) {
+        wanted = list
+        connectWanted(true)
+    }
+
+    /**
+     * В превью камера сама поворачивает буфер на ориентацию сенсора (и отражает фронталку), а в EGL-поверхность —
+     * нет. Поэтому для превью кадр поворачиваю здесь: буфер остаётся прежнего размера, а SurfaceView растянет
+     * его обратно в правильные пропорции.
+     */
+    @Volatile private var previewSurface: Surface? = null
+    @Volatile private var previewMap = IDENTITY
+
+    fun setPreview(surface: Surface?, rotation: Int, mirror: Boolean) {
+        previewSurface = surface
+        // rotationMap описывает, как кадр выровнять, а тут нужно обратное: развернуть его под экран
+        val r = rotationMap((360 - rotation % 360) % 360)
+        previewMap = if (mirror) mul3(r, floatArrayOf(-1f, 0f, 0f, 0f, 1f, 0f, 1f, 0f, 1f)) else r
+    }
+
+    /** Поверхности, которые нужно рисовать; часть из них может быть ещё не подключена. */
+    private var wanted: List<Surface> = emptyList()
+
+    /**
+     * Камера отпускает поверхность превью не сразу после закрытия сессии, и до этого EGL к ней не подключиться
+     * (already connected). Поэтому неподключённые выходы пробую снова на каждом кадре, а не теряю превью навсегда.
+     */
+    private fun connectWanted(log: Boolean) {
+        for (s in wanted) {
             if (outputs.any { it.surface === s } || !s.isValid) continue
             val egl = EGL14.eglCreateWindowSurface(display, config, s, intArrayOf(EGL14.EGL_NONE), 0)
             if (egl == null || egl == EGL14.EGL_NO_SURFACE) {
-                Log.w(TAG, "eglCreateWindowSurface failed: 0x${Integer.toHexString(EGL14.eglGetError())}")
+                val err = EGL14.eglGetError()
+                if (log) Log.w(TAG, "eglCreateWindowSurface failed: 0x${Integer.toHexString(err)}, retrying on next frame")
                 continue
             }
             val wh = IntArray(2)
@@ -125,6 +153,7 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)
             for (o in outputs) EGL14.eglDestroySurface(display, o.egl)
             outputs.clear()
+            wanted = emptyList()
             surfaceTexture?.release(); surfaceTexture = null
             inputSurface?.release(); inputSurface = null
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
@@ -223,6 +252,7 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
         try {
             EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)
             st.updateTexImage()
+            if (outputs.size < wanted.size) connectWanted(false)
             if (outputs.isEmpty()) return
             drawFrame(st.timestamp)
         } catch (e: Exception) {
@@ -232,11 +262,13 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
 
     private fun drawFrame(ts: Long) {
         val rot = rotationMap(orient)
-        val mode = if (settings.background == "image") 2 else 1
+        // режим 0 — фон не трогаю, а только раздаю кадр по выходам: так камере хватает одного потока на превью, трансляцию и запись
+        val mode = when (settings.background) { "image" -> 2; "blur" -> 1; else -> 0 }
         if (mode == 2) loadBackground()
+        if (mode == 0) hasMask = false
 
         // 1. маска: забираю готовую и, если сегментатор свободен, отдаю ему новый кадр
-        val seg = segmenter
+        val seg = if (mode == 0) null else segmenter
         if (maskReady && seg != null) {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTex)
             GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
@@ -296,7 +328,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             GLES20.glUseProgram(prog)
             bindQuad(prog)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(prog, "uTex"), 1, false, RAW_FRAME, 0)
-            GLES20.glUniformMatrix3fv(GLES20.glGetUniformLocation(prog, "uMap"), 1, false, IDENTITY, 0)
+            GLES20.glUniformMatrix3fv(GLES20.glGetUniformLocation(prog, "uMap"), 1, false,
+                if (o.surface === previewSurface) previewMap else IDENTITY, 0)
             GLES20.glUniformMatrix3fv(GLES20.glGetUniformLocation(prog, "uMask"), 1, false, rot, 0)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
@@ -423,6 +456,17 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
                 else -> M6(1f, 0f, 0f, 0f, -1f, 1f)
             }
             return floatArrayOf(a, d, 0f, b, e, 0f, c, f, 1f)
+        }
+
+        /** Произведение a·b для матриц 3×3 в порядке столбцов, как их ждёт glUniformMatrix3fv. */
+        fun mul3(a: FloatArray, b: FloatArray): FloatArray {
+            val r = FloatArray(9)
+            for (col in 0 until 3) for (row in 0 until 3) {
+                var s = 0f
+                for (k in 0 until 3) s += a[k * 3 + row] * b[col * 3 + k]
+                r[col * 3 + row] = s
+            }
+            return r
         }
 
         private data class M6(val a: Float, val b: Float, val c: Float, val d: Float, val e: Float, val f: Float)
