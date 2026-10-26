@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -22,15 +24,23 @@ android {
         noCompress += "tflite"
     }
 
+    // свой ключ лежит вне репозитория и описан в android/keystore.properties; без него подписываю отладочным
+    val keyProps = rootProject.file("keystore.properties").takeIf { it.exists() }
+        ?.let { f -> Properties().apply { f.inputStream().use { load(it) } } }
+
     signingConfigs {
-        // Подписываю релиз отладочным ключом, чтобы APK ставился сразу без лишних шагов
-        getByName("debug")
+        if (keyProps != null) create("release") {
+            storeFile = file(keyProps.getProperty("storeFile"))
+            storePassword = keyProps.getProperty("storePassword")
+            keyAlias = keyProps.getProperty("keyAlias")
+            keyPassword = keyProps.getProperty("keyPassword")
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (keyProps != null) "release" else "debug")
         }
     }
 

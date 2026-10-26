@@ -8,6 +8,9 @@ build/
 # Android / Gradle
 android/.gradle/
 android/local.properties
+android/keystore.properties
+*.jks
+*.keystore
 android/.kotlin/
 *.iml
 
