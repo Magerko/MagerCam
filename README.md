@@ -1,6 +1,57 @@
-# MagerCam: телефон как веб-камера (аналог DroidCam)
+<p align="center">
+  <img src="docs/images/banner.svg" alt="MagerCam — телефон как веб-камера" width="100%">
+</p>
 
-Android-телефон превращается в камеру и микрофон для компьютера по Wi-Fi или USB.
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/Magerko/MagerCam?label=%D0%B2%D0%B5%D1%80%D1%81%D0%B8%D1%8F&color=ff9800" alt="Версия"></a>
+  <a href="../../releases"><img src="https://img.shields.io/github/downloads/Magerko/MagerCam/total?label=%D1%81%D0%BA%D0%B0%D1%87%D0%B8%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F&color=4caf50" alt="Скачивания"></a>
+  <img src="https://img.shields.io/badge/Android-8.0%2B-3ddc84?logo=android&logoColor=white" alt="Android 8.0+">
+  <img src="https://img.shields.io/badge/Windows-11-0078d4?logo=windows11&logoColor=white" alt="Windows 11">
+  <img src="https://img.shields.io/badge/OBS_Studio-%D0%BF%D0%BB%D0%B0%D0%B3%D0%B8%D0%BD-302e31?logo=obsstudio&logoColor=white" alt="Плагин OBS Studio">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-GPL--2.0-blue" alt="GPL-2.0"></a>
+</p>
+
+<p align="center">
+  <b>Android-телефон становится веб-камерой и микрофоном для компьютера</b><br>
+  по Wi-Fi или USB, для Zoom, Discord, Teams, Telegram, браузера и OBS. Бесплатно, без рекламы и водяных знаков.
+</p>
+
+<p align="center">
+  <a href="../../releases/latest"><b>⬇ Скачать</b></a> ·
+  <a href="#установка">Установка</a> ·
+  <a href="#возможности">Возможности</a> ·
+  <a href="docs/PROTOCOL.md">Протокол</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/windows.jpg" alt="Программа MagerCam для Windows" width="100%">
+</p>
+
+## Главное
+
+| | |
+|---|---|
+| 📷 **Настоящая веб-камера в Windows 11** | Камера «MagerCam» видна в любой программе без драйверов. Можно подключить до четырёх телефонов сразу |
+| ⚡ **Быстро и чётко** | Аппаратный H.264/H.265 до 4K и 60 к/с, адаптивный битрейт, низкая задержка |
+| 🔗 **Подключение за секунды** | QR-код вместо IP-адресов, автопоиск в сети, USB через ADB с автозапуском приложения |
+| 🎙 **Звук с телефона** | Микрофон с шумоподавлением, синхронно с видео |
+| 🪄 **Обработка на телефоне** | Размытие и замена фона, автокадрирование по лицу, профили «Звонок / Стрим / Документ» |
+| 🎨 **Цвет на компьютере** | Яркость, контраст, теплота, свои LUT `.cube`, режим документа для чёткого текста |
+| 🎬 **Плагин OBS** | Источник с видео, звуком и полным управлением камерой прямо из OBS |
+| 🌐 **Веб-панель** | Управление из браузера, MJPEG для VLC и IP-камер, детектор движения |
+| 🔒 **Код доступа** | Чужой в той же сети не подключится к камере |
+
+## Скриншоты
+
+<table>
+  <tr>
+    <td width="26%" align="center"><img src="docs/images/phone.jpg" alt="Приложение"><br><sub>Приложение</sub></td>
+    <td width="26%" align="center"><img src="docs/images/phone-settings.jpg" alt="Настройки"><br><sub>Настройки</sub></td>
+    <td align="center"><img src="docs/images/obs.jpg" alt="Плагин OBS"><br><sub>Плагин OBS</sub><br><br><img src="docs/images/web-panel.jpg" alt="Веб-панель"><br><sub>Веб-панель в браузере</sub></td>
+  </tr>
+</table>
+
+## Из чего состоит
 
 | Часть | Где | Что делает |
 |-------|-----|------------|
@@ -9,20 +60,21 @@ Android-телефон превращается в камеру и микроф�
 | Плагин OBS | `obs-plugin/` | Источник «MagerCam (телефон)» прямо в OBS: видео + звук, управление камерой телефона |
 | Веб-панель | встроена в приложение | `http://IP:4848/`: просмотр и управление из браузера, MJPEG для любых программ |
 
-Протокол описан в [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
-
 ## Установка
 
-Готовые файлы лежат в [Releases](../../releases): `MagerCam.apk`, `MagerCam-Windows.zip`, `MagerCam-OBS-plugin.zip`.
+Готовые файлы лежат в [Releases](../../releases/latest): `MagerCam.apk`, `MagerCam-Windows.zip`, `MagerCam-OBS-plugin.zip`.
 
 ### 1. Приложение на телефон
 
 Скопируйте `MagerCam.apk` на телефон и откройте его (Android 8.0+). Разрешите камеру, микрофон и уведомления.
 Если телефон подключён по USB с включённой «Отладкой по USB», можно запустить `install-apk.bat`.
 
+> Начиная с 1.1.0 приложение подписано новым ключом. Если у вас стоит 1.0.0, удалите её перед установкой: поверх она не обновится.
+
 ### 2а. Программа для Windows (веб-камера для Zoom/Discord)
 
 1. Распакуйте `MagerCam-Windows.zip` и запустите **`install-windows.bat`** (он попросит права администратора).
+   Если Windows покажет «Система Windows защитила ваш компьютер», нажмите «Подробнее» → «Выполнить в любом случае»: у программы пока нет платной цифровой подписи.
    Программа ставится в `C:\Program Files\MagerCam`, появляются ярлыки в «Пуске» и на рабочем столе.
    Для режима USB установщик сам скачает `adb` с официального сайта Google (Android platform-tools).
 2. Откройте MagerCam, выберите телефон и нажмите «Подключить»:
