@@ -5,10 +5,27 @@
 #pragma once
 #include <windows.h>
 #include <mfobjects.h>
+#include <stdio.h>
 
 /* CLSID медиаисточника из magercam-vcam.dll, должен совпадать с CLSID_MagerCamSource в vcam.cpp */
 #define MCV_CLSID_STR L"{6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E41}"
 #define MCV_FRIENDLY_NAME L"MagerCam"
+
+/* камеры 2–4 отличаются последним байтом CLSID: 42, 43, 44 */
+static inline void mcv_clsid_str(int slot, wchar_t *out, int n)
+{
+	_snwprintf(out, n, L"{6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E%02X}", 0x41 + (slot < 0 ? 0 : slot));
+	out[n - 1] = 0;
+}
+
+static inline void mcv_friendly_name(int slot, wchar_t *out, int n)
+{
+	if (slot <= 0)
+		_snwprintf(out, n, L"%ls", MCV_FRIENDLY_NAME);
+	else
+		_snwprintf(out, n, L"%ls %d", MCV_FRIENDLY_NAME, slot + 1);
+	out[n - 1] = 0;
+}
 
 enum { MCV_TYPE_SOFTWARE = 0 };
 enum { MCV_LIFETIME_SESSION = 0, MCV_LIFETIME_SYSTEM = 1 };

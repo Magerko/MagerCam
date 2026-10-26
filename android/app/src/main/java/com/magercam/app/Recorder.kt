@@ -131,10 +131,16 @@ class Recorder(private val ctx: Context) {
 
     private fun drainLoop() {
         val info = MediaCodec.BufferInfo()
-        while (running) {
-            val v = video ?: break
-            drainOne(v, info, true, 10_000)
-            audio?.let { drainOne(it, info, false, 0) }
+        // любое исключение здесь уронило бы всё приложение, поэтому ловлю его и просто заканчиваю запись
+        try {
+            while (running) {
+                val v = video ?: break
+                drainOne(v, info, true, 10_000)
+                audio?.let { drainOne(it, info, false, 0) }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "drain loop", e)
+            running = false
         }
     }
 
@@ -143,8 +149,15 @@ class Recorder(private val ctx: Context) {
         if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
             synchronized(lock) {
                 val m = muxer ?: return
-                if (isVideo) videoTrack = m.addTrack(c.outputFormat) else audioTrack = m.addTrack(c.outputFormat)
-                if (videoTrack >= 0 && (audio == null || audioTrack >= 0)) { m.start(); muxerStarted = true }
+                // после старта muxer новые дорожки не принимает, а кодек при перенастройке камеры
+                // может прислать формат повторно; такой повтор пропускаю
+                if (muxerStarted || (if (isVideo) videoTrack else audioTrack) >= 0) return
+                try {
+                    if (isVideo) videoTrack = m.addTrack(c.outputFormat) else audioTrack = m.addTrack(c.outputFormat)
+                    if (videoTrack >= 0 && (audio == null || audioTrack >= 0)) { m.start(); muxerStarted = true }
+                } catch (e: Exception) {
+                    Log.w(TAG, "muxer track: $e")
+                }
             }
             return
         }

@@ -77,6 +77,7 @@ static void dbg(const char *fmt, ...)
 }
 
 struct FrameProvider {
+	int slot = 0;
 	HANDLE map = nullptr;
 	uint8_t *base = nullptr;
 	uint8_t *copy = nullptr;       // последний целый кадр клиента, прочитанный по seqlock
@@ -93,10 +94,13 @@ struct FrameProvider {
 		// клиент из пользовательской сессии не откроет объект, который создала служба.
 		ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GA;;;IU)",
 								     SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
-		map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE, MCV_SHM_NAME);
-		if (!map) // в Global\ создавать может только служба; если меня грузит обычное приложение (тест), беру Local\ как запасной вариант
-			map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE,
-						 L"Local\\MagerCamVirtualCamera");
+		wchar_t name[96];
+		mcv_shm_name(slot, L"Global\\", name, 96);
+		map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE, name);
+		if (!map) { // в Global\ создавать может только служба; если меня грузит обычное приложение (тест), беру Local\ как запасной вариант
+			mcv_shm_name(slot, L"Local\\", name, 96);
+			map = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, (DWORD)MCV_SHM_SIZE, name);
+		}
 		if (sa.lpSecurityDescriptor)
 			LocalFree(sa.lpSecurityDescriptor);
 		if (!map) {
@@ -294,8 +298,9 @@ class MagerSource;
 
 class MagerStream final : public IMyMFMediaStream2, public IMyKsControl {
 public:
-	MagerStream(MagerSource *src, CRITICAL_SECTION *lock) : m_source(src), m_lock(lock)
+	MagerStream(MagerSource *src, CRITICAL_SECTION *lock, int slot) : m_source(src), m_lock(lock)
 	{
+		m_frames.slot = slot;
 		InterlockedIncrement(&g_objects);
 	}
 	HRESULT init();
@@ -475,7 +480,7 @@ private:
 
 class MagerSource final : public IMFMediaSourceEx, public IMFGetService, public IMyKsControl, public IMySampleAllocatorControl {
 public:
-	MagerSource()
+	explicit MagerSource(int slot) : m_slot(slot)
 	{
 		InitializeCriticalSection(&m_lock);
 		InterlockedIncrement(&g_objects);
@@ -488,7 +493,7 @@ public:
 		hr = MFCreateAttributes(&m_attrs, 4);
 		if (FAILED(hr))
 			return hr;
-		m_stream = new (std::nothrow) MagerStream(this, &m_lock);
+		m_stream = new (std::nothrow) MagerStream(this, &m_lock, m_slot);
 		if (!m_stream)
 			return E_OUTOFMEMORY;
 		hr = m_stream->init();
@@ -722,6 +727,7 @@ private:
 	}
 
 	volatile LONG m_ref = 1;
+	int m_slot;
 	CRITICAL_SECTION m_lock;
 	IMFMediaEventQueue *m_queue = nullptr;
 	IMFPresentationDescriptor *m_pd = nullptr;
@@ -1052,7 +1058,7 @@ HRESULT MagerStream::deliver(IUnknown *token)
 // Активатор: именно его Frame Server создаёт через COM
 class MagerActivate final : public IMFActivate {
 public:
-	MagerActivate() { InterlockedIncrement(&g_objects); }
+	explicit MagerActivate(int slot) : m_slot(slot) { InterlockedIncrement(&g_objects); }
 	HRESULT init() { return MFCreateAttributes(&m_attrs, 4); }
 
 	STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override
@@ -1082,7 +1088,7 @@ public:
 			return E_POINTER;
 		*ppv = nullptr;
 		if (!m_source) {
-			auto *s = new (std::nothrow) MagerSource();
+			auto *s = new (std::nothrow) MagerSource(m_slot);
 			if (!s)
 				return E_OUTOFMEMORY;
 			HRESULT hr = s->init();
@@ -1155,6 +1161,7 @@ private:
 	volatile LONG m_ref = 1;
 	IMFAttributes *m_attrs = nullptr;
 	MagerSource *m_source = nullptr;
+	int m_slot;
 };
 
 class ClassFactory : public IClassFactory {
@@ -1180,7 +1187,7 @@ public:
 		*ppv = nullptr;
 		if (outer)
 			return CLASS_E_NOAGGREGATION;
-		auto *a = new (std::nothrow) MagerActivate();
+		auto *a = new (std::nothrow) MagerActivate(m_slot);
 		if (!a)
 			return E_OUTOFMEMORY;
 		HRESULT hr = a->init();
@@ -1197,12 +1204,26 @@ public:
 			InterlockedDecrement(&g_objects);
 		return S_OK;
 	}
+	int m_slot = 0;
 };
-static ClassFactory g_factory;
+static ClassFactory g_factory[MCV_MAX_SLOTS];
 
-static void clsid_string(wchar_t *out, int n)
+// CLSID камеры номер slot: базовый, у которого последний байт 41 + slot
+static int clsid_slot(REFCLSID clsid)
 {
-	StringFromGUID2(CLSID_MagerCamSource, out, n);
+	GUID base = CLSID_MagerCamSource;
+	base.Data4[7] = clsid.Data4[7];
+	if (memcmp(&base, &clsid, sizeof(GUID)) != 0)
+		return -1;
+	int slot = clsid.Data4[7] - CLSID_MagerCamSource.Data4[7];
+	return slot >= 0 && slot < MCV_MAX_SLOTS ? slot : -1;
+}
+
+static void clsid_string(int slot, wchar_t *out, int n)
+{
+	GUID g = CLSID_MagerCamSource;
+	g.Data4[7] = (BYTE)(g.Data4[7] + slot);
+	StringFromGUID2(g, out, n);
 }
 
 extern "C" {
@@ -1212,15 +1233,18 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *)
 	if (reason == DLL_PROCESS_ATTACH) {
 		g_module = inst;
 		DisableThreadLibraryCalls(inst);
+		for (int i = 0; i < MCV_MAX_SLOTS; i++)
+			g_factory[i].m_slot = i;
 	}
 	return TRUE;
 }
 
 HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **ppv)
 {
-	if (clsid != CLSID_MagerCamSource)
+	int slot = clsid_slot(clsid);
+	if (slot < 0)
 		return CLASS_E_CLASSNOTAVAILABLE;
-	return g_factory.QueryInterface(riid, ppv);
+	return g_factory[slot].QueryInterface(riid, ppv);
 }
 
 HRESULT WINAPI DllCanUnloadNow(void)
@@ -1231,33 +1255,40 @@ HRESULT WINAPI DllCanUnloadNow(void)
 HRESULT WINAPI DllRegisterServer(void)
 {
 	wchar_t clsid[64], key[160], path[MAX_PATH];
-	clsid_string(clsid, 64);
 	GetModuleFileNameW(g_module, path, MAX_PATH);
-	// Регистрирую в HKLM, а не в HKCU: Frame Server работает под LOCAL SERVICE и HKCU пользователя не видит
-	wsprintfW(key, L"Software\\Classes\\CLSID\\%s", clsid);
-	HKEY k;
-	if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
-		return SELFREG_E_CLASS;
-	const wchar_t *name = L"MagerCam Virtual Camera";
-	RegSetValueExW(k, nullptr, 0, REG_SZ, (const BYTE *)name, (DWORD)(wcslen(name) + 1) * 2);
-	RegCloseKey(k);
-	wsprintfW(key, L"Software\\Classes\\CLSID\\%s\\InprocServer32", clsid);
-	if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
-		return SELFREG_E_CLASS;
-	RegSetValueExW(k, nullptr, 0, REG_SZ, (const BYTE *)path, (DWORD)(wcslen(path) + 1) * 2);
-	const wchar_t *tm = L"Both";
-	RegSetValueExW(k, L"ThreadingModel", 0, REG_SZ, (const BYTE *)tm, (DWORD)(wcslen(tm) + 1) * 2);
-	RegCloseKey(k);
+	for (int slot = 0; slot < MCV_MAX_SLOTS; slot++) {
+		clsid_string(slot, clsid, 64);
+		// Регистрирую в HKLM, а не в HKCU: Frame Server работает под LOCAL SERVICE и HKCU пользователя не видит
+		wsprintfW(key, L"Software\\Classes\\CLSID\\%s", clsid);
+		HKEY k;
+		if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+			return SELFREG_E_CLASS;
+		const wchar_t *name = L"MagerCam Virtual Camera";
+		RegSetValueExW(k, nullptr, 0, REG_SZ, (const BYTE *)name, (DWORD)(wcslen(name) + 1) * 2);
+		RegCloseKey(k);
+		wsprintfW(key, L"Software\\Classes\\CLSID\\%s\\InprocServer32", clsid);
+		if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, key, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+			return SELFREG_E_CLASS;
+		RegSetValueExW(k, nullptr, 0, REG_SZ, (const BYTE *)path, (DWORD)(wcslen(path) + 1) * 2);
+		const wchar_t *tm = L"Both";
+		RegSetValueExW(k, L"ThreadingModel", 0, REG_SZ, (const BYTE *)tm, (DWORD)(wcslen(tm) + 1) * 2);
+		RegCloseKey(k);
+	}
 	return S_OK;
 }
 
 HRESULT WINAPI DllUnregisterServer(void)
 {
 	wchar_t clsid[64], key[160];
-	clsid_string(clsid, 64);
-	wsprintfW(key, L"Software\\Classes\\CLSID\\%s", clsid);
-	LSTATUS r = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key);
-	return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND ? S_OK : SELFREG_E_CLASS;
+	HRESULT hr = S_OK;
+	for (int slot = 0; slot < MCV_MAX_SLOTS; slot++) {
+		clsid_string(slot, clsid, 64);
+		wsprintfW(key, L"Software\\Classes\\CLSID\\%s", clsid);
+		LSTATUS r = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key);
+		if (r != ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND)
+			hr = SELFREG_E_CLASS;
+	}
+	return hr;
 }
 
 }

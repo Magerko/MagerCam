@@ -9,8 +9,9 @@ $ErrorActionPreference = 'Stop'
 Start-Transcript -Path (Join-Path $env:TEMP 'magercam-install.log') -Force | Out-Null
 
 $dest = Join-Path $env:ProgramFiles 'MagerCam'
-$clsid = '{6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E41}'
-$key = "HKLM:\Software\Classes\CLSID\$clsid"
+# по CLSID на каждую из четырёх камер: «MagerCam», «MagerCam 2»… отличаются последним байтом
+$keys = 0x41..0x44 | ForEach-Object { 'HKLM:\Software\Classes\CLSID\{6B1E3C7A-4D2F-4A8B-9C5E-2F7A1D3B8E' + $_.ToString('X2') + '}' }
+$fwRule = 'MagerCam: сопряжение по QR'
 $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\MagerCam.lnk'
 $desktop = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'MagerCam.lnk'
 
@@ -37,7 +38,8 @@ function Stop-Installed {
 
 if ($Uninstall) {
 	Stop-Installed
-	Remove-Item -Recurse -Force $key -ErrorAction SilentlyContinue
+	foreach ($key in $keys) { Remove-Item -Recurse -Force $key -ErrorAction SilentlyContinue }
+	Remove-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue
 	Remove-Item -Force $startMenu, $desktop -ErrorAction SilentlyContinue
 	Stop-Service FrameServerMonitor -Force -ErrorAction SilentlyContinue
 	Stop-Service FrameServer -Force -ErrorAction SilentlyContinue
@@ -82,10 +84,21 @@ if (-not (Test-Path (Join-Path $adbDir 'adb.exe'))) {
 	}
 }
 
-# регистрирую COM-объект именно в HKLM: служба Frame Server не видит HKCU пользователя
-New-Item -Force $key -Value 'MagerCam Virtual Camera' | Out-Null
-New-Item -Force "$key\InprocServer32" -Value (Join-Path $dest 'magercam-vcam.dll') | Out-Null
-New-ItemProperty -Force -Path "$key\InprocServer32" -Name ThreadingModel -Value 'Both' | Out-Null
+# регистрирую COM-объекты именно в HKLM: служба Frame Server не видит HKCU пользователя
+foreach ($key in $keys) {
+	New-Item -Force $key -Value 'MagerCam Virtual Camera' | Out-Null
+	New-Item -Force "$key\InprocServer32" -Value (Join-Path $dest 'magercam-vcam.dll') | Out-Null
+	New-ItemProperty -Force -Path "$key\InprocServer32" -Name ThreadingModel -Value 'Both' | Out-Null
+}
+
+# для QR-сопряжения телефон сам подключается к ПК, разрешаю это только в частных сетях
+try {
+	Remove-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue
+	New-NetFirewallRule -DisplayName $fwRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4850-4859 `
+		-Program (Join-Path $dest 'MagerCam.exe') -Profile Private, Domain | Out-Null
+} catch {
+	Write-Host "Правило брандмауэра не добавлено: $($_.Exception.Message)"
+}
 
 if (Test-Path (Join-Path $dest 'MagerCam.exe')) {
 	$sh = New-Object -ComObject WScript.Shell

@@ -13,23 +13,45 @@
   header .st { color:var(--dim); margin-left:auto; text-align:right; font-size:13px; }
   main { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; padding:16px; max-width:1400px; margin:0 auto; }
   @media (max-width:860px) { main { grid-template-columns:1fr; } }
-  .view { background:#000; border-radius:10px; overflow:hidden; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; position:relative; }
+  .view { background:#000; border-radius:10px; overflow:hidden; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; position:relative; border:2px solid transparent; transition:border-color .3s; }
+  .view.alarm { border-color:var(--red); }
   .view img { max-width:100%; max-height:100%; transition:transform .2s; cursor:crosshair; }
   .view .hint { position:absolute; bottom:8px; left:10px; color:var(--dim); font-size:12px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:12px; }
+  .panel h3 { margin:4px 0 0; font-size:13px; color:var(--acc); font-weight:600; }
   label { display:flex; flex-direction:column; gap:4px; color:var(--dim); font-size:12px; }
+  label.chk { flex-direction:row; align-items:center; gap:8px; color:var(--text); font-size:13px; }
   select, input[type=range] { width:100%; }
-  select { background:#26282d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px; }
+  select, input[type=password], input[type=text] { background:#26282d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px; font:inherit; }
   .row { display:flex; gap:8px; flex-wrap:wrap; }
   button { flex:1; background:#26282d; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px 10px; cursor:pointer; font:inherit; }
   button.on { background:var(--acc); color:#111; border-color:var(--acc); }
+  button.rec.on { background:var(--red); border-color:var(--red); color:#fff; }
   .err { color:var(--red); }
+  .note { color:var(--dim); font-size:12px; }
   .links { color:var(--dim); font-size:12px; word-break:break-all; }
   .links code { color:var(--text); }
+  #auth { display:none; position:fixed; inset:0; background:rgba(0,0,0,.75); align-items:center; justify-content:center; z-index:10; }
+  #auth form { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; width:min(340px, calc(100% - 32px)); display:flex; flex-direction:column; gap:12px; }
+  #auth input { font-size:22px; letter-spacing:6px; text-align:center; }
+  .events { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:8px; margin-top:12px; }
+  .events figure { margin:0; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .events img { width:100%; display:block; }
+  .events figcaption { padding:4px 8px; font-size:12px; color:var(--dim); display:flex; justify-content:space-between; }
+  .events a { color:var(--acc); }
 </style>
 </head>
 <body>
 <header><b>MagerCam</b><span id="name"></span><span class="st" id="st">…</span></header>
+<div id="auth">
+  <form id="authForm">
+    <b>Код доступа</b>
+    <span class="note">Введите шестизначный код с экрана телефона. Браузер его запомнит.</span>
+    <input type="password" id="authKey" inputmode="numeric" maxlength="8" autocomplete="off">
+    <span class="err" id="authErr"></span>
+    <button type="submit" class="on">Войти</button>
+  </form>
+</div>
 <main>
   <div>
     <div class="view" id="view"><img id="img" alt=""><span class="hint">Клик по картинке — фокус в точке</span></div>
@@ -38,12 +60,16 @@
       Снимок: <code id="l2"></code><br>
       Для лучшего качества и звука используйте плагин MagerCam для OBS.
     </p>
+    <div class="events" id="events"></div>
   </div>
   <div class="panel">
     <div class="err" id="err"></div>
     <div class="row">
       <button id="bPlay">▶ Показать видео</button>
     </div>
+    <label>Профиль <select id="profile">
+      <option value="">Свои настройки</option><option value="call">Звонок (720p, следить за лицом)</option>
+      <option value="stream">Стрим (1080p60)</option><option value="doc">Документ</option></select></label>
     <label>Камера <select id="camera"></select></label>
     <div class="row">
       <label style="flex:2">Разрешение <select id="res"></select></label>
@@ -72,27 +98,86 @@
       <button id="bAe">Фикс. экспозиции</button>
       <button id="bAwb">Фикс. ББ</button>
     </div>
+
+    <h3>Фон и кадр</h3>
+    <label>Фон <select id="bg">
+      <option value="off">Без обработки</option><option value="blur">Размыть</option><option value="image">Заменить картинкой</option></select></label>
+    <label id="bgsl">Сила размытия <input type="range" id="bgs" min="0" max="100"></label>
+    <div class="row">
+      <button id="bBgPick">🖼 Картинка фона…</button>
+      <input type="file" id="bgFile" accept="image/jpeg,image/png" hidden>
+    </div>
+    <div class="row">
+      <button id="bFraming">👤 Следить за лицом</button>
+      <button id="bLock">🔒 Фиксация</button>
+    </div>
+    <div class="row">
+      <button id="bRec" class="rec">⏺ Запись на телефоне</button>
+    </div>
+    <div class="row">
+      <button id="bAbr">Адаптивный битрейт</button>
+      <button id="bHeat">Защита от нагрева</button>
+    </div>
+    <span class="note" id="fxNote"></span>
+
+    <h3>Детектор движения</h3>
+    <label class="chk"><input type="checkbox" id="mdOn"> Следить за движением в кадре</label>
+    <label>Чувствительность: <span id="mdv"></span><input type="range" id="mdSens" min="1" max="100" value="50"></label>
+    <label class="chk"><input type="checkbox" id="mdSound" checked> Звуковой сигнал</label>
+    <label class="chk"><input type="checkbox" id="mdNotify"> Уведомление браузера</label>
+    <span class="note">Работает, пока открыта эта вкладка. Снимки с движением появляются под видео.</span>
   </div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 let st = null, playing = false, busy = 0;
 const base = location.origin;
-$('l1').textContent = base + '/video';
-$('l2').textContent = base + '/shot.jpg';
+const store = { get: (k) => { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
+let key = store.get('magercam_key');
+
+// код доступа: в заголовке для fetch и параметром там, где заголовок не поставить (img, ссылки)
+const withKey = (url) => key ? url + (url.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(key) : url;
+function showLinks() { $('l1').textContent = withKey(base + '/video'); $('l2').textContent = withKey(base + '/shot.jpg'); }
+showLinks();
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { ...(opts.headers || {}), ...(key ? { 'X-MagerCam-Key': key } : {}) } });
+  if (r.status === 401 || r.status === 429) {
+    askKey(r.status === 429 ? 'Слишком много неверных попыток, подождите минуту.' : (key ? 'Неверный код.' : ''));
+    throw new Error('auth');
+  }
+  return r;
+}
+function askKey(msg) {
+  $('auth').style.display = 'flex';
+  $('authErr').textContent = msg || '';
+  $('authKey').focus();
+}
+$('authForm').onsubmit = (e) => {
+  e.preventDefault();
+  key = $('authKey').value.trim();
+  store.set('magercam_key', key);
+  $('auth').style.display = 'none';
+  showLinks();
+  if (playing) $('img').src = withKey('/video?t=' + Date.now());
+  poll(true);
+};
 
 async function set(params) {
   busy = Date.now();
   const q = new URLSearchParams(params).toString();
-  try { st = await (await fetch('/api/set?' + q)).json(); render(); } catch (e) {}
+  try { st = await (await api('/api/set?' + q)).json(); render(); } catch (e) {}
 }
 const zoomFrom = (p) => { const lo = Math.max(st.zoom_min, .1), hi = Math.max(st.zoom_max, lo); return hi <= lo ? lo : Math.exp(Math.log(lo) + (Math.log(hi) - Math.log(lo)) * p / 1000); };
 const zoomTo = (z) => { const lo = Math.max(st.zoom_min, .1), hi = Math.max(st.zoom_max, lo); return hi <= lo ? 0 : Math.round((Math.log(Math.min(Math.max(z, lo), hi)) - Math.log(lo)) / (Math.log(hi) - Math.log(lo)) * 1000); };
+const mmss = (ms) => { const s = Math.floor(ms / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
 
 function render() {
   if (!st) return;
   $('name').textContent = st.name;
-  $('st').textContent = `${st.w}×${st.h} @${st.fps} · OBS: ${st.clients} · 🔋${st.battery}%${st.charging ? '⚡' : ''} · ${Math.round(st.temp)}°C`;
+  const codec = st.codec ? ` · ${st.codec === 'hevc' ? 'H.265' : 'H.264'}` : '';
+  $('st').textContent = `${st.w}×${st.h} @${st.fps}${codec} · OBS: ${st.clients} · 🔋${st.battery}%${st.charging ? '⚡' : ''} · ${Math.round(st.temp)}°C`;
   $('err').textContent = st.error || '';
   const fresh = Date.now() - busy > 1500; // пока ползунок тянут, не перетираю его значениями с телефона
   const cam = $('camera');
@@ -106,30 +191,52 @@ function render() {
     const r = st.ev_max - st.ev_min; $('evr').value = r > 0 ? Math.round((st.ev - st.ev_min) / r * 100) : 50;
     $('focus').value = st.focus; $('fd').value = Math.round(st.focus_dist * 100);
     $('wb').value = st.wb; $('antibanding').value = st.antibanding;
+    $('profile').value = st.profile || '';
+    $('bg').value = st.bg || 'off';
+    $('bgs').value = Math.round((st.bg_strength ?? .6) * 100);
   }
   $('brv').textContent = $('bitrate').value + ' Мбит/с';
   $('zv').textContent = (+st.zoom).toFixed(1) + 'x';
   $('ev').textContent = (st.ev >= 0 ? '+' : '') + (+st.ev).toFixed(1) + ' EV';
   $('fdl').style.display = st.focus === 'manual' ? '' : 'none';
+  $('bgsl').style.display = st.bg === 'blur' ? '' : 'none';
   $('bTorch').classList.toggle('on', st.torch);
   $('bMic').classList.toggle('on', st.audio);
   $('bStab').classList.toggle('on', st.stab);
   $('bAe').classList.toggle('on', st.ae_lock);
   $('bAwb').classList.toggle('on', st.awb_lock);
+  $('bFraming').classList.toggle('on', !!st.framing);
+  $('bLock').classList.toggle('on', !!st.lock);
+  $('bAbr').classList.toggle('on', !!st.abr);
+  $('bHeat').classList.toggle('on', !!st.heat_guard);
+  $('bRec').classList.toggle('on', !!st.rec);
+  $('bRec').textContent = st.rec ? `■ Стоп записи ${mmss(st.rec_ms || 0)}` : '⏺ Запись на телефоне';
+  const notes = [];
+  if (st.hot) notes.push('Телефон перегрет, качество временно снижено.');
+  if (st.framing && st.framing_available === false) notes.push('Эта камера не умеет находить лица.');
+  else if (st.framing && !st.faces) notes.push('Лицо не найдено.');
+  if (st.bg_error) notes.push('Фон: ' + st.bg_error);
+  if (st.rec_error) notes.push('Запись: ' + st.rec_error);
+  if (st.bitrate_now) notes.push(`Сейчас ${(st.bitrate_now / 1000).toFixed(1)} Мбит/с.`);
+  $('fxNote').textContent = notes.join(' ');
   const o = st.orient || 0;
   $('img').style.transform = `rotate(${o}deg)` + (o % 180 ? ' scale(0.5625)' : '');
 }
 
-async function poll() {
-  try { st = await (await fetch('/api/status')).json(); render(); } catch (e) { $('st').textContent = 'нет связи с телефоном'; }
-  setTimeout(poll, 1500);
+let pollTimer = 0;
+async function poll(once) {
+  clearTimeout(pollTimer);
+  try { st = await (await api('/api/status')).json(); render(); }
+  catch (e) { if (e.message !== 'auth') $('st').textContent = 'нет связи с телефоном'; }
+  pollTimer = setTimeout(poll, 1500);
 }
 
 $('bPlay').onclick = () => {
   playing = !playing;
-  $('img').src = playing ? '/video?t=' + Date.now() : '';
+  $('img').src = playing ? withKey('/video?t=' + Date.now()) : '';
   $('bPlay').textContent = playing ? '■ Скрыть видео' : '▶ Показать видео';
 };
+$('profile').onchange = (e) => { if (e.target.value) set({ profile: e.target.value }); };
 $('camera').onchange = (e) => set({ camera: e.target.value });
 $('res').onchange = (e) => { const [w, h] = e.target.value.split('x'); set({ w, h }); };
 $('fps').onchange = (e) => set({ fps: e.target.value });
@@ -147,6 +254,30 @@ $('bAf').onclick = () => set({ af: 'trigger', x: .5, y: .5 });
 $('bStab').onclick = () => set({ stab: st.stab ? 0 : 1 });
 $('bAe').onclick = () => set({ ae_lock: st.ae_lock ? 0 : 1 });
 $('bAwb').onclick = () => set({ awb_lock: st.awb_lock ? 0 : 1 });
+$('bFraming').onclick = () => set({ framing: st.framing ? 0 : 1 });
+$('bLock').onclick = () => set({ lock: st.lock ? 0 : 1 });
+$('bAbr').onclick = () => set({ abr: st.abr ? 0 : 1 });
+$('bHeat').onclick = () => set({ heat_guard: st.heat_guard ? 0 : 1 });
+$('bRec').onclick = () => set({ rec: st.rec ? 0 : 1 });
+$('bg').onchange = (e) => {
+  if (e.target.value === 'image' && st && !st.bg_image) { $('bgFile').click(); return; }
+  set({ bg: e.target.value });
+};
+$('bgs').onchange = (e) => set({ bg_strength: (e.target.value / 100).toFixed(2) });
+$('bgs').oninput = () => { busy = Date.now(); };
+$('bBgPick').onclick = () => $('bgFile').click();
+$('bgFile').onchange = async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  if (f.size > 12e6) { $('err').textContent = 'Картинка больше 12 МБ'; return; }
+  try {
+    const r = await api('/api/background', { method: 'POST', body: f });
+    if (!r.ok) { $('err').textContent = r.status === 415 ? 'Телефон не смог прочитать картинку' : 'Не удалось отправить картинку'; return; }
+    st = await r.json();
+    if (st.bg !== 'image') await set({ bg: 'image' }); else render();
+  } catch (e2) {}
+};
 $('img').onclick = (e) => {
   // картинка повёрнута через CSS, поэтому перевожу точку клика обратно в координаты сенсора
   const r = e.target.getBoundingClientRect();
@@ -156,6 +287,73 @@ $('img').onclick = (e) => {
   if (o === 90) { x = v; y = 1 - u; } else if (o === 180) { x = 1 - u; y = 1 - v; } else if (o === 270) { x = 1 - v; y = u; }
   set({ af: 'trigger', x: x.toFixed(3), y: y.toFixed(3) });
 };
+
+/* Детектор движения: раз в 700 мс беру снимок, уменьшаю до 64x36 в оттенках серого и считаю,
+ * какая доля точек заметно изменилась. Всё считается в браузере, телефон об этом не знает. */
+const md = { prev: null, timer: 0, last: 0, cnv: document.createElement('canvas') };
+md.cnv.width = 64; md.cnv.height = 36;
+const mdCtx = md.cnv.getContext('2d', { willReadFrequently: true });
+const sens = () => +$('mdSens').value;
+$('mdv').textContent = sens();
+$('mdSens').oninput = () => { $('mdv').textContent = sens(); store.set('magercam_md_sens', sens()); };
+if (store.get('magercam_md_sens')) { $('mdSens').value = store.get('magercam_md_sens'); $('mdv').textContent = sens(); }
+
+function beep() {
+  try {
+    const a = new (window.AudioContext || window.webkitAudioContext)(), o = a.createOscillator(), g = a.createGain();
+    o.frequency.value = 880; g.gain.value = .15; o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + .25); o.onended = () => a.close();
+  } catch (e) {}
+}
+
+async function mdTick() {
+  md.timer = setTimeout(mdTick, 700);
+  let blob;
+  try { blob = await (await api('/shot.jpg?t=' + Date.now())).blob(); } catch (e) { return; }
+  let bmp;
+  try { bmp = await createImageBitmap(blob); } catch (e) { return; }
+  mdCtx.drawImage(bmp, 0, 0, 64, 36);
+  const px = mdCtx.getImageData(0, 0, 64, 36).data, gray = new Uint8Array(64 * 36);
+  for (let i = 0; i < gray.length; i++) gray[i] = (px[i * 4] * 77 + px[i * 4 + 1] * 150 + px[i * 4 + 2] * 29) >> 8;
+  if (md.prev) {
+    // порог яркости и доля изменившихся точек зависят от чувствительности
+    const thr = 60 - sens() * 0.5, need = 0.2 - sens() * 0.0019;
+    let changed = 0;
+    for (let i = 0; i < gray.length; i++) if (Math.abs(gray[i] - md.prev[i]) > thr) changed++;
+    if (changed / gray.length > need && Date.now() - md.last > 5000) {
+      md.last = Date.now();
+      motion(blob, Math.round(changed / gray.length * 100));
+    }
+  }
+  md.prev = gray;
+  bmp.close && bmp.close();
+}
+
+function motion(blob, pct) {
+  const url = URL.createObjectURL(blob), t = new Date();
+  const time = t.toLocaleTimeString('ru-RU');
+  const fig = document.createElement('figure');
+  const name = `magercam-${t.toISOString().replace(/[:.]/g, '-')}.jpg`;
+  fig.innerHTML = `<img src="${url}" alt=""><figcaption><span>${time} · ${pct}%</span><a href="${url}" download="${name}">Сохранить</a></figcaption>`;
+  const ev = $('events');
+  ev.prepend(fig);
+  while (ev.children.length > 24) { const old = ev.lastChild; URL.revokeObjectURL(old.querySelector('img').src); old.remove(); }
+  $('view').classList.add('alarm');
+  setTimeout(() => $('view').classList.remove('alarm'), 1500);
+  if ($('mdSound').checked) beep();
+  if ($('mdNotify').checked && window.Notification && Notification.permission === 'granted')
+    new Notification('MagerCam: движение в кадре', { body: time, icon: url });
+}
+
+$('mdOn').onchange = (e) => {
+  clearTimeout(md.timer);
+  md.prev = null;
+  if (e.target.checked) mdTick();
+};
+$('mdNotify').onchange = (e) => {
+  if (e.target.checked && window.Notification && Notification.permission === 'default') Notification.requestPermission();
+};
+
 poll();
 </script>
 </body>

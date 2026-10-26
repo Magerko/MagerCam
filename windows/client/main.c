@@ -12,16 +12,22 @@
 #include "decoder.h"
 #include "audio.h"
 #include "vcam.h"
+#include "color.h"
+#include "pair.h"
 #include "../common/mcv_nv12.h"
+#include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.0.0"
+#define APP_VERSION "1.1.0"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
 #define WM_APP_INSTALLED (WM_APP + 4)
 #define WM_APP_TRAY (WM_APP + 5)
+#define WM_APP_PAIRED (WM_APP + 6)
+#define WM_APP_BG_SENT (WM_APP + 7)
 #define TIMER_CONTROLS 1
 #define TIMER_VCAM 2
+#define TIMER_COLOR 3
 #define PREVIEW_W 640
 #define PREVIEW_H 360
 #define MAX_CAMS 16
@@ -31,8 +37,15 @@ enum {
 	ID_CAMERA, ID_RES, ID_FPS, ID_BITRATE, ID_TORCH, ID_AF, ID_ZOOM, ID_EV, ID_ZOOM_LABEL, ID_EV_LABEL,
 	ID_ROT, ID_MIRROR, ID_FILL, ID_AUDIO, ID_AUDIO_DEV, ID_STATUS, ID_VCAM_STATE, ID_INSTALL, ID_AUTOSTART,
 	ID_PREVIEW, ID_TOTRAY,
+	ID_KEY, ID_PAIR, ID_HEVC, ID_MORE,
+	ID_PROFILE, ID_BG, ID_BG_STRENGTH, ID_BG_PICK, ID_FRAMING, ID_LOCK, ID_ABR, ID_HEAT, ID_REC,
+	ID_BRIGHT, ID_CONTRAST, ID_SAT, ID_WARM, ID_DOC, ID_LUT, ID_COLOR_RESET,
 	ID_TRAY_OPEN = 300, ID_TRAY_CONNECT, ID_TRAY_EXIT,
 };
+
+/* чем закончилась сессия: после отказа в коде доступа не долблю телефон повторами,
+ * иначе он закроется от меня на минуту */
+enum { SESSION_RETRY, SESSION_AUTH_FAILED };
 
 struct settings {
 	int conn; /* 0 — Wi-Fi, 1 — USB */
@@ -46,6 +59,10 @@ struct settings {
 	wchar_t audio_dev[256];
 	bool autoconnect;
 	bool to_tray; /* закрытие и сворачивание прячут окно в трей */
+	char key[16];  /* код доступа с экрана телефона */
+	bool hevc;     /* просить H.265, если в Windows есть декодер */
+	struct color_params color;
+	wchar_t lut_path[MAX_PATH];
 };
 
 struct cam_entry {
@@ -63,6 +80,13 @@ struct phone_status {
 	int ncams;
 	double zoom, zoom_min, zoom_max, ev, ev_min, ev_max;
 	wchar_t error[160];
+	/* протокол v2 */
+	char profile[16], codec[8], bg[8];
+	bool abr, lock, framing, framing_available, faces, bg_image, rec, hot, heat_guard;
+	int bitrate_now;
+	double bg_strength;
+	long long rec_ms;
+	wchar_t bg_error[120], rec_error[120];
 };
 
 static struct {
@@ -70,7 +94,18 @@ static struct {
 	HWND wnd, preview, status, vcam_label, install_btn;
 	HWND host, connect, camera, res, fps, bitrate, zoom, ev, zoom_label, ev_label, rot, mirror, fill, audio, audio_dev;
 	HWND wifi, usb, autoconnect, autostart, totray, torch;
+	HWND key, hevc, profile, bg, bg_strength, bg_strength_label, framing, lock_btn, abr, heat, rec, phone_info;
+	HWND bright, contrast, sat, warm, doc, lut_btn;
 	NOTIFYICONDATAW nid;
+	int slot;              /* номер камеры: 0 — «MagerCam», 1 — «MagerCam 2»… */
+	wchar_t section[32];   /* секция client.ini для этой камеры */
+	wchar_t cam_name[32];
+	int conn_port;         /* порт, по которому реально идёт связь (у USB он локальный) */
+	struct color_table *color; /* под lock */
+	struct color_lut *lut;
+	uint8_t *cc_buf;
+	size_t cc_cap;
+	bool bg_dirty;
 	UINT taskbar_created;
 	bool tray_hint_shown;
 	HFONT font, font_bold;
@@ -107,17 +142,17 @@ static struct {
 
 static void ini_get(const wchar_t *key, const wchar_t *def, wchar_t *out, int n)
 {
-	GetPrivateProfileStringW(L"MagerCam", key, def, out, n, app.ini);
+	GetPrivateProfileStringW(app.section, key, def, out, n, app.ini);
 }
 
 static int ini_int(const wchar_t *key, int def)
 {
-	return (int)GetPrivateProfileIntW(L"MagerCam", key, def, app.ini);
+	return (int)GetPrivateProfileIntW(app.section, key, def, app.ini);
 }
 
 static void ini_set(const wchar_t *key, const wchar_t *val)
 {
-	WritePrivateProfileStringW(L"MagerCam", key, val, app.ini);
+	WritePrivateProfileStringW(app.section, key, val, app.ini);
 }
 
 static void ini_set_int(const wchar_t *key, int v)
@@ -164,6 +199,15 @@ static void load_settings(void)
 	ini_get(L"audio_dev", L"", c->audio_dev, 256);
 	c->autoconnect = ini_int(L"autoconnect", 1) != 0;
 	c->to_tray = ini_int(L"to_tray", 1) != 0;
+	ini_get(L"key", L"", b, 256);
+	wide_to_utf8(b, c->key, sizeof(c->key));
+	c->hevc = ini_int(L"hevc", 1) != 0;
+	c->color.brightness = ini_int(L"brightness", 0);
+	c->color.contrast = ini_int(L"contrast", 0);
+	c->color.saturation = ini_int(L"saturation", 0);
+	c->color.warmth = ini_int(L"warmth", 0);
+	c->color.doc = ini_int(L"doc", 0) != 0;
+	ini_get(L"lut", L"", c->lut_path, MAX_PATH);
 }
 
 static void save_settings(void)
@@ -192,6 +236,16 @@ static void save_settings(void)
 	ini_set(L"audio_dev", c.audio_dev);
 	ini_set_int(L"autoconnect", c.autoconnect);
 	ini_set_int(L"to_tray", c.to_tray);
+	w = utf8_to_wide(c.key);
+	ini_set(L"key", w);
+	free(w);
+	ini_set_int(L"hevc", c.hevc);
+	ini_set_int(L"brightness", c.color.brightness);
+	ini_set_int(L"contrast", c.color.contrast);
+	ini_set_int(L"saturation", c.color.saturation);
+	ini_set_int(L"warmth", c.color.warmth);
+	ini_set_int(L"doc", c.color.doc);
+	ini_set(L"lut", c.lut_path);
 }
 
 static const wchar_t RUN_KEY[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -201,7 +255,7 @@ static bool autostart_enabled(void)
 	HKEY k;
 	if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS)
 		return false;
-	LSTATUS r = RegQueryValueExW(k, L"MagerCam", NULL, NULL, NULL, NULL);
+	LSTATUS r = RegQueryValueExW(k, app.cam_name, NULL, NULL, NULL, NULL);
 	RegCloseKey(k);
 	return r == ERROR_SUCCESS;
 }
@@ -212,14 +266,44 @@ static void set_autostart(bool on)
 	if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &k) != ERROR_SUCCESS)
 		return;
 	if (on) {
-		wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32];
+		wchar_t exe[MAX_PATH], cmd[MAX_PATH + 48];
 		GetModuleFileNameW(NULL, exe, MAX_PATH);
-		_snwprintf(cmd, MAX_PATH + 32, L"\"%ls\" --minimized", exe);
-		RegSetValueExW(k, L"MagerCam", 0, REG_SZ, (const BYTE *)cmd, (DWORD)(wcslen(cmd) + 1) * 2);
+		if (app.slot)
+			_snwprintf(cmd, MAX_PATH + 48, L"\"%ls\" --minimized --slot %d", exe, app.slot + 1);
+		else
+			_snwprintf(cmd, MAX_PATH + 48, L"\"%ls\" --minimized", exe);
+		RegSetValueExW(k, app.cam_name, 0, REG_SZ, (const BYTE *)cmd, (DWORD)(wcslen(cmd) + 1) * 2);
 	} else {
-		RegDeleteValueW(k, L"MagerCam");
+		RegDeleteValueW(k, app.cam_name);
 	}
 	RegCloseKey(k);
+}
+
+/* таблицу пересобираю в UI-потоке, а подменяю под lock: кадры идут из сетевого потока */
+static void rebuild_color(void)
+{
+	EnterCriticalSection(&app.lock);
+	struct color_params p = app.cfg.color;
+	LeaveCriticalSection(&app.lock);
+	struct color_table *t = color_table_build(&p, app.lut);
+	EnterCriticalSection(&app.lock);
+	struct color_table *old = app.color;
+	app.color = t;
+	LeaveCriticalSection(&app.lock);
+	color_table_free(old);
+}
+
+static bool load_lut(const wchar_t *path, char *err, size_t errsz)
+{
+	struct color_lut *l = NULL;
+	if (path && *path) {
+		l = color_lut_load(path, err, errsz);
+		if (!l)
+			return false;
+	}
+	color_lut_free(app.lut);
+	app.lut = l;
+	return true;
 }
 
 static void set_net_status(const wchar_t *fmt, ...)
@@ -276,6 +360,31 @@ static void apply_status_json(const char *text)
 		wcsncpy(p.error, w, 159);
 		free(w);
 	}
+	snprintf(p.profile, sizeof(p.profile), "%s", json_str(j, "profile", ""));
+	snprintf(p.codec, sizeof(p.codec), "%s", json_str(j, "codec", "h264"));
+	snprintf(p.bg, sizeof(p.bg), "%s", json_str(j, "bg", "off"));
+	p.abr = json_bool(j, "abr", false);
+	p.lock = json_bool(j, "lock", false);
+	p.framing = json_bool(j, "framing", false);
+	p.framing_available = json_bool(j, "framing_available", false);
+	p.faces = json_bool(j, "faces", false);
+	p.bg_image = json_bool(j, "bg_image", false);
+	p.rec = json_bool(j, "rec", false);
+	p.hot = json_bool(j, "hot", false);
+	p.heat_guard = json_bool(j, "heat_guard", false);
+	p.bitrate_now = (int)json_num(j, "bitrate_now", 0);
+	p.bg_strength = json_num(j, "bg_strength", 0.6);
+	p.rec_ms = (long long)json_num(j, "rec_ms", 0);
+	if ((err = json_str(j, "bg_error", NULL)) != NULL) {
+		w = utf8_to_wide(err);
+		wcsncpy(p.bg_error, w, 119);
+		free(w);
+	}
+	if ((err = json_str(j, "rec_error", NULL)) != NULL) {
+		w = utf8_to_wide(err);
+		wcsncpy(p.rec_error, w, 119);
+		free(w);
+	}
 	const struct json *cams = json_get(j, "cameras");
 	if (cams && cams->type == JSON_ARR) {
 		for (const struct json *c = cams->child; c && p.ncams < MAX_CAMS; c = c->next) {
@@ -324,12 +433,26 @@ struct session {
 static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h)
 {
 	struct session *s = opaque;
+	struct nv12 src = {(uint8_t *)y, (uint8_t *)uv, stride, stride, w, h};
 	EnterCriticalSection(&app.lock);
 	int rot = app.cfg.rotation < 0 ? app.ph.orient : app.cfg.rotation;
 	bool mirror = app.cfg.mirror, fill = app.cfg.fill;
+	/* цвет правлю один раз на исходном кадре, тогда и камера, и превью получают одно и то же */
+	if (app.color) {
+		size_t need = (size_t)w * h * 3 / 2;
+		if (need > app.cc_cap) {
+			free(app.cc_buf);
+			app.cc_buf = malloc(need);
+			app.cc_cap = app.cc_buf ? need : 0;
+		}
+		if (app.cc_buf) {
+			struct nv12 d = {app.cc_buf, app.cc_buf + (size_t)w * h, w, w, w, h};
+			color_apply(app.color, &src, &d);
+			src = d;
+		}
+	}
 	LeaveCriticalSection(&app.lock);
 
-	struct nv12 src = {(uint8_t *)y, (uint8_t *)uv, stride, stride, w, h};
 	vcam_write(&src, rot, mirror, fill);
 
 	s->frames++;
@@ -361,46 +484,73 @@ static void close_audio(struct session *s)
 	s->aout = NULL;
 }
 
-static void stream_session(const struct settings *cfg, LONG gen)
+static bool g_hevc_decoder; /* проверяю один раз при запуске */
+
+static int stream_session(const struct settings *cfg, LONG gen)
 {
 	char host[128];
 	snprintf(host, sizeof(host), "%s", cfg->host);
+	int port = cfg->port;
 	if (cfg->conn == 1) {
 		char err[256];
+		/* у каждой камеры свой локальный порт, чтобы два телефона по USB не мешали друг другу */
+		port = cfg->port + 100 * app.slot;
 		set_net_status(L"USB: подготовка adb…");
-		if (!adb_prepare(NULL, cfg->port, err, sizeof(err))) {
+		if (!adb_prepare(NULL, port, cfg->port, err, sizeof(err))) {
 			set_net_status_utf8(err);
-			return;
+			return SESSION_RETRY;
 		}
 		snprintf(host, sizeof(host), "127.0.0.1");
+		/* по USB телефон под рукой: если MagerCam на нём не запущено, открываю его */
+		set_net_status(L"USB: проверяю MagerCam на телефоне…");
+		if (adb_ensure_app() == 1) {
+			set_net_status(L"USB: MagerCam на телефоне запущено, жду камеру…");
+			Sleep(2500);
+		}
 	} else if (!*host) {
-		set_net_status(L"Укажите IP телефона или нажмите «Найти»");
-		return;
+		set_net_status(L"Укажите IP телефона, нажмите «Найти» или «QR-сопряжение»");
+		return SESSION_RETRY;
 	}
+	EnterCriticalSection(&app.lock);
+	app.conn_port = port;
+	LeaveCriticalSection(&app.lock);
 
 	wchar_t *whost = utf8_to_wide(host);
-	set_net_status(L"Подключение к %ls:%d…", whost, cfg->port);
-	SOCKET sock = tcp_connect(host, cfg->port, 3000);
+	set_net_status(L"Подключение к %ls:%d…", whost, port);
+	SOCKET sock = tcp_connect(host, port, 3000);
 	if (sock == INVALID_SOCKET) {
-		set_net_status(L"Нет связи с %ls:%d. Запущено ли MagerCam на телефоне?", whost, cfg->port);
+		set_net_status(L"Нет связи с %ls:%d. Запущено ли MagerCam на телефоне?", whost, port);
 		free(whost);
-		return;
+		return SESSION_RETRY;
 	}
 	EnterCriticalSection(&app.lock);
 	app.sock = sock;
 	LeaveCriticalSection(&app.lock);
 
 	set_recv_timeout(sock, 5000);
-	char cam[200], req[1024];
+	char cam[200], req[1024], keyhdr[64] = "";
 	url_encode(cam, sizeof(cam), cfg->camera);
+	if (cfg->key[0])
+		snprintf(keyhdr, sizeof(keyhdr), "X-MagerCam-Key: %s\r\n", cfg->key);
 	int n = snprintf(req, sizeof(req),
-			 "GET /stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=%s HTTP/1.1\r\nHost: %s\r\n"
-			 "User-Agent: MagerCam-Windows/" APP_VERSION "\r\n\r\n",
-			 cfg->width, cfg->height, cfg->fps, cfg->bitrate_kbps, cfg->audio ? 1 : 0, cam, host);
+			 "GET /stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=%s%s HTTP/1.1\r\nHost: %s\r\n"
+			 "User-Agent: MagerCam-Windows/" APP_VERSION "\r\n%s\r\n",
+			 cfg->width, cfg->height, cfg->fps, cfg->bitrate_kbps, cfg->audio ? 1 : 0, cam,
+			 cfg->hevc && g_hevc_decoder ? "&codec=hevc" : "", host, keyhdr);
 	bool ok = send_all(sock, req, (size_t)n);
 	int code = ok ? read_http_header(sock) : -1;
+	int result = SESSION_RETRY;
 	if (code == 409) {
 		set_net_status(L"Телефон занят другим клиентом");
+		ok = false;
+	} else if (code == 401) {
+		set_net_status(cfg->key[0] ? L"Неверный код доступа. Введите код с экрана телефона."
+					   : L"Телефон просит код доступа: введите его в поле «Код» или сопрягитесь по QR.");
+		result = SESSION_AUTH_FAILED;
+		ok = false;
+	} else if (code == 429) {
+		set_net_status(L"Слишком много неверных кодов, телефон ждёт минуту. Проверьте код.");
+		result = SESSION_AUTH_FAILED;
 		ok = false;
 	} else if (code != 200) {
 		set_net_status(L"Неверный ответ телефона (%d)", code);
@@ -428,7 +578,7 @@ static void stream_session(const struct settings *cfg, LONG gen)
 			break;
 		if (hdr[0] != 'M' || hdr[1] != 'C')
 			break;
-		int type = hdr[2];
+		int type = hdr[2], flags = hdr[3];
 		uint32_t len = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) | ((uint32_t)hdr[6] << 8) | hdr[7];
 		int64_t pts = 0;
 		for (int i = 0; i < 8; i++)
@@ -448,9 +598,11 @@ static void stream_session(const struct settings *cfg, LONG gen)
 		case PKT_VIDEO_CONFIG:
 			/* конфиг приходит заново при смене разрешения или камеры, поэтому декодер пересоздаю */
 			decoder_destroy(s.dec);
-			s.dec = decoder_create(on_frame, &s);
+			/* бит 1 во флагах конфига: телефон кодирует в H.265 */
+			s.dec = decoder_create(on_frame, &s, (flags & 2) != 0);
 			if (!s.dec) {
-				set_net_status(L"Ошибка: декодер H.264 Windows недоступен");
+				set_net_status((flags & 2) ? L"Ошибка: нет декодера H.265. Отключите «H.265» или поставьте «Расширения для видео HEVC»."
+							   : L"Ошибка: декодер H.264 Windows недоступен");
 				ok = false;
 				break;
 			}
@@ -500,10 +652,14 @@ static void stream_session(const struct settings *cfg, LONG gen)
 				wchar_t bat[64] = L"";
 				if (ph.battery >= 0)
 					_snwprintf(bat, 64, L", батарея %d%%%ls", ph.battery, ph.charging ? L" ⚡" : L"");
+				wchar_t br[48] = L"";
+				if (ph.bitrate_now > 0)
+					_snwprintf(br, 48, L", %ls %.1f Мбит/с", strcmp(ph.codec, "hevc") ? L"H.264" : L"H.265",
+						   ph.bitrate_now / 1000.0);
 				if (ph.error[0])
 					set_net_status(L"%ls: %ls", ph.name, ph.error);
 				else
-					set_net_status(L"%ls — %dx%d, %.0f к/с%ls", ph.name, ph.w, ph.h, s.fps_now, bat);
+					set_net_status(L"%ls — %dx%d, %.0f к/с%ls%ls", ph.name, ph.w, ph.h, s.fps_now, br, bat);
 			}
 		}
 	}
@@ -525,6 +681,7 @@ static void stream_session(const struct settings *cfg, LONG gen)
 	PostMessageW(app.wnd, WM_APP_FRAME, 0, 0);
 	PostMessageW(app.wnd, WM_APP_STATUS, 1, 0);
 	free(whost);
+	return result;
 }
 
 static DWORD WINAPI net_main(void *arg)
@@ -541,7 +698,10 @@ static DWORD WINAPI net_main(void *arg)
 		EnterCriticalSection(&app.lock);
 		struct settings cfg = app.cfg;
 		LeaveCriticalSection(&app.lock);
-		stream_session(&cfg, gen);
+		int r = stream_session(&cfg, gen);
+		/* после отказа по коду жду, пока пользователь не поменяет код или не переподключится */
+		while (r == SESSION_AUTH_FAILED && !app.quit && app.gen == gen && app.want_connect)
+			WaitForSingleObject(app.wake, 500);
 		if (!app.quit && app.gen == gen && app.want_connect)
 			WaitForSingleObject(app.wake, 1500);
 	}
@@ -565,39 +725,89 @@ struct control_req {
 	char host[128];
 	int port;
 	char path[512];
+	char key[16];
+	uint8_t *body; /* для POST */
+	size_t len;
 };
 
 static DWORD WINAPI control_main(void *p)
 {
 	struct control_req *r = p;
-	http_get(r->host, r->port, r->path);
+	int code = http_request(r->host, r->port, r->body ? "POST" : "GET", r->path, r->key, r->body, r->len);
+	if (r->body)
+		PostMessageW(app.wnd, WM_APP_BG_SENT, (WPARAM)code, 0);
+	free(r->body);
 	free(r);
 	return 0;
 }
 
-static void send_control(const char *fmt, ...)
+static struct control_req *control_target(void)
 {
 	struct control_req *r = calloc(1, sizeof(*r));
 	EnterCriticalSection(&app.lock);
 	bool connected = app.connected;
 	snprintf(r->host, sizeof(r->host), "%s", app.cfg.conn == 1 ? "127.0.0.1" : app.cfg.host);
-	r->port = app.cfg.port;
+	r->port = app.conn_port ? app.conn_port : app.cfg.port;
+	snprintf(r->key, sizeof(r->key), "%s", app.cfg.key);
 	LeaveCriticalSection(&app.lock);
 	if (!connected || !r->host[0]) {
 		free(r);
-		return;
+		return NULL;
 	}
+	return r;
+}
+
+static void control_start(struct control_req *r)
+{
+	HANDLE h = CreateThread(NULL, 0, control_main, r, 0, NULL);
+	if (h) {
+		CloseHandle(h);
+	} else {
+		free(r->body);
+		free(r);
+	}
+}
+
+/* картинку для замены фона отправляю телом POST /api/background как есть, телефон сам её декодирует */
+static void send_background(const wchar_t *path)
+{
+	HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return;
+	LARGE_INTEGER sz;
+	GetFileSizeEx(f, &sz);
+	struct control_req *r = NULL;
+	if (sz.QuadPart > 0 && sz.QuadPart <= 12000000 && (r = control_target()) != NULL) {
+		r->body = malloc((size_t)sz.QuadPart);
+		DWORD got = 0;
+		if (r->body && ReadFile(f, r->body, (DWORD)sz.QuadPart, &got, NULL) && got == sz.QuadPart) {
+			r->len = got;
+			snprintf(r->path, sizeof(r->path), "/api/background");
+			control_start(r);
+			r = NULL;
+		}
+	} else if (sz.QuadPart > 12000000) {
+		SetWindowTextW(app.status, L"Картинка больше 12 МБ, выберите поменьше");
+	}
+	if (r) {
+		free(r->body);
+		free(r);
+	}
+	CloseHandle(f);
+}
+
+static void send_control(const char *fmt, ...)
+{
+	struct control_req *r = control_target();
+	if (!r)
+		return;
 	char q[400];
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(q, sizeof(q), fmt, ap);
 	va_end(ap);
 	snprintf(r->path, sizeof(r->path), "/api/set?%s", q);
-	HANDLE h = CreateThread(NULL, 0, control_main, r, 0, NULL);
-	if (h)
-		CloseHandle(h);
-	else
-		free(r);
+	control_start(r);
 }
 
 static DWORD WINAPI discover_main(void *arg)
@@ -692,8 +902,11 @@ static void update_vcam_label(void)
 	bool show_install = false;
 	switch (app.vcam) {
 	case VCAM_READY:
-		t = app.vcam_in_use ? L"Виртуальная камера «MagerCam»: используется приложением ●"
-				    : L"Виртуальная камера «MagerCam»: готова. Выберите её в Zoom, Discord, Teams, браузере…";
+		_snwprintf(buf, 200,
+			   app.vcam_in_use ? L"Виртуальная камера «%ls»: используется приложением ●"
+					   : L"Виртуальная камера «%ls»: готова. Выберите её в Zoom, Discord, Teams, браузере…",
+			   app.cam_name);
+		t = buf;
 		break;
 	case VCAM_NOT_INSTALLED:
 		t = L"Виртуальная камера не установлена.";
@@ -790,7 +1003,84 @@ static void sync_phone_controls(void)
 	SetWindowTextW(app.zoom_label, b);
 	_snwprintf(b, 64, L"Экспозиция: %+.1f", on ? ph.ev : 0.0);
 	SetWindowTextW(app.ev_label, b);
+
+	HWND phone_ctl[] = {app.profile, app.bg, app.framing, app.lock_btn, app.abr, app.heat, app.rec};
+	for (size_t i = 0; i < sizeof(phone_ctl) / sizeof(phone_ctl[0]); i++)
+		EnableWindow(phone_ctl[i], on);
+	EnableWindow(app.bg_strength, on && strcmp(ph.bg, "blur") == 0);
+	if (on) {
+		static const char *profiles[] = {"", "call", "stream", "doc"};
+		int pi = 0;
+		for (int i = 0; i < 4; i++)
+			if (!strcmp(ph.profile, profiles[i]))
+				pi = i;
+		SendMessageW(app.profile, CB_SETCURSEL, pi, 0);
+		SendMessageW(app.bg, CB_SETCURSEL, !strcmp(ph.bg, "blur") ? 1 : !strcmp(ph.bg, "image") ? 2 : 0, 0);
+		if (!app.bg_dirty)
+			SendMessageW(app.bg_strength, TBM_SETPOS, TRUE, (int)lround(ph.bg_strength * 100));
+		Button_SetCheck(app.framing, ph.framing);
+		Button_SetCheck(app.lock_btn, ph.lock);
+		Button_SetCheck(app.abr, ph.abr);
+		Button_SetCheck(app.heat, ph.heat_guard);
+		SetWindowTextW(app.rec, ph.rec ? L"■ Стоп запись" : L"● Записать видео");
+	}
+	wchar_t info[256] = L"";
+	if (on) {
+		wchar_t *o = info;
+		size_t left = 256;
+		int k;
+#define ADD(...)                                          \
+	do {                                              \
+		k = _snwprintf(o, left, __VA_ARGS__);     \
+		if (k > 0 && (size_t)k < left) {          \
+			o += k;                           \
+			left -= (size_t)k;                \
+		}                                         \
+	} while (0)
+		if (ph.rec)
+			ADD(L"● Запись %02lld:%02lld  ", ph.rec_ms / 60000, ph.rec_ms / 1000 % 60);
+		if (ph.hot)
+			ADD(L"Телефон перегрет, качество снижено  ");
+		if (ph.framing && !ph.framing_available)
+			ADD(L"Эта камера не умеет искать лица  ");
+		else if (ph.framing && !ph.faces)
+			ADD(L"Лицо не найдено  ");
+		if (ph.bg_error[0])
+			ADD(L"Фон: %ls  ", ph.bg_error);
+		if (ph.rec_error[0])
+			ADD(L"Запись: %ls", ph.rec_error);
+#undef ADD
+	}
+	SetWindowTextW(app.phone_info, info);
 	app.updating_ui = false;
+}
+
+static void set_track_label(HWND tb, const wchar_t *name)
+{
+	wchar_t b[64];
+	_snwprintf(b, 64, L"%ls: %+d", name, (int)SendMessageW(tb, TBM_GETPOS, 0, 0));
+	SetWindowTextW(GetWindow(tb, GW_HWNDPREV), b);
+}
+
+static void sync_color_controls(void)
+{
+	struct color_params p = app.cfg.color;
+	SendMessageW(app.bright, TBM_SETPOS, TRUE, p.brightness);
+	SendMessageW(app.contrast, TBM_SETPOS, TRUE, p.contrast);
+	SendMessageW(app.sat, TBM_SETPOS, TRUE, p.saturation);
+	SendMessageW(app.warm, TBM_SETPOS, TRUE, p.warmth);
+	set_track_label(app.bright, L"Яркость");
+	set_track_label(app.contrast, L"Контраст");
+	set_track_label(app.sat, L"Насыщенность");
+	set_track_label(app.warm, L"Теплота");
+	Button_SetCheck(app.doc, p.doc);
+	const wchar_t *name = wcsrchr(app.cfg.lut_path, L'\\');
+	wchar_t b[MAX_PATH + 16];
+	if (app.lut && name)
+		_snwprintf(b, MAX_PATH + 16, L"LUT: %ls", name + 1);
+	else
+		wcscpy(b, L"LUT (.cube)…");
+	SetWindowTextW(app.lut_btn, b);
 }
 
 static void build_ui(void)
@@ -844,6 +1134,67 @@ static void build_ui(void)
 	group(L"Звук телефона", x, 480, w, 82);
 	app.audio = mk(L"BUTTON", L"Выводить микрофон телефона в:", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 500, w - 24, 22, ID_AUDIO);
 	app.audio_dev = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 12, 526, w - 24, 300, ID_AUDIO_DEV);
+
+	x = 980;
+	group(L"Доступ", x, 6, w, 92);
+	label(L"Код:", x + 12, 30, 40, 20);
+	app.key = mk(L"EDIT", L"", WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP, x + 52, 26, 80, 24, ID_KEY);
+	SendMessageW(app.key, EM_SETLIMITTEXT, 8, 0);
+	mk(L"BUTTON", L"QR-сопряжение…", BS_PUSHBUTTON | WS_TABSTOP, x + 140, 24, 148, 28, ID_PAIR);
+	app.hevc = mk(L"BUTTON", L"H.265 (меньше трафика)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 62, 170, 22, ID_HEVC);
+	mk(L"BUTTON", L"Ещё телефон…", BS_PUSHBUTTON | WS_TABSTOP, x + 186, 58, 102, 28, ID_MORE);
+
+	group(L"Функции телефона", x, 104, w, 238);
+	label(L"Профиль:", x + 12, 128, 70, 20);
+	app.profile = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 84, 124, 204, 200, ID_PROFILE);
+	label(L"Фон:", x + 12, 160, 70, 20);
+	app.bg = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 84, 156, 204, 200, ID_BG);
+	app.bg_strength_label = label(L"Размытие:", x + 12, 192, 70, 20);
+	app.bg_strength = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 80, 188, 212, 28, ID_BG_STRENGTH);
+	SendMessageW(app.bg_strength, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+	mk(L"BUTTON", L"Картинка фона…", BS_PUSHBUTTON | WS_TABSTOP, x + 12, 220, 135, 28, ID_BG_PICK);
+	app.rec = mk(L"BUTTON", L"● Записать видео", BS_PUSHBUTTON | WS_TABSTOP, x + 153, 220, 135, 28, ID_REC);
+	app.framing = mk(L"BUTTON", L"Следить за лицом", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 254, 140, 22, ID_FRAMING);
+	app.lock_btn = mk(L"BUTTON", L"Фикс. экспозиции", BS_AUTOCHECKBOX | WS_TABSTOP, x + 156, 254, 132, 22, ID_LOCK);
+	app.abr = mk(L"BUTTON", L"Адаптивный битрейт", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 278, 140, 22, ID_ABR);
+	app.heat = mk(L"BUTTON", L"Защита от нагрева", BS_AUTOCHECKBOX | WS_TABSTOP, x + 156, 278, 132, 22, ID_HEAT);
+	app.phone_info = label(L"", x + 12, 304, w - 24, 34);
+
+	group(L"Цвет на компьютере", x, 348, w, 214);
+	static const struct { const wchar_t *name; int id; HWND *h; } sliders[] = {
+		{L"Яркость", ID_BRIGHT, &app.bright},
+		{L"Контраст", ID_CONTRAST, &app.contrast},
+		{L"Насыщенность", ID_SAT, &app.sat},
+		{L"Теплота", ID_WARM, &app.warm},
+	};
+	for (int i = 0; i < 4; i++) {
+		/* подпись создаю прямо перед ползунком: set_track_label находит её через GW_HWNDPREV */
+		label(sliders[i].name, x + 12, 372 + i * 30, 110, 20);
+		*sliders[i].h = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 120, 368 + i * 30, 172, 26,
+				   sliders[i].id);
+		SendMessageW(*sliders[i].h, TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
+	}
+	app.doc = mk(L"BUTTON", L"Режим документа (чёткий текст)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 492,
+		     w - 24, 22, ID_DOC);
+	app.lut_btn = mk(L"BUTTON", L"LUT (.cube)…", BS_PUSHBUTTON | WS_TABSTOP, x + 12, 522, 180, 28, ID_LUT);
+	mk(L"BUTTON", L"Сбросить", BS_PUSHBUTTON | WS_TABSTOP, x + 198, 522, 90, 28, ID_COLOR_RESET);
+
+	combo_add(app.profile, L"Свои настройки", 0);
+	combo_add(app.profile, L"Звонок (720p, лицо)", 1);
+	combo_add(app.profile, L"Стрим (1080p60)", 2);
+	combo_add(app.profile, L"Документ", 3);
+	combo_add(app.bg, L"Без обработки", 0);
+	combo_add(app.bg, L"Размыть фон", 1);
+	combo_add(app.bg, L"Заменить картинкой", 2);
+	wchar_t *kw = utf8_to_wide(app.cfg.key);
+	SetWindowTextW(app.key, kw);
+	free(kw);
+	Button_SetCheck(app.hevc, app.cfg.hevc);
+	if (!g_hevc_decoder) {
+		EnableWindow(app.hevc, FALSE);
+		SetWindowTextW(app.hevc, L"H.265 (нет декодера)");
+	}
+	sync_color_controls();
 
 	HWND hint = label(L"Микрофон для Zoom/Discord: установите VB-Audio Virtual Cable, выберите здесь «CABLE Input», "
 			  L"а в приложении — микрофон «CABLE Output».",
@@ -922,7 +1273,7 @@ static void tray_add(void)
 
 static void tray_tip(const wchar_t *status)
 {
-	_snwprintf(app.nid.szTip, 127, L"MagerCam: %ls", status);
+	_snwprintf(app.nid.szTip, 127, L"%ls: %ls", app.cam_name, status);
 	app.nid.szTip[127] = 0;
 	app.nid.uFlags = NIF_TIP;
 	Shell_NotifyIconW(NIM_MODIFY, &app.nid);
@@ -1106,6 +1457,150 @@ static void on_command(int id, int code)
 		SetWindowTextW(app.vcam_label, L"Установка… подтвердите запрос Windows (UAC).");
 		CloseHandle(CreateThread(NULL, 0, install_main, NULL, 0, NULL));
 		break;
+	case ID_KEY:
+		if (code == EN_CHANGE) {
+			wchar_t k[16];
+			GetWindowTextW(app.key, k, 16);
+			EnterCriticalSection(&app.lock);
+			wide_to_utf8(k, app.cfg.key, sizeof(app.cfg.key));
+			LeaveCriticalSection(&app.lock);
+			save_settings();
+			/* переподключаюсь только на полном коде, иначе каждая цифра — неудачная попытка */
+			size_t n = wcslen(k);
+			if (app.want_connect && (n == 6 || n == 0))
+				reconnect();
+		}
+		break;
+	case ID_PAIR:
+		if (!pair_show(app.wnd, app.inst, app.font, app.dpi, WM_APP_PAIRED))
+			SetWindowTextW(app.status, L"Не удалось открыть порт для сопряжения (4850–4859 заняты?)");
+		break;
+	case ID_HEVC:
+		EnterCriticalSection(&app.lock);
+		app.cfg.hevc = Button_GetCheck(app.hevc) == BST_CHECKED;
+		LeaveCriticalSection(&app.lock);
+		save_settings();
+		if (app.want_connect)
+			reconnect(); /* кодек выбирается при подключении */
+		break;
+	case ID_MORE: {
+		/* следующая свободная камера: «MagerCam 2», «MagerCam 3»… каждая в своём окне */
+		int free_slot = -1;
+		for (int i = 0; i < MCV_MAX_SLOTS && free_slot < 0; i++) {
+			wchar_t cls[48];
+			_snwprintf(cls, 48, i ? L"MagerCamClient%d" : L"MagerCamClient", i + 1);
+			if (i != app.slot && !FindWindowW(cls, NULL))
+				free_slot = i;
+		}
+		if (free_slot < 0) {
+			SetWindowTextW(app.status, L"Уже открыты все четыре камеры MagerCam");
+			break;
+		}
+		wchar_t exe[MAX_PATH], args[32];
+		GetModuleFileNameW(NULL, exe, MAX_PATH);
+		_snwprintf(args, 32, L"--slot %d", free_slot + 1);
+		ShellExecuteW(NULL, L"open", exe, args, NULL, SW_SHOWNORMAL);
+		break;
+	}
+	case ID_PROFILE:
+		if (code == CBN_SELCHANGE) {
+			static const char *profiles[] = {"", "call", "stream", "doc"};
+			int i = (int)combo_data(app.profile);
+			if (i > 0 && i < 4)
+				send_control("profile=%s", profiles[i]);
+		}
+		break;
+	case ID_BG:
+		if (code == CBN_SELCHANGE) {
+			static const char *modes[] = {"off", "blur", "image"};
+			int i = (int)combo_data(app.bg);
+			EnterCriticalSection(&app.lock);
+			bool have_image = app.ph.bg_image;
+			LeaveCriticalSection(&app.lock);
+			if (i == 2 && !have_image)
+				on_command(ID_BG_PICK, BN_CLICKED); /* картинки на телефоне ещё нет — сначала выбрать */
+			else if (i >= 0 && i < 3)
+				send_control("bg=%s", modes[i]);
+		}
+		break;
+	case ID_BG_PICK: {
+		wchar_t path[MAX_PATH] = L"";
+		OPENFILENAMEW ofn = {sizeof(ofn)};
+		ofn.hwndOwner = app.wnd;
+		ofn.lpstrFilter = L"Изображения (*.jpg, *.png)\0*.jpg;*.jpeg;*.png\0Все файлы\0*.*\0";
+		ofn.lpstrFile = path;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+		if (GetOpenFileNameW(&ofn)) {
+			SetWindowTextW(app.status, L"Отправляю картинку фона на телефон…");
+			send_background(path);
+		} else {
+			sync_phone_controls();
+		}
+		break;
+	}
+	case ID_FRAMING:
+		send_control("framing=%d", Button_GetCheck(app.framing) == BST_CHECKED);
+		break;
+	case ID_LOCK:
+		send_control("lock=%d", Button_GetCheck(app.lock_btn) == BST_CHECKED);
+		break;
+	case ID_ABR:
+		send_control("abr=%d", Button_GetCheck(app.abr) == BST_CHECKED);
+		break;
+	case ID_HEAT:
+		send_control("heat_guard=%d", Button_GetCheck(app.heat) == BST_CHECKED);
+		break;
+	case ID_REC: {
+		EnterCriticalSection(&app.lock);
+		bool rec = app.ph.rec;
+		LeaveCriticalSection(&app.lock);
+		send_control("rec=%d", !rec);
+		break;
+	}
+	case ID_DOC:
+		EnterCriticalSection(&app.lock);
+		app.cfg.color.doc = Button_GetCheck(app.doc) == BST_CHECKED;
+		LeaveCriticalSection(&app.lock);
+		save_settings();
+		rebuild_color();
+		break;
+	case ID_LUT: {
+		wchar_t path[MAX_PATH] = L"";
+		OPENFILENAMEW ofn = {sizeof(ofn)};
+		ofn.hwndOwner = app.wnd;
+		ofn.lpstrFilter = L"3D LUT (*.cube)\0*.cube\0";
+		ofn.lpstrFile = path;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+		if (!GetOpenFileNameW(&ofn))
+			break;
+		char err[160];
+		if (!load_lut(path, err, sizeof(err))) {
+			wchar_t *we = utf8_to_wide(err), b[256];
+			_snwprintf(b, 256, L"LUT не загружен: %ls", we);
+			SetWindowTextW(app.status, b);
+			free(we);
+			break;
+		}
+		EnterCriticalSection(&app.lock);
+		wcscpy(app.cfg.lut_path, path);
+		LeaveCriticalSection(&app.lock);
+		save_settings();
+		rebuild_color();
+		sync_color_controls();
+		break;
+	}
+	case ID_COLOR_RESET:
+		EnterCriticalSection(&app.lock);
+		memset(&app.cfg.color, 0, sizeof(app.cfg.color));
+		app.cfg.lut_path[0] = 0;
+		LeaveCriticalSection(&app.lock);
+		load_lut(NULL, NULL, 0);
+		save_settings();
+		rebuild_color();
+		sync_color_controls();
+		break;
 	}
 }
 
@@ -1180,13 +1675,31 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 		SetBkMode(dc, TRANSPARENT);
 		return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 	}
-	case WM_HSCROLL:
-		if ((HWND)lp == app.zoom)
+	case WM_HSCROLL: {
+		HWND tb = (HWND)lp;
+		if (tb == app.bright || tb == app.contrast || tb == app.sat || tb == app.warm) {
+			EnterCriticalSection(&app.lock);
+			app.cfg.color.brightness = (int)SendMessageW(app.bright, TBM_GETPOS, 0, 0);
+			app.cfg.color.contrast = (int)SendMessageW(app.contrast, TBM_GETPOS, 0, 0);
+			app.cfg.color.saturation = (int)SendMessageW(app.sat, TBM_GETPOS, 0, 0);
+			app.cfg.color.warmth = (int)SendMessageW(app.warm, TBM_GETPOS, 0, 0);
+			LeaveCriticalSection(&app.lock);
+			set_track_label(app.bright, L"Яркость");
+			set_track_label(app.contrast, L"Контраст");
+			set_track_label(app.sat, L"Насыщенность");
+			set_track_label(app.warm, L"Теплота");
+			SetTimer(w, TIMER_COLOR, 80, NULL); /* таблицу собираю, когда ползунок замер */
+			return 0;
+		}
+		if (tb == app.zoom)
 			app.zoom_dirty = true;
-		else if ((HWND)lp == app.ev)
+		else if (tb == app.ev)
 			app.ev_dirty = true;
+		else if (tb == app.bg_strength)
+			app.bg_dirty = true;
 		SetTimer(w, TIMER_CONTROLS, 120, NULL);
 		return 0;
+	}
 	case WM_TIMER:
 		if (wp == TIMER_CONTROLS) {
 			KillTimer(w, TIMER_CONTROLS);
@@ -1207,11 +1720,17 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 				_snwprintf(b, 64, L"Экспозиция: %+.1f", ev);
 				SetWindowTextW(app.ev_label, b);
 			}
+			if (app.bg_dirty && ph.valid)
+				send_control("bg_strength=%.2f", (int)SendMessageW(app.bg_strength, TBM_GETPOS, 0, 0) / 100.0);
 			/* даю телефону подтвердить значение, иначе старый статус дёрнет ползунки обратно */
 			SetTimer(w, TIMER_CONTROLS + 10, 1500, NULL);
 		} else if (wp == TIMER_CONTROLS + 10) {
 			KillTimer(w, wp);
-			app.zoom_dirty = app.ev_dirty = false;
+			app.zoom_dirty = app.ev_dirty = app.bg_dirty = false;
+		} else if (wp == TIMER_COLOR) {
+			KillTimer(w, wp);
+			rebuild_color();
+			save_settings();
 		} else if (wp == TIMER_VCAM) {
 			bool in_use = app.vcam == VCAM_READY && vcam_in_use();
 			if (in_use != app.vcam_in_use) {
@@ -1257,9 +1776,43 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		return 0;
 	}
+	case WM_APP_PAIRED: {
+		struct pair_result *pr = (struct pair_result *)lp;
+		pair_close();
+		EnterCriticalSection(&app.lock);
+		app.cfg.conn = 0;
+		snprintf(app.cfg.host, sizeof(app.cfg.host), "%s", pr->ip);
+		app.cfg.port = pr->port > 0 && pr->port < 65536 ? pr->port : MC_DEFAULT_PORT;
+		snprintf(app.cfg.key, sizeof(app.cfg.key), "%s", pr->key);
+		LeaveCriticalSection(&app.lock);
+		app.updating_ui = true;
+		Button_SetCheck(app.wifi, BST_CHECKED);
+		Button_SetCheck(app.usb, BST_UNCHECKED);
+		wchar_t *ip = utf8_to_wide(pr->ip), *key = utf8_to_wide(pr->key), *nm = utf8_to_wide(pr->name);
+		SetWindowTextW(app.host, ip);
+		SetWindowTextW(app.key, key);
+		app.updating_ui = false;
+		save_settings();
+		app.want_connect = true;
+		update_connect_button();
+		set_net_status(L"Сопряжено с «%ls», подключаюсь…", nm);
+		free(ip);
+		free(key);
+		free(nm);
+		free(pr);
+		reconnect();
+		return 0;
+	}
+	case WM_APP_BG_SENT:
+		SetWindowTextW(app.status, (int)wp == 200 ? L"Картинка фона отправлена на телефон"
+				   : (int)wp == 415   ? L"Телефон не смог прочитать картинку (нужен JPEG или PNG)"
+						      : L"Не удалось отправить картинку фона");
+		if ((int)wp == 200)
+			send_control("bg=image");
+		return 0;
 	case WM_APP_INSTALLED:
 		EnableWindow(app.install_btn, TRUE);
-		app.vcam = vcam_start(&app.vcam_hr);
+		app.vcam = vcam_start(app.slot, &app.vcam_hr);
 		update_vcam_label();
 		if (app.vcam != VCAM_READY && wp != 0)
 			SetWindowTextW(app.vcam_label, L"Установка не выполнена (отменена или ошибка). Лог: %TEMP%\\magercam-install.log");
@@ -1279,10 +1832,28 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 {
 	(void)prev;
-	/* держу один экземпляр: виртуальную камеру и подключение к телефону не поделить между копиями */
-	CreateMutexW(NULL, TRUE, L"Local\\MagerCamClient");
+	/* --slot N: N-я виртуальная камера для N-го телефона, у каждой своё окно и свои настройки */
+	const wchar_t *slot_arg = cmdline ? wcsstr(cmdline, L"--slot") : NULL;
+	if (slot_arg) {
+		int n = _wtoi(slot_arg + 6);
+		app.slot = n >= 1 && n <= MCV_MAX_SLOTS ? n - 1 : 0;
+	}
+	wchar_t mutex_name[48], cls[48];
+	if (app.slot) {
+		_snwprintf(app.section, 32, L"MagerCam%d", app.slot + 1);
+		_snwprintf(app.cam_name, 32, L"MagerCam %d", app.slot + 1);
+		_snwprintf(mutex_name, 48, L"Local\\MagerCamClient%d", app.slot + 1);
+		_snwprintf(cls, 48, L"MagerCamClient%d", app.slot + 1);
+	} else {
+		wcscpy(app.section, L"MagerCam");
+		wcscpy(app.cam_name, L"MagerCam");
+		wcscpy(mutex_name, L"Local\\MagerCamClient");
+		wcscpy(cls, L"MagerCamClient");
+	}
+	/* держу один экземпляр на камеру: виртуальную камеру и подключение к телефону не поделить между копиями */
+	CreateMutexW(NULL, TRUE, mutex_name);
 	if (GetLastError() == ERROR_ALREADY_EXISTS) {
-		HWND other = FindWindowW(L"MagerCamClient", NULL);
+		HWND other = FindWindowW(cls, NULL);
 		if (other) {
 			ShowWindow(other, SW_SHOW);
 			ShowWindow(other, SW_RESTORE);
@@ -1309,21 +1880,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 	app.dpi = GetDeviceCaps(sdc, LOGPIXELSX);
 	ReleaseDC(NULL, sdc);
 
-	app.vcam = vcam_start(&app.vcam_hr);
+	app.vcam = vcam_start(app.slot, &app.vcam_hr);
+	g_hevc_decoder = decoder_hevc_available();
+	char lut_err[160];
+	if (app.cfg.lut_path[0] && !load_lut(app.cfg.lut_path, lut_err, sizeof(lut_err)))
+		app.cfg.lut_path[0] = 0;
+	rebuild_color();
 
 	WNDCLASSEXW wc = {sizeof(wc)};
 	wc.lpfnWndProc = wnd_proc;
 	wc.hInstance = inst;
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 	wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-	wc.lpszClassName = L"MagerCamClient";
+	wc.lpszClassName = cls;
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
 	wc.hIconSm = wc.hIcon;
 	RegisterClassExW(&wc);
-	RECT r = {0, 0, S(980), S(572)};
+	RECT r = {0, 0, S(1292), S(572)};
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 	AdjustWindowRect(&r, style, FALSE);
-	HWND w = CreateWindowExW(0, wc.lpszClassName, L"MagerCam — телефон как веб-камера", style, CW_USEDEFAULT,
+	wchar_t title[96];
+	_snwprintf(title, 96, L"%ls — телефон как веб-камера", app.cam_name);
+	HWND w = CreateWindowExW(0, wc.lpszClassName, title, style, CW_USEDEFAULT,
 				 CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
 	/* --minimized (автозапуск): только иконка в трее или свёрнутое окно без трея.
 	 * Первый ShowWindow всё равно берёт режим показа от того, кто меня запустил,

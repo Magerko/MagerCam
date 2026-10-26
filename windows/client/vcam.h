@@ -13,7 +13,8 @@ enum vcam_state {
 	VCAM_READY,
 };
 
-enum vcam_state vcam_start(long *hr_out);
+/* slot: 0 — «MagerCam», 1 — «MagerCam 2» и так далее */
+enum vcam_state vcam_start(int slot, long *hr_out);
 void vcam_stop(void);
 bool vcam_in_use(void);
 /* кадр подгоняю под размер, который запросило приложение, а не под размер с телефона */

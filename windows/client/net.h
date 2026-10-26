@@ -22,6 +22,9 @@ bool recv_all(SOCKET sock, uint8_t *buf, size_t n);
 bool send_all(SOCKET sock, const char *buf, size_t n);
 int read_http_header(SOCKET sock);
 bool http_get(const char *host, int port, const char *path);
+/* возвращаю HTTP-код или -1; key уходит заголовком X-MagerCam-Key */
+int http_request(const char *host, int port, const char *method, const char *path, const char *key, const void *body,
+		 size_t len);
 void url_encode(char *out, size_t outsz, const char *v);
 
 struct found_device {
@@ -33,7 +36,9 @@ int discovery_run(int timeout_ms, struct found_device *out, int max);
 
 bool find_adb(const char *configured, char *out, size_t sz);
 /* при ошибке кладу в err текст для пользователя в UTF-8 */
-bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz);
+bool adb_prepare(const char *adb_cfg, int local_port, int port, char *err, size_t errsz);
+/* если MagerCam на телефоне не запущено, открываю его: -1 ошибка, 0 уже работало, 1 только что запущено */
+int adb_ensure_app(void);
 
 enum json_type { JSON_NULL, JSON_BOOL, JSON_NUM, JSON_STR, JSON_ARR, JSON_OBJ };
 struct json {

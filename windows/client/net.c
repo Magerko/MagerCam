@@ -110,18 +110,33 @@ int read_http_header(SOCKET sock)
 	return code;
 }
 
-bool http_get(const char *host, int port, const char *path)
+int http_request(const char *host, int port, const char *method, const char *path, const char *key, const void *body,
+		 size_t len)
 {
 	SOCKET sock = tcp_connect(host, port, 2000);
 	if (sock == INVALID_SOCKET)
-		return false;
-	set_recv_timeout(sock, 2000);
-	char req[2048];
-	int n = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+		return -1;
+	set_recv_timeout(sock, body ? 15000 : 2000);
+	char req[2048], extra[256] = "";
+	if (key && *key)
+		snprintf(extra, sizeof(extra), "X-MagerCam-Key: %s\r\n", key);
+	if (body) {
+		size_t o = strlen(extra);
+		snprintf(extra + o, sizeof(extra) - o, "Content-Type: application/octet-stream\r\nContent-Length: %zu\r\n", len);
+	}
+	int n = snprintf(req, sizeof(req), "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n", method, path, host,
+			 extra);
 	bool ok = n > 0 && n < (int)sizeof(req) && send_all(sock, req, (size_t)n);
+	if (ok && body && len)
+		ok = send_all(sock, body, len);
 	int code = ok ? read_http_header(sock) : -1;
 	closesocket(sock);
-	return code == 200;
+	return code;
+}
+
+bool http_get(const char *host, int port, const char *path)
+{
+	return http_request(host, port, "GET", path, NULL, NULL, 0) == 200;
 }
 
 void url_encode(char *out, size_t outsz, const char *v)
@@ -344,7 +359,9 @@ bool find_adb(const char *configured, char *out, size_t sz)
 	return false;
 }
 
-bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
+static char g_adb[1024], g_serial[128];
+
+bool adb_prepare(const char *adb_cfg, int local_port, int port, char *err, size_t errsz)
 {
 	char adb[1024];
 	if (!find_adb(adb_cfg, adb, sizeof(adb))) {
@@ -358,8 +375,11 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 		return false;
 	}
 	/* беру устройства в состоянии "device": сначала USB (в серийнике нет ':'), потом беспроводные */
-	char cand[8][128];
-	int ncand = 0;
+	/* телефоны, проброшенные на чужой локальный порт, уже заняты другим окном MagerCam */
+	char fwd[4096] = "";
+	run_process(adb, "forward --list", fwd, sizeof(fwd), 5000);
+	char cand[8][128], first_busy[128] = "";
+	int ncand = 0, nbusy = 0;
 	bool unauthorized = false;
 	for (int pass = 0; pass < 2; pass++) {
 		char copy[4096];
@@ -373,10 +393,29 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 				unauthorized = true;
 			if (strcmp(state, "device") != 0 || ncand >= 8)
 				continue;
-			if ((pass == 0) == (strchr(ser, ':') == NULL))
+			if ((pass == 0) != (strchr(ser, ':') == NULL))
+				continue;
+			bool busy = false;
+			char fcopy[4096];
+			snprintf(fcopy, sizeof(fcopy), "%s", fwd);
+			char *fctx = NULL;
+			for (char *fl = strtok_s(fcopy, "\r\n", &fctx); fl; fl = strtok_s(NULL, "\r\n", &fctx)) {
+				char fser[128];
+				int lp = 0;
+				/* занятым считаю только проброс на порт другой камеры MagerCam: port + 100 * slot */
+				if (sscanf(fl, "%127s tcp:%d", fser, &lp) == 2 && !strcmp(fser, ser) && lp != local_port &&
+				    lp >= port && (lp - port) % 100 == 0 && (lp - port) / 100 < 4)
+					busy = true;
+			}
+			if (!busy)
 				snprintf(cand[ncand++], sizeof(cand[0]), "%s", ser);
+			else if (!nbusy++)
+				snprintf(first_busy, sizeof(first_busy), "%s", ser);
 		}
 	}
+	/* все заняты: возможно, проброс остался от закрытого окна, пробую всё равно */
+	if (ncand == 0 && nbusy > 0)
+		snprintf(cand[ncand++], sizeof(cand[0]), "%s", first_busy);
 	if (ncand == 0) {
 		snprintf(err, errsz, unauthorized ? "USB: разрешите отладку на телефоне (диалог RSA-ключа)"
 						  : "USB: телефон не найден (включите отладку по USB)");
@@ -395,12 +434,36 @@ bool adb_prepare(const char *adb_cfg, int port, char *err, size_t errsz)
 		}
 	}
 	char args[256];
-	snprintf(args, sizeof(args), "-s %s forward tcp:%d tcp:%d", serial, port, port);
+	snprintf(args, sizeof(args), "-s %s forward tcp:%d tcp:%d", serial, local_port, port);
 	if (!run_process(adb, args, out, sizeof(out), 5000)) {
 		snprintf(err, errsz, "USB: adb forward не удался: %s", out);
 		return false;
 	}
+	snprintf(g_adb, sizeof(g_adb), "%s", adb);
+	snprintf(g_serial, sizeof(g_serial), "%s", serial);
 	return true;
+}
+
+static bool adb_app_running(void)
+{
+	char args[256], pid[64] = "";
+	snprintf(args, sizeof(args), "-s %s shell pidof com.magercam.app", g_serial);
+	return run_process(g_adb, args, pid, sizeof(pid), 5000) && pid[0] >= '0' && pid[0] <= '9';
+}
+
+int adb_ensure_app(void)
+{
+	if (!g_adb[0] || !g_serial[0])
+		return -1;
+	if (adb_app_running())
+		return 0;
+	char args[256];
+	snprintf(args, sizeof(args), "-s %s shell am start -n com.magercam.app/.MainActivity", g_serial);
+	if (!run_process(g_adb, args, NULL, 0, 8000))
+		return -1;
+	for (int i = 0; i < 20 && !adb_app_running(); i++)
+		Sleep(250);
+	return 1;
 }
 
 struct jp {

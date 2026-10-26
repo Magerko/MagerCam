@@ -11,8 +11,11 @@
  */
 #pragma once
 #include <stdint.h>
+#include <stdio.h>
+#include <wchar.h>
 
 #define MCV_SHM_NAME L"Global\\MagerCamVirtualCamera"
+#define MCV_MAX_SLOTS 4 /* «MagerCam», «MagerCam 2»… — по камере на телефон */
 #define MCV_MAGIC 0x4D435643u /* 'MCVC' */
 #define MCV_VERSION 1
 #define MCV_MAX_W 1920
@@ -34,6 +37,16 @@ struct mcv_header {
 	volatile int64_t writer_tick;    /* GetTickCount64() последнего кадра, по нему понимаю, жив ли клиент */
 	volatile uint32_t writer_pid;
 };
+
+/* у первой камеры имя прежнее, чтобы старые клиенты и DLL понимали друг друга */
+static inline void mcv_shm_name(int slot, const wchar_t *prefix, wchar_t *out, int n)
+{
+	if (slot <= 0)
+		_snwprintf(out, n, L"%lsMagerCamVirtualCamera", prefix);
+	else
+		_snwprintf(out, n, L"%lsMagerCamVirtualCamera%d", prefix, slot + 1);
+	out[n - 1] = 0;
+}
 
 static inline uint8_t *mcv_frame(void *base)
 {

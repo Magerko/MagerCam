@@ -25,7 +25,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.0.0"
+#define PLUGIN_VERSION "1.1.0"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -64,6 +64,12 @@ struct mc_config {
 	double zoom, ev;
 	char wb[32], focus[32], antibanding[16];
 	bool stab;
+	char key[16];     /* код доступа с экрана телефона */
+	bool hevc;        /* просить H.265: вдвое меньше трафика при том же качестве */
+	char profile[16]; /* "" — свои настройки, иначе call/stream/doc */
+	char bg[8];       /* off/blur/image */
+	double bg_strength;
+	bool framing, lock;
 };
 
 struct mc_source {
@@ -109,6 +115,8 @@ struct mc_source {
 	uint8_t *payload;
 	size_t payload_cap;
 	bool had_video;
+	bool stream_hevc; /* по флагу в VIDEO_CONFIG */
+	bool phone_rec;   /* под lock */
 };
 
 static wchar_t *utf8_to_wide(const char *s)
@@ -255,14 +263,17 @@ static int read_http_header(SOCKET sock)
 	return code;
 }
 
-static bool http_get(const char *host, int port, const char *path)
+static bool http_get(const char *host, int port, const char *path, const char *key)
 {
 	SOCKET sock = tcp_connect(host, port, 2000);
 	if (sock == INVALID_SOCKET)
 		return false;
 	set_recv_timeout(sock, 2000);
 	struct dstr req = {0};
-	dstr_printf(&req, "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
+	dstr_printf(&req, "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n", path, host);
+	if (key && *key)
+		dstr_catf(&req, "X-MagerCam-Key: %s\r\n", key);
+	dstr_cat(&req, "\r\n");
 	bool ok = send_all(sock, req.array, req.len);
 	dstr_free(&req);
 	int code = ok ? read_http_header(sock) : -1;
@@ -458,6 +469,17 @@ static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 		snprintf(last_serial, sizeof(last_serial), "%s", serial);
 		LOG(LOG_INFO, "USB: adb '%s', device %s", adb, serial);
 	}
+	/* телефон подключён кабелем: если MagerCam на нём не запущено, открываю его */
+	char pid[64] = "";
+	snprintf(args, sizeof(args), "-s %s shell pidof com.magercam.app", serial);
+	if (!(run_process(adb, args, pid, sizeof(pid), 5000) && pid[0] >= '0' && pid[0] <= '9')) {
+		set_status(s, "USB: запускаю MagerCam на телефоне…");
+		snprintf(args, sizeof(args), "-s %s shell am start -n com.magercam.app/.MainActivity", serial);
+		if (run_process(adb, args, NULL, 0, 8000)) {
+			LOG(LOG_INFO, "USB: started MagerCam on %s", serial);
+			Sleep(3500);
+		}
+	}
 	return true;
 }
 
@@ -572,9 +594,9 @@ static void decoder_close(struct mc_source *s)
 static bool decoder_open(struct mc_source *s, bool hw)
 {
 	decoder_close(s);
-	const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	const AVCodec *codec = avcodec_find_decoder(s->stream_hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
 	if (!codec) {
-		set_status(s, "Ошибка: нет декодера H.264");
+		set_status(s, s->stream_hevc ? "Ошибка: нет декодера H.265" : "Ошибка: нет декодера H.264");
 		return false;
 	}
 	s->dec = avcodec_alloc_context3(codec);
@@ -802,9 +824,24 @@ static void apply_status_json(struct mc_source *s, const char *json)
 		obs_data_array_release(s->cameras);
 		s->cameras = cams;
 	}
+	s->phone_rec = obs_data_get_bool(d, "rec");
 	LeaveCriticalSection(&s->lock);
-	set_status(s, "Подключено: %s — %dx%d@%d, батарея %d%%%s", obs_data_get_string(d, "name"),
-		   (int)obs_data_get_int(d, "w"), (int)obs_data_get_int(d, "h"), (int)obs_data_get_int(d, "fps"),
+	char extra[160] = "";
+	int br = (int)obs_data_get_int(d, "bitrate_now");
+	if (br > 0)
+		snprintf(extra, sizeof(extra), ", %s %.1f Мбит/с", strcmp(obs_data_get_string(d, "codec"), "hevc") ? "H.264" : "H.265",
+			 br / 1000.0);
+	if (obs_data_get_bool(d, "rec")) {
+		long long ms = obs_data_get_int(d, "rec_ms");
+		size_t o = strlen(extra);
+		snprintf(extra + o, sizeof(extra) - o, ", запись %02lld:%02lld", ms / 60000, ms / 1000 % 60);
+	}
+	if (obs_data_get_bool(d, "hot")) {
+		size_t o = strlen(extra);
+		snprintf(extra + o, sizeof(extra) - o, ", телефон перегрет");
+	}
+	set_status(s, "Подключено: %s — %dx%d@%d%s, батарея %d%%%s", obs_data_get_string(d, "name"),
+		   (int)obs_data_get_int(d, "w"), (int)obs_data_get_int(d, "h"), (int)obs_data_get_int(d, "fps"), extra,
 		   (int)obs_data_get_int(d, "battery"), obs_data_get_bool(d, "charging") ? " (заряжается)" : "");
 	obs_data_release(d);
 }
@@ -814,7 +851,11 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c)
 	dstr_printf(q, "/stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=", c->width, c->height, c->fps,
 		    c->bitrate_kbps, c->audio ? 1 : 0);
 	url_encode(q, c->camera);
+	if (c->hevc && avcodec_find_decoder(AV_CODEC_ID_HEVC))
+		dstr_cat(q, "&codec=hevc");
 	if (c->control) {
+		dstr_catf(q, "&framing=%d&lock=%d&bg=%s&bg_strength=%.2f", c->framing ? 1 : 0, c->lock ? 1 : 0, c->bg,
+			  c->bg_strength);
 		dstr_catf(q, "&zoom=%.2f&ev=%.2f&stab=%d", c->zoom, c->ev, c->stab ? 1 : 0);
 		dstr_cat(q, "&wb=");
 		url_encode(q, c->wb);
@@ -831,23 +872,24 @@ static void wait_or_wake(struct mc_source *s, DWORD ms)
 		WaitForSingleObject(s->wake, ms);
 }
 
-static void stream_session(struct mc_source *s, const struct mc_config *cfg, LONG gen)
+/* false — телефон отказал по коду доступа, повторять без смены кода бессмысленно */
+static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LONG gen)
 {
 	const char *host = cfg->host;
 	if (cfg->usb) {
 		if (!adb_prepare(s, cfg->adb_path, cfg->port))
-			return;
+			return true;
 		host = "127.0.0.1";
 	} else if (!*host) {
 		set_status(s, "Укажите IP телефона или выберите его из списка");
-		return;
+		return true;
 	}
 
 	set_status(s, "Подключение к %s:%d…", host, cfg->port);
 	SOCKET sock = tcp_connect(host, cfg->port, 3000);
 	if (sock == INVALID_SOCKET) {
 		set_status(s, "Нет связи с %s:%d — запущено ли приложение MagerCam?", host, cfg->port);
-		return;
+		return true;
 	}
 	EnterCriticalSection(&s->lock);
 	s->sock = sock;
@@ -856,15 +898,25 @@ static void stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	set_recv_timeout(sock, 5000);
 	struct dstr q = {0}, req = {0};
 	build_stream_query(&q, cfg);
-	dstr_printf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: MagerCam-OBS/" PLUGIN_VERSION "\r\n\r\n", q.array,
+	dstr_printf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: MagerCam-OBS/" PLUGIN_VERSION "\r\n", q.array,
 		    host);
+	if (cfg->key[0])
+		dstr_catf(&req, "X-MagerCam-Key: %s\r\n", cfg->key);
+	dstr_cat(&req, "\r\n");
 	bool ok = send_all(sock, req.array, req.len);
 	dstr_free(&q);
 	dstr_free(&req);
 
 	int code = ok ? read_http_header(sock) : -1;
+	bool retry = true;
 	if (code == 409) {
 		set_status(s, "Телефон занят: камера используется другим клиентом");
+		ok = false;
+	} else if (code == 401 || code == 429) {
+		set_status(s, code == 429 ? "Слишком много неверных кодов, телефон ждёт минуту"
+		           : cfg->key[0] ? "Неверный код доступа — введите код с экрана телефона"
+					 : "Телефон просит код доступа: введите его в поле «Код доступа»");
+		retry = false;
 		ok = false;
 	} else if (code != 200) {
 		set_status(s, "Неверный ответ телефона (%d)", code);
@@ -872,6 +924,7 @@ static void stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	}
 
 	if (ok) {
+		s->stream_hevc = false;
 		decoder_open(s, cfg->hw_decode);
 		s->ts_valid = false;
 		s->a_rate = 48000;
@@ -917,7 +970,8 @@ static void stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 
 		switch (type) {
 		case PKT_VIDEO_CONFIG:
-			/* новая сессия кодера: пересоздаю декодер, вдруг сменилось разрешение */
+			/* новая сессия кодера: пересоздаю декодер, вдруг сменилось разрешение или кодек */
+			s->stream_hevc = (hdr[3] & 2) != 0;
 			decoder_open(s, cfg->hw_decode);
 			decode_packet(s, s->payload, len, pts, true, rot, mirror);
 			s->need_key = true;
@@ -970,6 +1024,7 @@ static void stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 			obs_source_output_video2(s->source, NULL);
 		s->had_video = false;
 	}
+	return retry;
 }
 
 static DWORD WINAPI net_thread(LPVOID param)
@@ -993,7 +1048,10 @@ static DWORD WINAPI net_thread(LPVOID param)
 			continue;
 		}
 
-		stream_session(s, &cfg, gen);
+		bool retry = stream_session(s, &cfg, gen);
+		/* после отказа по коду жду, пока код не поменяют, иначе телефон заблокирует меня на минуту */
+		while (!retry && !s->stop && s->gen == gen)
+			wait_or_wake(s, 1000);
 		if (s->stop)
 			break;
 		if (s->gen == gen)
@@ -1022,12 +1080,13 @@ struct control_req {
 	char host[128];
 	int port;
 	char path[512];
+	char key[16];
 };
 
 static DWORD WINAPI control_thread(LPVOID param)
 {
 	struct control_req *r = param;
-	if (!http_get(r->host, r->port, r->path))
+	if (!http_get(r->host, r->port, r->path, r->key))
 		LOG(LOG_WARNING, "control request failed: %s", r->path);
 	bfree(r);
 	return 0;
@@ -1039,6 +1098,7 @@ static void send_control(struct mc_source *s, const char *query)
 	EnterCriticalSection(&s->lock);
 	snprintf(r->host, sizeof(r->host), "%s", s->cfg.usb ? "127.0.0.1" : s->cfg.host);
 	r->port = s->cfg.port;
+	snprintf(r->key, sizeof(r->key), "%s", s->cfg.key);
 	LeaveCriticalSection(&s->lock);
 	snprintf(r->path, sizeof(r->path), "/api/set?%s", query);
 	if (!*r->host) {
@@ -1083,6 +1143,13 @@ static void mc_defaults(obs_data_t *st)
 	obs_data_set_default_string(st, "focus", "continuous");
 	obs_data_set_default_string(st, "antibanding", "auto");
 	obs_data_set_default_bool(st, "stab", false);
+	obs_data_set_default_string(st, "key", "");
+	obs_data_set_default_bool(st, "hevc", true);
+	obs_data_set_default_string(st, "profile", "");
+	obs_data_set_default_string(st, "bg", "off");
+	obs_data_set_default_double(st, "bg_strength", 0.6);
+	obs_data_set_default_bool(st, "framing", false);
+	obs_data_set_default_bool(st, "lock", false);
 }
 
 static void read_config(obs_data_t *st, struct mc_config *c)
@@ -1118,13 +1185,21 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 	snprintf(c->focus, sizeof(c->focus), "%s", obs_data_get_string(st, "focus"));
 	snprintf(c->antibanding, sizeof(c->antibanding), "%s", obs_data_get_string(st, "antibanding"));
 	c->stab = obs_data_get_bool(st, "stab");
+	snprintf(c->key, sizeof(c->key), "%s", obs_data_get_string(st, "key"));
+	c->hevc = obs_data_get_bool(st, "hevc");
+	snprintf(c->profile, sizeof(c->profile), "%s", obs_data_get_string(st, "profile"));
+	snprintf(c->bg, sizeof(c->bg), "%s", obs_data_get_string(st, "bg"));
+	c->bg_strength = obs_data_get_double(st, "bg_strength");
+	c->framing = obs_data_get_bool(st, "framing");
+	c->lock = obs_data_get_bool(st, "lock");
 }
 
 static bool stream_params_differ(const struct mc_config *a, const struct mc_config *b)
 {
 	return strcmp(a->host, b->host) != 0 || a->port != b->port || a->usb != b->usb ||
 	       strcmp(a->adb_path, b->adb_path) != 0 || a->width != b->width || a->height != b->height ||
-	       a->fps != b->fps || a->audio != b->audio || strcmp(a->camera, b->camera) != 0 || a->hw_decode != b->hw_decode;
+	       a->fps != b->fps || a->audio != b->audio || strcmp(a->camera, b->camera) != 0 || a->hw_decode != b->hw_decode ||
+	       strcmp(a->key, b->key) != 0 || a->hevc != b->hevc;
 }
 
 static void mc_update(void *data, obs_data_t *st)
@@ -1183,6 +1258,17 @@ static void mc_update(void *data, obs_data_t *st)
 		}
 		if (old.stab != c.stab || !old.control)
 			dstr_catf(&q, "&stab=%d", c.stab ? 1 : 0);
+		if (old.framing != c.framing || !old.control)
+			dstr_catf(&q, "&framing=%d", c.framing ? 1 : 0);
+		if (old.lock != c.lock || !old.control)
+			dstr_catf(&q, "&lock=%d", c.lock ? 1 : 0);
+		if (strcmp(old.bg, c.bg) != 0 || !old.control)
+			dstr_catf(&q, "&bg=%s", c.bg);
+		if (old.bg_strength != c.bg_strength || !old.control)
+			dstr_catf(&q, "&bg_strength=%.2f", c.bg_strength);
+		/* профиль шлю только при смене: он сам переставит разрешение, камеру и прочее */
+		if (strcmp(old.profile, c.profile) != 0 && c.profile[0])
+			dstr_catf(&q, "&profile=%s", c.profile);
 	}
 	if (q.len)
 		send_control(s, q.array + 1);
@@ -1310,6 +1396,18 @@ static bool on_torch(obs_properties_t *props, obs_property_t *p, void *data)
 	return false;
 }
 
+static bool on_record(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	struct mc_source *s = data;
+	EnterCriticalSection(&s->lock);
+	bool rec = s->phone_rec;
+	LeaveCriticalSection(&s->lock);
+	send_control(s, rec ? "rec=0" : "rec=1");
+	return false;
+}
+
 static bool on_autofocus(obs_properties_t *props, obs_property_t *p, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -1392,6 +1490,9 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_add_int(conn, "port", "Порт", 1, 65535, 1);
 	p = obs_properties_add_path(conn, "adb_path", "Путь к adb.exe (необязательно)", OBS_PATH_FILE, "adb.exe (adb.exe)",
 				    NULL);
+	p = obs_properties_add_text(conn, "key", "Код доступа", OBS_TEXT_PASSWORD);
+	obs_property_set_long_description(p, "Шестизначный код с экрана телефона. По USB он не нужен.");
+	obs_properties_add_bool(conn, "hevc", "H.265, если телефон умеет (меньше трафика)");
 	obs_properties_add_button(conn, "reconnect", "Переподключиться", on_reconnect);
 	obs_properties_add_group(props, "grp_conn", "Подключение", OBS_GROUP_NORMAL, conn);
 
@@ -1462,6 +1563,22 @@ static obs_properties_t *mc_properties(void *data)
 	obs_property_list_add_string(p, "Выкл", "off");
 	obs_properties_add_bool(cam, "stab", "Стабилизация видео");
 	obs_properties_add_group(props, "grp_cam", "Управление камерой", OBS_GROUP_NORMAL, cam);
+
+	obs_properties_t *fx = obs_properties_create();
+	p = obs_properties_add_list(fx, "profile", "Профиль", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Свои настройки", "");
+	obs_property_list_add_string(p, "Звонок (720p, следить за лицом)", "call");
+	obs_property_list_add_string(p, "Стрим (1080p60)", "stream");
+	obs_property_list_add_string(p, "Документ", "doc");
+	p = obs_properties_add_list(fx, "bg", "Фон", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Без обработки", "off");
+	obs_property_list_add_string(p, "Размыть", "blur");
+	obs_property_list_add_string(p, "Заменить картинкой (выбирается на телефоне или в программе для Windows)", "image");
+	obs_properties_add_float_slider(fx, "bg_strength", "Сила размытия", 0.0, 1.0, 0.05);
+	obs_properties_add_bool(fx, "framing", "Следить за лицом (автокадрирование)");
+	obs_properties_add_bool(fx, "lock", "Зафиксировать экспозицию и баланс белого");
+	obs_properties_add_button(fx, "record", "Запись на телефоне: старт/стоп", on_record);
+	obs_properties_add_group(props, "grp_fx", "Функции телефона", OBS_GROUP_NORMAL, fx);
 
 	obs_properties_t *adv = obs_properties_create();
 	obs_properties_add_bool(adv, "low_latency", "Минимальная задержка (без буферизации)");

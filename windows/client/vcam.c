@@ -10,12 +10,15 @@ static HANDLE g_map;
 static uint8_t *g_base;
 static ULONGLONG g_last_open_try;
 static uint8_t *g_tmp;
+static int g_slot;
 
 static bool registered(void)
 {
+	wchar_t clsid[64], key[160];
+	mcv_clsid_str(g_slot, clsid, 64);
+	_snwprintf(key, 160, L"Software\\Classes\\CLSID\\%ls\\InprocServer32", clsid);
 	HKEY k;
-	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Classes\\CLSID\\" MCV_CLSID_STR L"\\InprocServer32", 0,
-			  KEY_READ, &k) != ERROR_SUCCESS)
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &k) != ERROR_SUCCESS)
 		return false;
 	wchar_t path[MAX_PATH] = {0};
 	DWORD sz = sizeof(path) - sizeof(wchar_t), type = 0;
@@ -24,19 +27,22 @@ static bool registered(void)
 	return r == ERROR_SUCCESS && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-enum vcam_state vcam_start(long *hr_out)
+enum vcam_state vcam_start(int slot, long *hr_out)
 {
 	if (hr_out)
 		*hr_out = 0;
 	if (g_cam)
 		return VCAM_READY;
+	g_slot = slot;
 	PFN_MFCreateVirtualCamera create = mcv_load_api();
 	if (!create)
 		return VCAM_UNSUPPORTED;
 	if (!registered())
 		return VCAM_NOT_INSTALLED;
-	HRESULT hr = create(MCV_TYPE_SOFTWARE, MCV_LIFETIME_SESSION, MCV_ACCESS_CURRENT_USER, MCV_FRIENDLY_NAME,
-			    MCV_CLSID_STR, NULL, 0, &g_cam);
+	wchar_t clsid[64], name[64];
+	mcv_clsid_str(slot, clsid, 64);
+	mcv_friendly_name(slot, name, 64);
+	HRESULT hr = create(MCV_TYPE_SOFTWARE, MCV_LIFETIME_SESSION, MCV_ACCESS_CURRENT_USER, name, clsid, NULL, 0, &g_cam);
 	if (SUCCEEDED(hr)) {
 		hr = g_cam->lpVtbl->Start(g_cam, NULL);
 		if (FAILED(hr)) {
@@ -78,7 +84,9 @@ static bool open_shm(void)
 	if (now - g_last_open_try < 500)
 		return false;
 	g_last_open_try = now;
-	g_map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, MCV_SHM_NAME);
+	wchar_t name[96];
+	mcv_shm_name(g_slot, L"Global\\", name, 96);
+	g_map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
 	if (!g_map)
 		return false;
 	g_base = MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, MCV_SHM_SIZE);

@@ -11,6 +11,38 @@
 static const GUID CLSID_H264Decoder = {0x62ce7e72, 0x4c71, 0x4d20, {0xb1, 0x5d, 0x45, 0x28, 0x31, 0xa8, 0x7d, 0x9d}};
 #include <stdlib.h>
 
+/* 'HEVC' в виде FOURCC-подтипа; в старых заголовках mingw его тоже может не быть */
+static const GUID MY_MFVideoFormat_HEVC = {0x43564548, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+/* HEVC-декодер в Windows не встроен: его ставит «Расширения для видео HEVC» из Store или драйвер видеокарты.
+ * Ищу синхронный MFT, асинхронные аппаратные требуют другой модели работы. */
+static IMFTransform *create_hevc_mft(void)
+{
+	MFT_REGISTER_TYPE_INFO in = {MFMediaType_Video, MY_MFVideoFormat_HEVC};
+	IMFActivate **acts = NULL;
+	UINT32 n = 0;
+	IMFTransform *mft = NULL;
+	if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+			     &in, NULL, &acts, &n)))
+		return NULL;
+	for (UINT32 i = 0; i < n; i++) {
+		if (!mft && FAILED(IMFActivate_ActivateObject(acts[i], &IID_IMFTransform, (void **)&mft)))
+			mft = NULL;
+		IMFActivate_Release(acts[i]);
+	}
+	CoTaskMemFree(acts);
+	return mft;
+}
+
+bool decoder_hevc_available(void)
+{
+	IMFTransform *m = create_hevc_mft();
+	if (!m)
+		return false;
+	IMFTransform_Release(m);
+	return true;
+}
+
 struct decoder {
 	IMFTransform *mft;
 	decoder_frame_cb cb;
@@ -82,13 +114,19 @@ static HRESULT set_output_nv12(struct decoder *d)
 	return hr;
 }
 
-struct decoder *decoder_create(decoder_frame_cb cb, void *opaque)
+struct decoder *decoder_create(decoder_frame_cb cb, void *opaque, bool hevc)
 {
 	struct decoder *d = calloc(1, sizeof(*d));
 	d->cb = cb;
 	d->opaque = opaque;
-	HRESULT hr = CoCreateInstance(&CLSID_H264Decoder, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform,
-				      (void **)&d->mft);
+	HRESULT hr = S_OK;
+	if (hevc) {
+		d->mft = create_hevc_mft();
+		if (!d->mft)
+			hr = E_FAIL;
+	} else {
+		hr = CoCreateInstance(&CLSID_H264Decoder, NULL, CLSCTX_INPROC_SERVER, &IID_IMFTransform, (void **)&d->mft);
+	}
 	if (FAILED(hr)) {
 		free(d);
 		return NULL;
@@ -101,18 +139,29 @@ struct decoder *decoder_create(decoder_frame_cb cb, void *opaque)
 	IMFMediaType *in = NULL;
 	MFCreateMediaType(&in);
 	IMFMediaType_SetGUID(in, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-	IMFMediaType_SetGUID(in, &MF_MT_SUBTYPE, &MFVideoFormat_H264);
+	IMFMediaType_SetGUID(in, &MF_MT_SUBTYPE, hevc ? &MY_MFVideoFormat_HEVC : &MFVideoFormat_H264);
 	IMFMediaType_SetUINT32(in, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
 	hr = IMFTransform_SetInputType(d->mft, 0, in, 0);
+	if (SUCCEEDED(hr) && FAILED(set_output_nv12(d))) {
+		hr = E_FAIL;
+		/* HEVC-декодеру без размера кадра нечего предложить на выход, а без выходного типа он не берёт вход.
+		 * Даю ему примерный размер: настоящий он увидит в SPS и сообщит через STREAM_CHANGE. */
+		if (hevc) {
+			IMFMediaType_SetUINT64(in, &MF_MT_FRAME_SIZE, ((UINT64)1920 << 32) | 1080);
+			if (SUCCEEDED(IMFTransform_SetInputType(d->mft, 0, in, 0)))
+				hr = set_output_nv12(d);
+		}
+	}
 	IMFMediaType_Release(in);
-	if (SUCCEEDED(hr))
-		hr = set_output_nv12(d);
 	if (FAILED(hr)) {
 		decoder_destroy(d);
 		return NULL;
 	}
-	IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-	IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+	/* эти сообщения необязательны, а «Расширения для видео HEVC» падают на них, пока выходной тип не задан */
+	if (d->w) {
+		IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+		IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+	}
 	return d;
 }
 
@@ -151,23 +200,24 @@ static bool drain(struct decoder *d)
 	for (;;) {
 		MFT_OUTPUT_DATA_BUFFER out = {0};
 		out.dwStreamID = 0;
-		if (!d->provides_samples) {
-			if (!d->out_sample)
-				return false;
+		if (!d->provides_samples && d->out_sample) {
 			IMFMediaBuffer *b = NULL;
 			if (SUCCEEDED(IMFSample_GetBufferByIndex(d->out_sample, 0, &b))) {
 				IMFMediaBuffer_SetCurrentLength(b, 0);
 				IMFMediaBuffer_Release(b);
 			}
 			out.pSample = d->out_sample;
+		} else if (!d->provides_samples && d->w) {
+			return false;
 		}
+		/* без выходного типа (d->w == 0) декодер ответит STREAM_CHANGE, как только разберёт SPS */
 		DWORD status = 0;
 		HRESULT hr = IMFTransform_ProcessOutput(d->mft, 0, 1, &out, &status);
 		if (out.pEvents)
 			IMFCollection_Release(out.pEvents);
 		if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
 			return true;
-		if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+		if (hr == MF_E_TRANSFORM_STREAM_CHANGE || hr == MF_E_TRANSFORM_TYPE_NOT_SET) {
 			if (FAILED(set_output_nv12(d)))
 				return false;
 			continue;
