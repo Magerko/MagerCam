@@ -14,7 +14,9 @@ import android.view.OrientationEventListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.Inet4Address
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 
@@ -22,7 +24,10 @@ class Core(val context: Context) : CameraEngine.Listener {
     val settings = Settings(context)
     val server = StreamServer(this)
     val engine = CameraEngine(context, settings, this)
-    private val audio = AudioCapture { pcm, pts -> server.broadcastAudio(pcm, pts) }
+    private val audio = AudioCapture { pcm, pts ->
+        server.broadcastAudio(pcm, pts)
+        engine.recorder.feedAudio(pcm, pts)
+    }
     private val discovery = Discovery(this)
 
     private val worker = HandlerThread("mc-core").apply { start() }
@@ -36,6 +41,12 @@ class Core(val context: Context) : CameraEngine.Listener {
         private set
     @Volatile var serverError: String? = null
         private set
+    /** Битрейт, который сейчас реально отдаю: адаптивный режим держит его ниже настройки, пока сеть не тянет. */
+    @Volatile var bitrateNow = settings.bitrateKbps
+        private set
+    @Volatile var overheated = false
+        private set
+    private var calmTicks = 0
 
     private val orientationListener = object : OrientationEventListener(context) {
         override fun onOrientationChanged(o: Int) {
@@ -54,12 +65,15 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     private val statusTick = object : Runnable {
         override fun run() {
+            adaptBitrate()
+            checkHeat()
             pushStatus()
             handler.postDelayed(this, 1000)
         }
     }
 
     fun start() {
+        engine.orientProvider = { streamOrientation() }
         startServer()
         discovery.start()
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
@@ -88,6 +102,9 @@ class Core(val context: Context) : CameraEngine.Listener {
     }
 
     fun onClientsChanged() {
+        // HEVC включаю, только если его попросили все подключённые клиенты: кодер у них общий
+        val hevc = server.streamClients.isNotEmpty() && server.streamClients.all { it.wantsHevc }
+        if (hevc != engine.wantHevc) { engine.wantHevc = hevc; engine.restart() }
         engine.setStreamDemand(server.streamClients.isNotEmpty())
         engine.setMjpegDemand(server.wantsJpeg)
         updateAudio()
@@ -95,7 +112,7 @@ class Core(val context: Context) : CameraEngine.Listener {
     }
 
     private fun updateAudio() {
-        val want = settings.micEnabled && server.streamClients.any { it.wantsAudio }
+        val want = settings.micEnabled && (server.streamClients.any { it.wantsAudio } || engine.isRecordingRequested)
         if (want && !audio.isRunning) {
             val ch = engine.characteristics(engine.resolveCameraId(settings.cameraId))
             val boot = ch?.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
@@ -108,11 +125,120 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     fun requestKeyFrame() = engine.requestKeyFrame()
 
+    private fun targetBitrate(): Int =
+        if (overheated && settings.heatGuard) minOf(settings.bitrateKbps, HOT_BITRATE) else settings.bitrateKbps
+
+    /**
+     * Адаптивный битрейт: если очередь на отправку растёт или кадры пришлось выкинуть, сразу сбавляю на 30%,
+     * а поднимаю осторожно, только после нескольких спокойных секунд. Так картинка по слабому Wi-Fi
+     * становится мягче, но не замирает.
+     */
+    private fun adaptBitrate() {
+        val (drops, queued) = server.takeCongestion()
+        val target = targetBitrate()
+        var cur = bitrateNow
+        if (!settings.abr || server.streamClients.isEmpty()) {
+            cur = target
+            calmTicks = 0
+        } else if (drops > 0 || queued > 600_000) {
+            cur = maxOf(MIN_BITRATE, (cur * 0.7f).toInt())
+            calmTicks = 0
+        } else if (queued < 100_000) {
+            if (++calmTicks >= 4 && cur < target) {
+                cur = (cur * 1.15f).toInt() + 100
+                calmTicks = 2
+            }
+        }
+        cur = cur.coerceAtMost(target)
+        if (cur != bitrateNow) {
+            bitrateNow = cur
+            engine.bitrateOverride = cur
+            engine.setBitrate(cur)
+        }
+    }
+
+    /** Перегрев: при батарее горячее 43.5 °C снижаю частоту кадров до 30 и битрейт, отпускаю после 40.5 °C. */
+    private fun checkHeat() {
+        val temp = battery().third
+        val hot = if (overheated) temp > 40.5f else temp >= 43.5f
+        if (hot != overheated) {
+            overheated = hot
+            Log.i(TAG, "overheated=$hot temp=$temp")
+        }
+        val cap = if (overheated && settings.heatGuard) 30 else 0
+        if (cap != engine.fpsCap) {
+            engine.fpsCap = cap
+            if (settings.fps > 30) engine.restart()
+        }
+    }
+
+    /**
+     * Сопряжение по QR: программа на ПК показывает код с адресом и одноразовым nonce, телефон сам
+     * стучится к ней и передаёт свои адреса и код доступа. Так не нужно ни искать IP, ни вводить код руками.
+     */
+    fun pair(host: String, port: Int, nonce: String): String? = try {
+        Socket().use { sock ->
+            sock.connect(InetSocketAddress(host, port), 5000)
+            sock.soTimeout = 5000
+            val ips = JSONArray()
+            ipAddresses().forEach { ips.put(it.second) }
+            val json = JSONObject()
+                .put("name", settings.displayName).put("ips", ips).put("port", settings.port)
+                .put("key", if (settings.authEnabled) settings.pin else "").put("ver", PROTOCOL_VERSION)
+            sock.getOutputStream().write("MCPAIR1 $nonce\n$json\n".toByteArray())
+            sock.getOutputStream().flush()
+            val reply = sock.getInputStream().bufferedReader().readLine()?.trim()
+            if (reply == "OK") null else "ПК отклонил сопряжение: ${reply ?: "нет ответа"}"
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "pair: $e")
+        "Не удалось связаться с ПК $host: ${e.message}"
+    }
+
+    /** Ручная правка любого из этих значений означает, что профиль больше не действует. */
+    private fun profileSnapshot() = listOf(settings.width, settings.height, settings.fps, settings.bitrateKbps,
+        engine.resolveCameraId(settings.cameraId), settings.framing, settings.stab, settings.audioSource)
+
+    /** Картинку для замены фона ужимаю до 1920 по большей стороне: больше кодеру всё равно не нужно. */
+    fun saveBackground(bytes: ByteArray): Boolean {
+        val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        if (opts.outWidth <= 0) return false
+        var sample = 1
+        while (maxOf(opts.outWidth, opts.outHeight) / (sample * 2) >= 1920) sample *= 2
+        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+            android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }) ?: return false
+        val f = java.io.File(context.filesDir, GlRenderer.BG_FILE)
+        f.outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, it) }
+        bmp.recycle()
+        if (settings.background == "off") applyParams(mapOf("bg" to "image")) else pushStatus()
+        return true
+    }
+
+    private fun profileParams(name: String): Map<String, String>? = when (name) {
+        "call" -> mapOf("w" to "1280", "h" to "720", "fps" to "30", "bitrate" to "3000", "camera" to "front",
+            "framing" to "1", "stab" to "0", "audio_source" to "voice", "focus" to "continuous")
+        "stream" -> mapOf("w" to "1920", "h" to "1080", "fps" to "60", "bitrate" to "12000", "camera" to "back",
+            "framing" to "0", "stab" to "1", "audio_source" to "camcorder", "focus" to "continuous")
+        "doc" -> mapOf("w" to "1920", "h" to "1080", "fps" to "30", "bitrate" to "8000", "camera" to "back",
+            "framing" to "0", "stab" to "0", "audio_source" to "camcorder", "focus" to "continuous", "bg" to "off")
+        else -> null
+    }
+
     val clientCount get() = server.streamClients.size + server.mjpegClients.size
 
     /** Параметры /api/set и /stream описываю в docs/PROTOCOL.md. */
     fun applyParams(p: Map<String, String>) {
         if (p.isEmpty()) return
+        p["profile"]?.let { name ->
+            profileParams(name)?.let { preset ->
+                applyParams(preset + (p - "profile"))
+                settings.profile = name
+                settings.save()
+                return
+            }
+        }
+        val before = profileSnapshot()
         var restart = false
         var controls = false
         var audioChanged = false
@@ -127,7 +253,12 @@ class Core(val context: Context) : CameraEngine.Listener {
         }
         p["bitrate"]?.toIntOrNull()?.let {
             val v = it.coerceIn(500, 50000)
-            if (v != settings.bitrateKbps) { settings.bitrateKbps = v; engine.setBitrate(v) }
+            if (v != settings.bitrateKbps) {
+                settings.bitrateKbps = v
+                bitrateNow = targetBitrate()
+                engine.bitrateOverride = bitrateNow
+                engine.setBitrate(bitrateNow)
+            }
         }
         p["camera"]?.let {
             // на "back"/"front" оставляю текущий объектив, если он уже смотрит в эту сторону
@@ -160,6 +291,18 @@ class Core(val context: Context) : CameraEngine.Listener {
         if ("mirror" in p) settings.mirrorPreview = b("mirror")
         p["orientation_mode"]?.let { if (it in listOf("auto", "landscape", "portrait")) settings.orientationMode = it }
         p["name"]?.let { settings.deviceName = it.take(60) }
+        if ("abr" in p) settings.abr = b("abr")
+        if ("heat_guard" in p) settings.heatGuard = b("heat_guard")
+        p["codec"]?.let { if (it in listOf("auto", "h264") && it != settings.codec) { settings.codec = it; restart = true } }
+        if ("framing" in p) { settings.framing = b("framing"); controls = true }
+        p["bg"]?.let { if (it in listOf("off", "blur", "image") && it != settings.background) { settings.background = it; restart = true } }
+        f("bg_strength")?.let { settings.bgStrength = it.coerceIn(0f, 1f) }
+        if ("lock" in p) engine.lockAll(b("lock"))
+        if ("rec" in p && b("rec") != engine.isRecordingRequested) {
+            engine.setRecording(b("rec"), settings.micEnabled, streamOrientation())
+            audioChanged = true
+        }
+        if (profileSnapshot() != before) settings.profile = ""
 
         if (p["af"] == "trigger") {
             engine.focusAt(f("x") ?: 0.5f, f("y") ?: 0.5f)
@@ -211,7 +354,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         val (bat, charging, temp) = battery()
         val size = engine.activeSize
         val o = JSONObject()
-        o.put("name", settings.displayName).put("ver", 1)
+        o.put("name", settings.displayName).put("ver", PROTOCOL_VERSION)
         o.put("w", size?.width ?: settings.width).put("h", size?.height ?: settings.height)
         o.put("fps", if (engine.activeFps > 0) engine.activeFps else settings.fps)
         o.put("bitrate", settings.bitrateKbps)
@@ -233,6 +376,19 @@ class Core(val context: Context) : CameraEngine.Listener {
         o.put("battery", bat).put("charging", charging).put("temp", temp.toDouble())
         o.put("clients", server.streamClients.size).put("viewers", server.mjpegClients.size)
         o.put("camera_open", engine.isOpen)
+        o.put("auth", settings.authEnabled).put("profile", settings.profile)
+        o.put("codec", if (engine.encoderHevc) "hevc" else "h264").put("codec_pref", settings.codec)
+        o.put("hevc", VideoEncoder.isHevcSupported())
+        o.put("abr", settings.abr).put("bitrate_now", bitrateNow)
+        o.put("lock", settings.aeLock && settings.awbLock)
+        o.put("framing", settings.framing).put("framing_available", engine.framingAvailable).put("faces", engine.facesVisible)
+        o.put("bg", settings.background).put("bg_strength", settings.bgStrength.toDouble())
+        o.put("bg_image", java.io.File(context.filesDir, GlRenderer.BG_FILE).exists())
+        engine.bgError?.let { o.put("bg_error", it) }
+        o.put("rec", engine.recorder.isRunning)
+        if (engine.recorder.isRunning) o.put("rec_ms", System.currentTimeMillis() - engine.recorder.startedAt)
+        engine.recordError?.let { o.put("rec_error", it) }
+        o.put("hot", overheated).put("heat_guard", settings.heatGuard)
         engine.error?.let { o.put("error", it) }
         serverError?.let { o.put("error", it) }
         val ips = JSONArray()
@@ -243,6 +399,7 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     private fun pushStatus() {
         handler.post {
+            engine.glOrient = streamOrientation()
             if (server.streamClients.isNotEmpty()) server.broadcastStatus(statusJson())
             notifyUiNow()
         }
@@ -267,6 +424,10 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     companion object {
         private const val TAG = "MC.Core"
+        const val PROTOCOL_VERSION = 2
+        private const val MIN_BITRATE = 800
+        private const val HOT_BITRATE = 6000
+
         @Volatile var instance: Core? = null
     }
 }

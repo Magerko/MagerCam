@@ -3,6 +3,7 @@ package com.magercam.app
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
+import java.security.SecureRandom
 
 /** Поля читаю и пишу из нескольких потоков, поэтому все они @Volatile. */
 class Settings(context: Context) {
@@ -32,8 +33,24 @@ class Settings(context: Context) {
     @Volatile var awbLock = false
     @Volatile var mirrorPreview = prefs.getBoolean("mirror", false)
 
+    @Volatile var authEnabled = prefs.getBoolean("auth", true)
+    @Volatile var pin: String = prefs.getString("pin", null) ?: newPin().also { prefs.edit().putString("pin", it).apply() }
+    @Volatile var profile = prefs.getString("profile", "") ?: ""
+    @Volatile var abr = prefs.getBoolean("abr", true)
+    @Volatile var codec = prefs.getString("codec", "auto") ?: "auto"
+    @Volatile var framing = prefs.getBoolean("framing", false)
+    @Volatile var background = prefs.getString("bg", "off") ?: "off"
+    @Volatile var bgStrength = prefs.getFloat("bg_strength", 0.6f)
+    @Volatile var heatGuard = prefs.getBoolean("heat_guard", true)
+    @Volatile var autoDim = prefs.getBoolean("auto_dim", false)
+
     val displayName: String
         get() = deviceName.ifBlank { "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}" }
+
+    fun regeneratePin() {
+        pin = newPin()
+        save()
+    }
 
     fun save() {
         prefs.edit()
@@ -46,6 +63,15 @@ class Settings(context: Context) {
             .putFloat("focus_dist", focusDist).putString("wb", wb)
             .putString("antibanding", antibanding).putBoolean("stab", stab)
             .putBoolean("mirror", mirrorPreview)
+            .putBoolean("auth", authEnabled).putString("pin", pin).putString("profile", profile)
+            .putBoolean("abr", abr).putString("codec", codec).putBoolean("framing", framing)
+            .putString("bg", background).putFloat("bg_strength", bgStrength)
+            .putBoolean("heat_guard", heatGuard).putBoolean("auto_dim", autoDim)
             .apply()
+    }
+
+    companion object {
+        private val rnd = SecureRandom()
+        fun newPin(): String = "%06d".format(rnd.nextInt(1_000_000))
     }
 }

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
@@ -14,6 +15,9 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.Face
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.media.Image
@@ -28,6 +32,11 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import android.view.SurfaceHolder
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import com.google.zxing.qrcode.QRCodeReader
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -66,6 +75,13 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private val jpegHandler = Handler(jpegThread.looper)
 
     private val encoder = VideoEncoder { t, p, k -> listener.onEncoderPacket(t, p, k) }
+    val recorder = Recorder(ctx)
+    private var recordRequested = false
+    private var recordAudio = false
+    private var recordOrientation = 0
+    private var encoderWantedHevc = false
+    private var gl: GlRenderer? = null
+    private var glActive = false
 
     private var streamDemand = false
     private var mjpegDemand = false
@@ -89,6 +105,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var dropPreview = false
     private var dropMjpeg = false
     private var lastJpegAt = 0L
+    @Volatile private var qrListener: ((String) -> Unit)? = null
+    private var lastQrAt = 0L
 
     @Volatile var activeSize: Size? = null; private set
     @Volatile var activeFps = 0; private set
@@ -105,6 +123,27 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     @Volatile var hasFlash = false; private set
     @Volatile var currentCameraId: String = ""; private set
     @Volatile var supportedSizes: List<Size> = emptyList(); private set
+    /** Потолок частоты кадров при перегреве, 0 — без ограничения. */
+    @Volatile var fpsCap = 0
+    @Volatile var wantHevc = false
+    @Volatile var bitrateOverride = 0
+    @Volatile var bgError: String? = null; private set
+    var orientProvider: () -> Int = { 0 }
+
+    /** Поворот кадра до ровного; нужен GL-ступени, чтобы сегментатор видел человека стоящим, а не лежащим. */
+    var glOrient: Int
+        get() = gl?.orient ?: 0
+        set(v) { gl?.orient = v }
+    @Volatile var encoderHevc = false; private set
+    @Volatile var framingAvailable = false; private set
+    @Volatile var facesVisible = 0; private set
+    @Volatile var recordError: String? = null; private set
+    private var lastFocusDistance = -1f
+    private var faceModes = intArrayOf()
+    private var framingCrop: RectF? = null
+    private var framingTarget: RectF? = null
+    private var lastFaceAt = 0L
+    private var frameNo = 0L
 
     val cameras: List<CameraInfo> by lazy { listCameras() }
 
@@ -146,6 +185,44 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     fun requestKeyFrame() = handler.post { encoder.requestKeyFrame() }
 
+    fun setRecording(on: Boolean, withAudio: Boolean, orientation: Int) = handler.post {
+        recordRequested = on
+        recordAudio = withAudio
+        recordOrientation = orientation
+        recordError = null
+        if (!on) recorder.stop()
+        requestReconfigure()
+    }
+
+    val isRecordingRequested get() = recordRequested
+
+    /** Пока слушатель задан, ищу QR-код в кадрах той же камеры, что показывает превью. */
+    fun setQrScan(listener: ((String) -> Unit)?) = handler.post {
+        qrListener = listener
+        requestReconfigure()
+    }
+
+    /**
+     * «Зафиксировать всё»: экспозиция, баланс белого и фокус перестают подстраиваться,
+     * чтобы картинка не плавала, когда в кадре кто-то двигается. Фокус ставлю ручным на ту дистанцию,
+     * где автофокус стоит прямо сейчас.
+     */
+    fun lockAll(on: Boolean) = handler.post {
+        settings.aeLock = on
+        settings.awbLock = on
+        if (on) {
+            val minFocus = chars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+            if (minFocus > 0f && lastFocusDistance >= 0f) {
+                settings.focus = "manual"
+                settings.focusDist = (lastFocusDistance / minFocus).coerceIn(0f, 1f)
+            }
+        } else if (settings.focus == "manual") {
+            settings.focus = "continuous"
+        }
+        settings.save()
+        applyRepeating()
+    }
+
     /** x, y жду нормализованными, в координатах неповёрнутого кадра сенсора. */
     fun focusAt(x: Float, y: Float) = handler.post {
         val ch = chars ?: return@post
@@ -181,8 +258,9 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     fun release() {
         val latch = CountDownLatch(1)
         handler.post {
-            streamDemand = false; mjpegDemand = false; previewSurface = null
+            streamDemand = false; mjpegDemand = false; previewSurface = null; recordRequested = false; qrListener = null
             doReconfigure()
+            gl?.release(); gl = null
             latch.countDown()
         }
         latch.await(3, TimeUnit.SECONDS)
@@ -293,10 +371,20 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     }
 
     private fun doReconfigure() {
-        val needCamera = streamDemand || mjpegDemand || previewSurface != null
+        val needCamera = streamDemand || mjpegDemand || previewSurface != null || recordRequested || qrListener != null
         closeSession()
+        // GL обязан отпустить поверхности кодера и превью раньше, чем их пересоздадут или отдадут камере
+        gl?.setOutputs(emptyList())
+        val wantGl = settings.background != "off" && needCamera
+        if (wantGl != glActive) {
+            // одна поверхность не может принадлежать и камере, и EGL, поэтому при смене режима кодер пересоздаю
+            encoder.stop()
+            glActive = wantGl
+            if (!wantGl) { gl?.release(); gl = null; bgError = null }
+        }
         if (!needCamera) {
             encoder.stop()
+            recorder.stop()
             closeReader()
             closeDevice()
             activeSize = null
@@ -308,6 +396,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         if (device == null || deviceId != id) {
             if (opening) return
             encoder.stop()
+            recorder.stop()
             closeReader()
             closeDevice()
             openDevice(id)
@@ -317,21 +406,38 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val ch = streamChars ?: return
 
         val size = chooseVideoSize(ch, settings.width, settings.height)
-        val range = chooseFpsRange(ch, settings.fps)
+        val wantFps = if (fpsCap > 0) minOf(settings.fps, fpsCap) else settings.fps
+        val range = chooseFpsRange(ch, wantFps)
         fpsRange = range
-        val fps = minOf(settings.fps, range.upper)
+        val fps = minOf(wantFps, range.upper)
         activeSize = size
         activeFps = fps
 
         if (streamDemand) {
-            if (!encoder.isRunning || encoder.width != size.width || encoder.height != size.height || encoder.fps != fps) {
-                if (!encoder.start(size.width, size.height, fps, settings.bitrateKbps)) {
-                    error = "Кодировщик H.264 не запустился для ${size.width}x${size.height}"
+            val hevc = wantHevc && settings.codec != "h264"
+            if (!encoder.isRunning || encoder.width != size.width || encoder.height != size.height || encoder.fps != fps ||
+                encoderWantedHevc != hevc) {
+                encoderWantedHevc = hevc
+                if (!encoder.start(size.width, size.height, fps, if (bitrateOverride > 0) bitrateOverride else settings.bitrateKbps, hevc)) {
+                    error = "Кодировщик видео не запустился для ${size.width}x${size.height}"
                 }
+                encoderHevc = encoder.hevc
             }
         } else encoder.stop()
 
-        if (mjpegDemand && !dropMjpeg) {
+        if (recordRequested) {
+            if (!recorder.isRunning) {
+                // для записи битрейт с запасом: 1080p30 примерно 16 Мбит/с, дальше пропорционально пикселям и кадрам
+                val auto = (size.width.toLong() * size.height * fps * 16000 / (1920L * 1080 * 30)).toInt()
+                val kbps = maxOf(auto, settings.bitrateKbps * 2).coerceIn(4000, 50000)
+                if (!recorder.start(size.width, size.height, fps, kbps, recordAudio, recordOrientation)) {
+                    recordRequested = false
+                    recordError = "Не удалось начать запись"
+                }
+            }
+        } else recorder.stop()
+
+        if ((mjpegDemand && !dropMjpeg) || qrListener != null) {
             val ms = chooseMjpegSize(ch, size)
             val r = imageReader
             if (r == null || r.width != ms.width || r.height != ms.height) {
@@ -348,10 +454,21 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             listener.onPreviewSizeChanged(wantPreview)
         }
 
-        val surfaces = ArrayList<Surface>()
+        val outs = ArrayList<Surface>()
         val ps = previewSurface
-        if (ps != null && ps.isValid && previewSurfaceSize == wantPreview && !dropPreview) surfaces += ps
-        if (encoder.isRunning) encoder.inputSurface?.let { surfaces += it }
+        if (ps != null && ps.isValid && previewSurfaceSize == wantPreview && !dropPreview) outs += ps
+        if (encoder.isRunning) encoder.inputSurface?.let { outs += it }
+        if (recorder.isRunning) recorder.inputSurface?.let { outs += it }
+        val surfaces = ArrayList<Surface>()
+        if (glActive && outs.isNotEmpty()) {
+            val g = gl ?: GlRenderer(ctx, settings).also { gl = it; it.orient = orientProvider() }
+            val input = g.start(size.width, size.height)
+            bgError = g.error
+            if (input != null) {
+                g.setOutputs(outs)
+                surfaces += input
+            } else surfaces += outs
+        } else surfaces += outs
         imageReader?.surface?.let { surfaces += it }
         if (surfaces.isEmpty()) {
             listener.onEngineStateChanged()
@@ -378,6 +495,11 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                     when {
                         surfaces.size > 1 && ps != null && surfaces.contains(ps) && !dropPreview -> dropPreview = true
                         imageReader != null && surfaces.size > 1 -> dropMjpeg = true
+                        recorder.isRunning && surfaces.size > 1 -> {
+                            recordRequested = false
+                            recorder.stop()
+                            recordError = "Камера не тянет запись одновременно с трансляцией"
+                        }
                         else -> {
                             error = "Камера не поддерживает ${size.width}x${size.height}@$fps"
                             listener.onEngineStateChanged()
@@ -481,6 +603,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         evMin = (evRange?.lower ?: 0) * step
         evMax = (evRange?.upper ?: 0) * step
         supportedSizes = videoSizes(sc)
+        faceModes = ch.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES) ?: intArrayOf()
+        framingAvailable = physicalId == null && faceModes.any { it != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF }
+        framingCrop = null
+        framingTarget = null
     }
 
     private fun videoSizes(ch: CameraCharacteristics): List<Size> {
@@ -559,12 +685,87 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             ).also { nb -> sessionSurfaces.forEach { nb.addTarget(it) } }
             builder = b
             applyControls(b)
-            s.setRepeatingRequest(b.build(), null, handler)
+            s.setRepeatingRequest(b.build(), captureCallback, handler)
         } catch (e: Exception) {
             Log.w(TAG, "applyRepeating: $e")
         }
         listener.onEngineStateChanged()
     }
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
+            result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDistance = it }
+            frameNo++
+            if (framingOn()) onFaces(result.get(CaptureResult.STATISTICS_FACES) ?: emptyArray())
+            else facesVisible = 0
+        }
+    }
+
+    private fun framingOn() = settings.framing && framingAvailable
+
+    /**
+     * Автокадрирование: двигаю и масштабирую crop region сенсора за лицами. Это обрезка на самом
+     * сенсоре, а не растягивание готового кадра, поэтому чёткости теряется меньше, чем при цифровом зуме на ПК.
+     */
+    private fun onFaces(faces: Array<Face>) {
+        val ch = chars ?: return
+        val active = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+        val size = activeSize ?: return
+        val aw = active.width().toFloat()
+        val ah = active.height().toFloat()
+        val outAspect = size.width.toFloat() / size.height
+        val now = SystemClock.elapsedRealtime()
+        val good = faces.filter { it.score >= 30 }
+        facesVisible = good.size
+
+        val fullW = minOf(aw, ah * outAspect)
+        val full = RectF((aw - fullW) / 2, (ah - fullW / outAspect) / 2, (aw + fullW) / 2, (ah + fullW / outAspect) / 2)
+        var target = framingTarget ?: full
+        if (good.isNotEmpty()) {
+            lastFaceAt = now
+            var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = 0f; var b = 0f
+            for (f in good) {
+                l = minOf(l, f.bounds.left.toFloat()); t = minOf(t, f.bounds.top.toFloat())
+                r = maxOf(r, f.bounds.right.toFloat()); b = maxOf(b, f.bounds.bottom.toFloat())
+            }
+            val fw = maxOf(r - l, (b - t) * outAspect)
+            val w = (fw * 3.2f).coerceIn(fullW / 2.5f, fullW)
+            val cx = (l + r) / 2
+            val cy = (t + b) / 2
+            val cur = framingTarget
+            // мёртвая зона: мелкие движения головы не дёргают кадр
+            val still = cur != null && abs(cx - cur.centerX()) < cur.width() * 0.08f &&
+                abs(cy - cur.centerY()) < cur.height() * 0.08f && abs(w - cur.width()) < cur.width() * 0.12f
+            if (!still) {
+                val h = w / outAspect
+                val x0 = (cx - w / 2).coerceIn(0f, aw - w)
+                val y0 = (cy - h / 2).coerceIn(0f, ah - h)
+                target = RectF(x0, y0, x0 + w, y0 + h)
+            }
+        } else if (now - lastFaceAt > 2500) {
+            target = full
+        }
+        framingTarget = target
+
+        val cur = framingCrop ?: full
+        val k = 0.07f
+        val next = RectF(
+            cur.left + (target.left - cur.left) * k, cur.top + (target.top - cur.top) * k,
+            cur.right + (target.right - cur.right) * k, cur.bottom + (target.bottom - cur.bottom) * k
+        )
+        framingCrop = next
+        if (frameNo % 2L != 0L) return
+        val moved = abs(next.left - cur.left) + abs(next.top - cur.top) + abs(next.width() - cur.width())
+        if (moved < aw * 0.0015f) return
+        val b = builder ?: return
+        val s = session ?: return
+        try {
+            b.set(CaptureRequest.SCALER_CROP_REGION, next.toRect())
+            s.setRepeatingRequest(b.build(), captureCallback, handler)
+        } catch (_: Exception) {}
+    }
+
+    private fun RectF.toRect() = Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
 
     private fun applyControls(b: CaptureRequest.Builder) {
         val ch = chars ?: return
@@ -635,8 +836,22 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val maxAe = ch.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
         if (maxAe > 0) b.set(CaptureRequest.CONTROL_AE_REGIONS, if (region != null && settings.focus == "auto") arrayOf(region) else null)
 
+        if (faceModes.isNotEmpty()) {
+            val mode = when {
+                !framingOn() -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF
+                faceModes.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE) -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE
+                else -> CameraMetadata.STATISTICS_FACE_DETECT_MODE_FULL
+            }
+            b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, mode)
+        }
+
         if (physicalId != null) {
             // физическому объективу зум не трогаю, логическая камера остаётся на своём зуме по умолчанию
+        } else if (framingOn()) {
+            // при автокадрировании зумом управляет crop region, поэтому общий зум держу на 1x
+            if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
+                b.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+            framingCrop?.let { b.set(CaptureRequest.SCALER_CROP_REGION, it.toRect()) }
         } else if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null) {
             b.set(CaptureRequest.CONTROL_ZOOM_RATIO, settings.zoom.coerceIn(zoomMin, zoomMax))
         } else {
@@ -661,6 +876,12 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
         try {
             val now = SystemClock.elapsedRealtime()
+            val qr = qrListener
+            if (qr != null && now - lastQrAt > 150) {
+                lastQrAt = now
+                decodeQr(img)?.let { qr(it) }
+            }
+            if (!mjpegDemand) return
             if (now - lastJpegAt < 45) return // не чаще ~20 кадров в секунду
             lastJpegAt = now
             val nv21 = toNv21(img)
@@ -672,6 +893,29 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             Log.w(TAG, "jpeg: $e")
         } finally {
             img.close()
+        }
+    }
+
+    private val qrReader = QRCodeReader()
+    private val qrHints = mapOf(DecodeHintType.TRY_HARDER to true)
+
+    private fun decodeQr(img: Image): String? {
+        val w = img.width
+        val h = img.height
+        val y = img.planes[0]
+        val buf = y.buffer
+        val luma = ByteArray(w * h)
+        for (r in 0 until h) {
+            if (y.pixelStride == 1) { buf.position(r * y.rowStride); buf.get(luma, r * w, w) }
+            else for (c in 0 until w) luma[r * w + c] = buf.get(r * y.rowStride + c * y.pixelStride)
+        }
+        return try {
+            val src = PlanarYUVLuminanceSource(luma, w, h, 0, 0, w, h, false)
+            qrReader.decode(BinaryBitmap(HybridBinarizer(src)), qrHints).text
+        } catch (_: Exception) {
+            null
+        } finally {
+            qrReader.reset()
         }
     }
 

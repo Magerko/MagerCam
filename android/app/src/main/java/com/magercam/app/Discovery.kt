@@ -39,11 +39,13 @@ class Discovery(private val core: Core) {
                         val p = DatagramPacket(buf, buf.size)
                         s.receive(p)
                         val msg = String(p.data, 0, p.length)
-                        if (msg.trim() != "MAGERCAM_DISCOVER") continue
+                        if (!msg.trim().startsWith("MAGERCAM_DISCOVER")) continue
                         val reply = JSONObject()
                             .put("magercam", 1)
                             .put("name", core.settings.displayName)
                             .put("port", core.server.port)
+                            .put("ver", Core.PROTOCOL_VERSION)
+                            .put("auth", core.settings.authEnabled)
                             .toString().toByteArray()
                         s.send(DatagramPacket(reply, reply.size, p.socketAddress))
                     }

@@ -20,31 +20,35 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
     var width = 0; private set
     var height = 0; private set
     var fps = 0; private set
+    var hevc = false; private set
 
     val isRunning get() = running
 
-    fun start(w: Int, h: Int, fps: Int, bitrateKbps: Int): Boolean {
+    fun start(w: Int, h: Int, fps: Int, bitrateKbps: Int, wantHevc: Boolean = false): Boolean {
         stop()
-        val attempts = listOf(true, false)
-        for (full in attempts) {
+        // HEVC при том же битрейте даёт картинку заметно лучше, но если кодер капризничает, откатываюсь на H.264
+        val attempts = (if (wantHevc && isHevcSupported(w, h)) listOf(true to true, true to false) else emptyList()) +
+            listOf(false to true, false to false)
+        for ((useHevc, full) in attempts) {
+            val mime = if (useHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
             val c = try {
-                MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                MediaCodec.createEncoderByType(mime)
             } catch (e: Exception) {
-                Log.e(TAG, "no AVC encoder", e); return false
+                Log.e(TAG, "no encoder for $mime", e); continue
             }
             try {
-                c.configure(buildFormat(c, w, h, fps, bitrateKbps, full), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                c.configure(buildFormat(c, mime, w, h, fps, bitrateKbps, full), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 inputSurface = c.createInputSurface()
                 c.start()
                 codec = c
-                width = w; height = h; this.fps = fps
+                width = w; height = h; this.fps = fps; hevc = useHevc
                 lastConfig = null
                 running = true
                 drainThread = Thread({ drain(c) }, "mc-encoder").also { it.start() }
-                Log.i(TAG, "encoder started ${w}x$h@$fps ${bitrateKbps}kbps full=$full (${c.name})")
+                Log.i(TAG, "encoder started $mime ${w}x$h@$fps ${bitrateKbps}kbps full=$full (${c.name})")
                 return true
             } catch (e: Exception) {
-                Log.w(TAG, "encoder configure failed (full=$full): $e")
+                Log.w(TAG, "encoder configure failed ($mime full=$full): $e")
                 inputSurface?.release(); inputSurface = null
                 try { c.release() } catch (_: Exception) {}
             }
@@ -52,8 +56,8 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
         return false
     }
 
-    private fun buildFormat(c: MediaCodec, w: Int, h: Int, fps: Int, kbps: Int, full: Boolean): MediaFormat {
-        val f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
+    private fun buildFormat(c: MediaCodec, mime: String, w: Int, h: Int, fps: Int, kbps: Int, full: Boolean): MediaFormat {
+        val f = MediaFormat.createVideoFormat(mime, w, h)
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         f.setInteger(MediaFormat.KEY_BIT_RATE, kbps * 1000)
         f.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
@@ -65,10 +69,12 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
         f.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
         f.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         try {
-            val caps = c.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val caps = c.codecInfo.getCapabilitiesForType(mime)
             if (caps.encoderCapabilities.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR))
                 f.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            if (caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh }) {
+            if (mime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+            } else if (caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh }) {
                 f.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
                 f.setInteger(MediaFormat.KEY_LEVEL, levelFor(w, h, fps))
             }
@@ -91,7 +97,9 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
     private fun emitConfig(cfg: ByteArray) {
         if (lastConfig?.contentEquals(cfg) == true) return
         lastConfig = cfg
-        sink(StreamServer.PKT_VIDEO_CONFIG, StreamServer.packet(StreamServer.PKT_VIDEO_CONFIG, cfg, 0, true), true)
+        val pkt = StreamServer.packet(StreamServer.PKT_VIDEO_CONFIG, cfg, 0, true)
+        if (hevc) pkt[3] = (pkt[3].toInt() or StreamServer.FLAG_HEVC).toByte()
+        sink(StreamServer.PKT_VIDEO_CONFIG, pkt, true)
     }
 
     private fun drain(c: MediaCodec) {
@@ -103,6 +111,7 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
                 val sps = fmt.getByteBuffer("csd-0")
                 val pps = fmt.getByteBuffer("csd-1")
                 if (sps != null) {
+                    // у HEVC в csd-0 уже лежат VPS+SPS+PPS, csd-1 нет
                     val out = ByteArray(sps.remaining() + (pps?.remaining() ?: 0))
                     sps.get(out, 0, sps.remaining())
                     pps?.get(out, out.size - pps.remaining(), pps.remaining())
@@ -165,7 +174,19 @@ class VideoEncoder(private val sink: (type: Int, packet: ByteArray, key: Boolean
             } catch (_: Exception) { emptyList() }
         }
 
+        private val hevcEncoderCaps by lazy {
+            try {
+                MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+                    .filter { info -> info.isEncoder && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, true) } }
+                    .filter { Build.VERSION.SDK_INT < 29 || it.isHardwareAccelerated }
+                    .map { it.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_HEVC).videoCapabilities }
+            } catch (_: Exception) { emptyList() }
+        }
+
         fun isSizeSupported(w: Int, h: Int): Boolean =
             avcEncoderCaps.isEmpty() || avcEncoderCaps.any { it.isSizeSupported(w, h) }
+
+        /** Программный HEVC-кодер на телефоне слишком медленный для живого видео, поэтому беру только аппаратный. */
+        fun isHevcSupported(w: Int = 1280, h: Int = 720): Boolean = hevcEncoderCaps.any { it.isSizeSupported(w, h) }
     }
 }

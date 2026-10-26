@@ -10,6 +10,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
@@ -23,6 +24,7 @@ class StreamServer(private val core: Core) {
     val streamClients = CopyOnWriteArrayList<StreamClient>()
     val mjpegClients = CopyOnWriteArrayList<MjpegClient>()
     private val jpegWaiters = CopyOnWriteArrayList<JpegWaiter>()
+    private val failures = ConcurrentHashMap<String, Pair<Int, Long>>()
 
     @Volatile var lastVideoConfig: ByteArray? = null
         private set
@@ -81,9 +83,13 @@ class StreamServer(private val core: Core) {
             sock.soTimeout = 15000
             val input = sock.getInputStream()
             val requestLine = readLine(input) ?: return sock.close()
+            var headerKey: String? = null
+            var contentLength = 0
             while (true) {
                 val l = readLine(input) ?: break
                 if (l.isEmpty()) break
+                if (l.startsWith("X-MagerCam-Key:", ignoreCase = true)) headerKey = l.substringAfter(':').trim()
+                if (l.startsWith("Content-Length:", ignoreCase = true)) contentLength = l.substringAfter(':').trim().toIntOrNull() ?: 0
             }
             val parts = requestLine.split(" ")
             if (parts.size < 2) return sock.close()
@@ -91,18 +97,37 @@ class StreamServer(private val core: Core) {
             val path = target.substringBefore('?')
             val query = parseQuery(target.substringAfter('?', ""))
             val out = sock.getOutputStream()
+            if (path != "/" && path != "/index.html" && path != "/favicon.ico") {
+                val denied = checkAuth(sock, query["key"] ?: headerKey)
+                if (denied != null) { sendText(out, denied, if (denied == 429) "Too many attempts" else "Access code required"); sock.close(); return }
+            }
             when (path) {
                 "/", "/index.html" -> sendAsset(out, "index.html", "text/html; charset=utf-8")
                 "/api/status" -> sendJson(out, core.statusJson())
                 "/api/set" -> {
                     // здесь "audio" включает микрофон телефона, а в /stream это флаг конкретного клиента
-                    val q = if ("audio" in query && "mic" !in query) query + ("mic" to query.getValue("audio")) else query
+                    val q0 = query - "key"
+                    val q = if ("audio" in q0 && "mic" !in q0) q0 + ("mic" to q0.getValue("audio")) else q0
                     core.applyParams(q)
                     sendJson(out, core.statusJson())
+                }
+                "/api/background" -> {
+                    // картинку для замены фона присылают телом POST, не больше 12 МБ
+                    if (contentLength !in 1..12_000_000) return sendText(out, 413, "Bad size").also { sock.close() }
+                    val body = ByteArray(contentLength)
+                    var off = 0
+                    while (off < body.size) {
+                        val n = input.read(body, off, body.size - off)
+                        if (n < 0) break
+                        off += n
+                    }
+                    if (off == body.size && core.saveBackground(body)) sendJson(out, core.statusJson())
+                    else sendText(out, 415, "Not an image")
                 }
                 "/video", "/mjpeg", "/mjpegfeed" -> { serveMjpeg(sock); return }
                 "/shot.jpg", "/jpeg" -> serveShot(out)
                 "/stream" -> { serveStream(sock, query); return }
+                "/favicon.ico" -> sendText(out, 404, "Not found")
                 else -> sendText(out, 404, "Not found")
             }
             sock.close()
@@ -111,15 +136,34 @@ class StreamServer(private val core: Core) {
         }
     }
 
+    /**
+     * Код доступа нужен всем, кроме подключений с самого телефона: по USB через adb forward
+     * клиент приходит с 127.0.0.1, а кабель и так означает, что телефон в руках у владельца.
+     * После 10 неверных кодов подряд адрес отдыхает минуту, чтобы шесть цифр нельзя было перебрать.
+     */
+    private fun checkAuth(sock: Socket, key: String?): Int? {
+        val s = core.settings
+        val addr = sock.inetAddress
+        if (!s.authEnabled || addr.isLoopbackAddress) return null
+        val ip = addr.hostAddress ?: ""
+        val now = System.currentTimeMillis()
+        val (count, since) = failures[ip] ?: (0 to now)
+        if (count >= 10 && now - since < 60_000) return 429
+        if (key != null && key.filter { it.isDigit() } == s.pin) { failures.remove(ip); return null }
+        if (key != null) failures[ip] = (if (now - since > 60_000) 1 else count + 1) to (if (now - since > 60_000) now else since)
+        return 401
+    }
+
     private fun serveStream(sock: Socket, query: Map<String, String>) {
         sock.soTimeout = 0
         sock.sendBufferSize = 512 * 1024
         val wantsAudio = query["audio"] != "0"
-        core.applyParams(query)
+        val wantsHevc = query["codec"] == "hevc"
+        core.applyParams(query - "codec" - "key")
         val out = BufferedOutputStream(sock.getOutputStream(), 64 * 1024)
         out.write("HTTP/1.1 200 OK\r\nContent-Type: application/x-magercam\r\nCache-Control: no-cache\r\n\r\n".toByteArray())
         out.flush()
-        val client = StreamClient(sock, out, wantsAudio)
+        val client = StreamClient(sock, out, wantsAudio, wantsHevc)
         val ac = ByteBuffer.allocate(5).putInt(AudioCapture.RATE).put(AudioCapture.CHANNELS.toByte()).array()
         client.enqueueOther(packet(PKT_AUDIO_CONFIG, ac, 0, false), droppable = false)
         client.enqueueOther(packet(PKT_STATUS, core.statusJson().toByteArray(), 0, false), droppable = false)
@@ -191,7 +235,7 @@ class StreamServer(private val core: Core) {
 
     private fun sendText(out: OutputStream, code: Int, text: String) {
         val b = text.toByteArray()
-        val reason = if (code == 404) "Not Found" else if (code == 503) "Service Unavailable" else "Error"
+        val reason = when (code) { 401 -> "Unauthorized"; 404 -> "Not Found"; 413 -> "Payload Too Large"; 415 -> "Unsupported Media Type"; 429 -> "Too Many Requests"; 503 -> "Service Unavailable"; else -> "Error" }
         out.write("HTTP/1.0 $code $reason\r\nContent-Type: text/plain\r\nContent-Length: ${b.size}\r\n\r\n".toByteArray())
         out.write(b)
         out.flush()
@@ -217,9 +261,22 @@ class StreamServer(private val core: Core) {
         }
     }
 
-    class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean) {
+    /** Сумма по всем клиентам: сколько раз сеть не успела и пришлось выкинуть кадры, плюс самая длинная очередь. */
+    fun takeCongestion(): Pair<Int, Long> {
+        var drops = 0
+        var maxQueued = 0L
+        for (c in streamClients) {
+            drops += c.drops.getAndSet(0)
+            maxQueued = maxOf(maxQueued, c.queuedBytes)
+        }
+        return drops to maxQueued
+    }
+
+    class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean, val wantsHevc: Boolean) {
         private val queue = LinkedBlockingDeque<ByteArray>()
         private val queued = AtomicLong(0)
+        val drops = java.util.concurrent.atomic.AtomicInteger(0)
+        val queuedBytes get() = queued.get()
         @Volatile private var closed = false
         @Volatile private var waitingKey = true
         @Volatile private var hasConfig = false
@@ -242,6 +299,7 @@ class StreamServer(private val core: Core) {
                 // сеть не успевает: выкидываю кадры до следующего ключевого, чтобы задержка не росла
                 waitingKey = true
                 keyRequested = true
+                drops.incrementAndGet()
                 return
             }
             push(pkt)
@@ -340,6 +398,7 @@ class StreamServer(private val core: Core) {
         const val PKT_AUDIO = 4
         const val PKT_STATUS = 5
         const val PKT_PING = 6
+        const val FLAG_HEVC = 2
         private const val BOUNDARY = "magercamframe"
         private const val MAX_QUEUE_BYTES = 1_500_000L
 

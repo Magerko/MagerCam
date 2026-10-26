@@ -13,6 +13,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCharacteristics
+import android.net.Uri
+import android.os.SystemClock
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -58,6 +60,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var btnTorch: TextView
     private lateinit var btnMic: TextView
     private lateinit var btnFocus: TextView
+    private lateinit var btnRec: TextView
+    private lateinit var btnFrame: TextView
+    private lateinit var btnLock: TextView
+    private lateinit var scanOverlay: LinearLayout
     private lateinit var zoomBar: SeekBar
     private lateinit var zoomLabel: TextView
     private lateinit var evBar: SeekBar
@@ -67,6 +73,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var previewSize: Size? = null
     private var dimmed = false
     private var seeking = false
+    private var scanning = false
+    private var cameraBeforeScan: String? = null
+    private var lastBadQr: String? = null
+    private var pendingPair: Uri? = null
+    private var lastTouch = SystemClock.elapsedRealtime()
+
+    private val autoDimTick = object : Runnable {
+        override fun run() {
+            val c = core
+            if (c != null && c.settings.autoDim && !dimmed && !scanning && c.clientCount > 0 &&
+                SystemClock.elapsedRealtime() - lastTouch > 60_000) setDimmed(true)
+            main.postDelayed(this, 5000)
+        }
+    }
 
     private val uiListener: () -> Unit = {
         main.removeCallbacks(refreshRunnable)
@@ -91,6 +111,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         if (Build.VERSION.SDK_INT >= 33) need += Manifest.permission.POST_NOTIFICATIONS
         val missing = need.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) startCore() else requestPermissions(missing.toTypedArray(), 1)
+        handlePairIntent(intent)
+        main.postDelayed(autoDimTick, 5000)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handlePairIntent(intent)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        lastTouch = SystemClock.elapsedRealtime()
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** Ссылку magercam://pair открывает и системная камера телефона, если отсканировать QR ею, а не кнопкой в приложении. */
+    private fun handlePairIntent(i: Intent?) {
+        val u = i?.data ?: return
+        if (u.scheme == "magercam" && u.host == "pair") {
+            if (core != null) doPair(u) else pendingPair = u
+        }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
@@ -136,6 +176,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         c.uiListeners += uiListener
         c.previewSizeListener = { s -> main.post { applyPreviewSize(s) } }
         c.engine.desiredPreviewSize?.let { applyPreviewSize(it) }
+        pendingPair?.let { pendingPair = null; doPair(it) }
         if (surfaceReady) {
             val h = surfaceView.holder
             c.engine.setPreviewSurface(h.surface, h.surfaceFrame.width(), h.surfaceFrame.height())
@@ -273,6 +314,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         col.addView(btnMic)
         btnFocus = roundButton("AF") { chooseFocus() }
         col.addView(btnFocus)
+        btnFrame = roundButton("👤") { core?.let { it.applyParams(mapOf("framing" to if (it.settings.framing) "0" else "1")) } }
+        col.addView(btnFrame)
+        btnLock = roundButton("🔒") {
+            core?.let {
+                val on = !(it.settings.aeLock && it.settings.awbLock)
+                it.applyParams(mapOf("lock" to if (on) "1" else "0"))
+                Toast.makeText(this, if (on) "Экспозиция, баланс белого и фокус зафиксированы" else "Автонастройка снова включена", Toast.LENGTH_SHORT).show()
+            }
+        }
+        col.addView(btnLock)
+        btnRec = roundButton("⏺") { core?.let { it.applyParams(mapOf("rec" to if (it.engine.isRecordingRequested) "0" else "1")) } }
+        col.addView(btnRec)
+        col.addView(roundButton("QR") { if (scanning) stopScan() else startScan() })
         col.addView(roundButton("🌙") { setDimmed(true) })
         col.addView(roundButton("⚙") { showSettings() })
         col.addView(roundButton("?") { showHelp() })
@@ -331,6 +385,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             visibility = View.GONE
             setOnClickListener { setDimmed(false) }
         }
+        scanOverlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dpi(16), dpi(12), dpi(16), dpi(12))
+            background = GradientDrawable().apply { cornerRadius = dp(12); setColor(0xCC000000.toInt()) }
+            visibility = View.GONE
+            addView(TextView(this@MainActivity).apply {
+                text = "Наведите камеру на QR-код\nв программе MagerCam на ПК"
+                setTextColor(Color.WHITE); textSize = 16f; gravity = Gravity.CENTER
+            })
+            addView(Button(this@MainActivity).apply { text = "Отмена"; setOnClickListener { stopScan() } })
+        }
+        root.addView(scanOverlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+
         root.addView(dimOverlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         setContentView(root)
@@ -384,6 +452,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         tvAddr.text = buildString {
             if (wifi != null) append("Wi-Fi IP: ${wifi.second}\n") else append("Нет Wi-Fi — используйте USB\n")
             append("Порт: ${s.port}")
+            if (s.authEnabled) append("\nКод: ${s.pin.substring(0, 3)} ${s.pin.substring(3)}")
             ips.filter { it != wifi }.take(2).forEach { append("\n${it.first}: ${it.second}") }
         }
         val size = c.engine.activeSize
@@ -394,11 +463,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val v = c.server.mjpegClients.size
             if (v > 0) append(" · браузер: $v")
             append("\n")
-            if (size != null) append("${size.width}×${size.height} @${c.engine.activeFps} · ${s.bitrateKbps / 1000} Мбит/с\n")
+            val codec = if (c.engine.encoderHevc) "HEVC" else "H.264"
+            val br = if (c.server.streamClients.isNotEmpty()) c.bitrateNow else s.bitrateKbps
+            if (size != null) append("${size.width}×${size.height} @${c.engine.activeFps} · $codec ${"%.1f".format(br / 1000f)} Мбит/с\n")
             else append("${s.width}×${s.height} @${s.fps} · ${s.bitrateKbps / 1000} Мбит/с\n")
+            if (c.engine.recorder.isRunning) {
+                val sec = (System.currentTimeMillis() - c.engine.recorder.startedAt) / 1000
+                append("⏺ Запись %d:%02d\n".format(sec / 60, sec % 60))
+            }
             append("🔋 $bat%"); if (charging) append(" ⚡"); append(" · ${"%.0f".format(temp)}°C")
         }
-        val err = c.serverError ?: c.engine.error
+        val err = c.serverError ?: c.engine.error ?: c.engine.recordError ?: c.engine.bgError
+            ?: if (c.overheated && s.heatGuard) "Телефон перегрелся: снижаю до 30 к/с и 6 Мбит/с. Снимите чехол и уберите его от солнца." else null
         tvErr.text = err ?: ""
         tvErr.visibility = if (err != null) View.VISIBLE else View.GONE
 
@@ -406,6 +482,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         btnTorch.alpha = if (c.engine.hasFlash || !c.engine.isOpen) 1f else 0.4f
         btnMic.text = if (s.micEnabled) "🎤" else "🔇"
         setActive(btnMic, !s.micEnabled)
+        val rec = c.engine.recorder.isRunning
+        btnRec.text = if (rec) "■" else "⏺"
+        (btnRec.background as GradientDrawable).setColor(if (rec) 0xCCE53935.toInt() else 0x88000000.toInt())
+        btnFrame.visibility = if (c.engine.framingAvailable) View.VISIBLE else View.GONE
+        setActive(btnFrame, s.framing)
+        setActive(btnLock, s.aeLock && s.awbLock)
         btnFocus.text = when (s.focus) { "continuous" -> "AF"; "auto" -> "AF•"; "infinity" -> "∞"; "macro" -> "🌼"; else -> "MF" }
 
         if (!seeking) {
@@ -476,6 +558,79 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         AlertDialog.Builder(this).setTitle("Ручной фокус").setView(box).setPositiveButton("Готово", null).show()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_BG || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val c = core ?: return
+        Thread {
+            val ok = try {
+                contentResolver.openInputStream(uri)?.use { c.saveBackground(it.readBytes()) } ?: false
+            } catch (_: Exception) { false }
+            main.post {
+                if (ok) c.applyParams(mapOf("bg" to "image"))
+                Toast.makeText(this, if (ok) "Фон заменён" else "Не удалось открыть картинку", Toast.LENGTH_SHORT).show()
+            }
+        }.start()
+    }
+
+    private fun startScan() {
+        val c = core ?: return
+        scanning = true
+        lastBadQr = null
+        // QR на экране ПК удобнее снимать задней камерой
+        val cur = c.engine.resolveCameraId(c.settings.cameraId)
+        if (c.engine.cameras.firstOrNull { it.id == cur }?.front == true) {
+            cameraBeforeScan = cur
+            c.applyParams(mapOf("camera" to "back"))
+        }
+        scanOverlay.visibility = View.VISIBLE
+        c.engine.setQrScan { text -> main.post { onQr(text) } }
+    }
+
+    private fun stopScan() {
+        scanning = false
+        scanOverlay.visibility = View.GONE
+        core?.engine?.setQrScan(null)
+        cameraBeforeScan?.let { core?.applyParams(mapOf("camera" to it)) }
+        cameraBeforeScan = null
+    }
+
+    private fun onQr(text: String) {
+        if (!scanning) return
+        val u = Uri.parse(text)
+        if (u.scheme != "magercam" || u.host != "pair") {
+            if (text != lastBadQr) Toast.makeText(this, "Это не QR-код MagerCam", Toast.LENGTH_SHORT).show()
+            lastBadQr = text
+            return
+        }
+        stopScan()
+        doPair(u)
+    }
+
+    private fun doPair(u: Uri) {
+        val c = core ?: return
+        val hosts = u.getQueryParameter("h")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+        val port = u.getQueryParameter("p")?.toIntOrNull() ?: 4850
+        val nonce = u.getQueryParameter("n") ?: return
+        Toast.makeText(this, "Сопряжение с ПК…", Toast.LENGTH_SHORT).show()
+        Thread {
+            var err: String? = "В QR-коде нет адреса ПК"
+            for (h in hosts) {
+                err = c.pair(h, port, nonce)
+                if (err == null) break
+            }
+            main.post {
+                AlertDialog.Builder(this)
+                    .setTitle(if (err == null) "Готово" else "Не получилось")
+                    .setMessage(err ?: "Телефон сопряжён с ПК. Программа MagerCam подключится к нему сама.")
+                    .setPositiveButton("OK", null).show()
+            }
+        }.start()
+    }
+
     private fun exitApp() {
         stopService(Intent(this, CameraService::class.java))
         finishAndRemoveTask()
@@ -486,10 +641,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val ip = c?.ipAddresses()?.firstOrNull()?.second ?: "IP телефона"
         val port = c?.settings?.port ?: 4848
         val text = """
-            |OBS (рекомендуется)
+            |Быстрее всего: нажмите «QR» здесь и наведите телефон на QR-код в программе MagerCam на ПК.
+            |
+            |Zoom, Discord, Teams (Windows 11)
+            |Установите MagerCam для Windows, выберите телефон и нажмите «Подключить». В Zoom выберите камеру «MagerCam».
+            |
+            |OBS
             |1. Установите плагин MagerCam для OBS (файл install-obs-plugin.bat).
             |2. В OBS: Источники → + → «MagerCam (телефон)».
             |3. Выберите телефон из списка найденных или введите IP: $ip
+            |
+            |Код доступа: ${c?.settings?.pin ?: "—"}. Его спросят при подключении по Wi-Fi. По USB код не нужен.
             |
             |USB
             |Включите «Отладку по USB» в настройках разработчика, подключите кабель и выберите в плагине «USB (через ADB)».
@@ -522,6 +684,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         fun switch(title: String, on: Boolean): Switch = Switch(this).apply {
             text = title; isChecked = on; setPadding(0, dpi(8), 0, dpi(8)); box.addView(this)
         }
+
+        val profValues = listOf("", "call", "stream", "doc")
+        val profSp = spinner("Профиль", listOf("Свои настройки", "Созвон (720p, фронталка, слежение за лицом)", "Стрим (1080p 60, стабилизация)", "Документ (1080p, задняя)"), profValues, s.profile)
 
         val cams = c.engine.cameras
         val camSp = spinner("Камера", cams.map { it.label }, cams.map { it.id }, c.engine.resolveCameraId(s.cameraId))
@@ -563,6 +728,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val wbSp = spinner("Баланс белого", listOf("Авто", "Дневной свет", "Облачно", "Тень", "Лампа накаливания", "Флуоресцентная", "Сумерки"), wbValues, s.wb)
         val abValues = listOf("auto", "50", "60", "off")
         val abSp = spinner("Антимерцание", listOf("Авто", "50 Гц (Россия/Европа)", "60 Гц", "Выкл"), abValues, s.antibanding)
+        val codecValues = listOf("auto", "h264")
+        val codecSp = spinner("Кодек", listOf(if (VideoEncoder.isHevcSupported()) "Авто: HEVC, если ПК его умеет" else "Авто (HEVC этот телефон не умеет)", "Только H.264"), codecValues, s.codec)
         val orValues = listOf("auto", "landscape", "portrait")
         val orSp = spinner("Ориентация картинки в OBS", listOf("Авто (по положению телефона)", "Всегда альбомная", "Всегда портретная"), orValues, s.orientationMode)
 
@@ -572,6 +739,39 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val swAwb = switch("Зафиксировать баланс белого", s.awbLock)
         val swMirror = switch("Зеркалить превью на телефоне", s.mirrorPreview)
         val swScreen = switch("Не гасить экран", s.keepScreenOn)
+        val swDim = switch("Затемнять экран через минуту без касаний во время трансляции", s.autoDim)
+        val swFrame = if (c.engine.framingAvailable) switch("Автокадрирование: камера следит за лицом", s.framing) else null
+        val swAbr = switch("Адаптивный битрейт (подстраиваться под Wi-Fi)", s.abr)
+        val swHeat = switch("Беречь телефон: при перегреве снижать нагрузку", s.heatGuard)
+
+        header("Фон (размытие или замена; работает на телефоне)")
+        val bgValues = listOf("off", "blur", "image")
+        val bgSp = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("Как есть", "Размыть", "Заменить картинкой"))
+            setSelection(bgValues.indexOf(s.background).coerceAtLeast(0))
+        }
+        box.addView(bgSp)
+        val bgBar = SeekBar(this).apply { max = 100; progress = (s.bgStrength * 100).roundToInt() }
+        box.addView(TextView(this).apply { text = "Сила размытия" })
+        box.addView(bgBar)
+        box.addView(Button(this).apply {
+            text = "Выбрать картинку фона…"
+            setOnClickListener {
+                @Suppress("DEPRECATION")
+                startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*").addCategory(Intent.CATEGORY_OPENABLE), REQ_BG)
+            }
+        })
+
+        header("Безопасность")
+        val swAuth = switch("Спрашивать код доступа при подключении по Wi-Fi", s.authEnabled)
+        box.addView(Button(this).apply {
+            text = "Сменить код (сейчас ${s.pin})"
+            setOnClickListener {
+                s.regeneratePin()
+                text = "Новый код: ${s.pin}"
+                refreshUi()
+            }
+        })
 
         header("Имя устройства (видно в OBS)")
         val nameEt = EditText(this).apply { setText(s.deviceName); hint = s.displayName; box.addView(this) }
@@ -585,6 +785,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             .setNegativeButton("Отмена", null)
             .setPositiveButton("Сохранить") { _, _ ->
                 val p = HashMap<String, String>()
+                val prof = profValues[profSp.selectedItemPosition]
+                if (prof.isNotEmpty() && prof != s.profile) {
+                    c.applyParams(mapOf("profile" to prof))
+                    refreshUi()
+                    return@setPositiveButton
+                }
                 if (cams.isNotEmpty()) p["camera"] = cams[camSp.selectedItemPosition].id
                 sizes.getOrNull(resSp.selectedItemPosition)?.let { p["w"] = "${it.width}"; p["h"] = "${it.height}" }
                 p["fps"] = "${fpsValues[fpsSp.selectedItemPosition]}"
@@ -598,7 +804,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 p["awb_lock"] = if (swAwb.isChecked) "1" else "0"
                 p["mirror"] = if (swMirror.isChecked) "1" else "0"
                 p["name"] = nameEt.text.toString().trim()
+                p["codec"] = codecValues[codecSp.selectedItemPosition]
+                p["bg"] = bgValues[bgSp.selectedItemPosition]
+                p["bg_strength"] = "%.2f".format(java.util.Locale.US, bgBar.progress / 100f)
+                swFrame?.let { p["framing"] = if (it.isChecked) "1" else "0" }
+                p["abr"] = if (swAbr.isChecked) "1" else "0"
+                p["heat_guard"] = if (swHeat.isChecked) "1" else "0"
                 s.keepScreenOn = swScreen.isChecked
+                s.autoDim = swDim.isChecked
+                s.authEnabled = swAuth.isChecked
                 c.applyParams(p)
                 val newPort = portEt.text.toString().toIntOrNull()
                 if (newPort != null && newPort in 1024..65535 && newPort != s.port) {
@@ -618,6 +832,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             .distinct().sortedByDescending { it.width * it.height }
     }
 }
+
+private const val REQ_BG = 7
 
 class AspectFrame(ctx: Context) : FrameLayout(ctx) {
     var ratio = 0f
