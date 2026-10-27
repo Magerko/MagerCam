@@ -20,9 +20,7 @@
 /* беру объявление из util/threading.h: сам заголовок требует интринсиков MSVC */
 EXPORT void os_set_thread_name(const char *name);
 
-#include <libavcodec/avcodec.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/imgutils.h>
+#include "ffdec.h"
 
 OBS_DECLARE_MODULE()
 
@@ -31,6 +29,8 @@ OBS_DECLARE_MODULE()
 
 #define DEFAULT_PORT 4848
 #define DISCOVERY_PORT 4849
+/* запас в конце пакета, который FFmpeg читает за его границей; AV_INPUT_BUFFER_PADDING_SIZE во всех версиях 64 */
+#define MC_INPUT_PADDING 64
 
 enum pkt_type {
 	PKT_VIDEO_CONFIG = 1,
@@ -103,11 +103,7 @@ struct mc_source {
 	obs_data_array_t *cameras;
 
 	/* это трогает только сетевой поток */
-	AVCodecContext *dec;
-	AVBufferRef *hw_dev;
-	AVPacket *pkt;
-	AVFrame *frame;
-	AVFrame *sw_frame;
+	struct mc_dec *dec;
 	bool need_key;
 	bool hw_failed;
 	int64_t ts_offset;
@@ -882,60 +878,26 @@ static void discovery_run(int timeout_ms)
 	LOG(LOG_INFO, "discovery: found %d device(s)", count);
 }
 
-#ifdef _WIN32
-#define MC_HW_PIX AV_PIX_FMT_D3D11
-#define MC_HW_DEVICE AV_HWDEVICE_TYPE_D3D11VA
-#define MC_HW_NAME "D3D11VA"
-#else
-#define MC_HW_PIX AV_PIX_FMT_VAAPI
-#define MC_HW_DEVICE AV_HWDEVICE_TYPE_VAAPI
-#define MC_HW_NAME "VA-API"
-#endif
-
-static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmts)
-{
-	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
-		if (*p == MC_HW_PIX)
-			return *p;
-	return avcodec_default_get_format(ctx, fmts);
-}
+/* FFmpeg из самого OBS, выбираю при загрузке плагина; NULL, если подходящего нет */
+static const struct mc_ffapi *g_ff;
 
 static void decoder_close(struct mc_source *s)
 {
-	if (s->dec)
-		avcodec_free_context(&s->dec);
-	if (s->hw_dev)
-		av_buffer_unref(&s->hw_dev);
+	if (s->dec && g_ff)
+		g_ff->close(s->dec);
+	s->dec = NULL;
 }
 
 static bool decoder_open(struct mc_source *s, bool hw)
 {
 	decoder_close(s);
-	const AVCodec *codec = avcodec_find_decoder(s->stream_hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
-	if (!codec) {
-		set_status(s, s->stream_hevc ? "Ошибка: нет декодера H.265" : "Ошибка: нет декодера H.264");
+	if (!g_ff) {
+		set_status(s, "Ошибка: в этом OBS не нашлось FFmpeg (avcodec-60, 61 или 62). Нужен OBS 30 или новее");
 		return false;
 	}
-	s->dec = avcodec_alloc_context3(codec);
-	s->dec->flags |= AV_CODEC_FLAG_LOW_DELAY;
-	s->dec->flags2 |= AV_CODEC_FLAG2_FAST;
-	s->dec->thread_type = FF_THREAD_SLICE;
-	s->dec->thread_count = 0;
-
-	if (hw && !s->hw_failed) {
-		if (av_hwdevice_ctx_create(&s->hw_dev, MC_HW_DEVICE, NULL, NULL, 0) == 0) {
-			s->dec->hw_device_ctx = av_buffer_ref(s->hw_dev);
-			s->dec->get_format = get_hw_format;
-			LOG(LOG_INFO, "hardware decoding (" MC_HW_NAME ") enabled");
-		} else {
-			LOG(LOG_WARNING, MC_HW_NAME " unavailable, using software decoding");
-			s->hw_failed = true;
-		}
-	}
-
-	if (avcodec_open2(s->dec, codec, NULL) < 0) {
-		avcodec_free_context(&s->dec);
-		set_status(s, "Ошибка: не удалось открыть декодер");
+	s->dec = g_ff->open(s->stream_hevc, hw, &s->hw_failed);
+	if (!s->dec) {
+		set_status(s, s->stream_hevc ? "Ошибка: не удалось открыть декодер H.265" : "Ошибка: не удалось открыть декодер H.264");
 		return false;
 	}
 	s->need_key = true;
@@ -996,38 +958,35 @@ static uint64_t map_timestamp(struct mc_source *s, int64_t pts_us, bool audio)
 	return (uint64_t)ts;
 }
 
-static void output_frame(struct mc_source *s, AVFrame *f, int rot, bool mirror)
+static void output_frame(struct mc_source *s, const struct mc_frame *f, int rot, bool mirror)
 {
 	struct obs_source_frame2 out = {0};
 	enum video_format fmt;
-	switch (f->format) {
-	case AV_PIX_FMT_YUV420P:
-	case AV_PIX_FMT_YUVJ420P:
+	switch (f->pix) {
+	case MC_PIX_I420:
 		fmt = VIDEO_FORMAT_I420;
 		break;
-	case AV_PIX_FMT_NV12:
+	case MC_PIX_NV12:
 		fmt = VIDEO_FORMAT_NV12;
 		break;
 	default:
-		LOG(LOG_WARNING, "unsupported pixel format %d", f->format);
+		LOG(LOG_WARNING, "unsupported pixel format %d", f->raw_format);
 		return;
 	}
 
-	bool full = f->color_range == AVCOL_RANGE_JPEG || f->format == AV_PIX_FMT_YUVJ420P;
 	enum video_colorspace cs;
-	switch (f->colorspace) {
-	case AVCOL_SPC_BT709:
+	switch (f->cs) {
+	case MC_CS_709:
 		cs = VIDEO_CS_709;
 		break;
-	case AVCOL_SPC_BT470BG:
-	case AVCOL_SPC_SMPTE170M:
+	case MC_CS_601:
 		cs = VIDEO_CS_601;
 		break;
 	default:
 		cs = f->height >= 720 || f->width >= 1280 ? VIDEO_CS_709 : VIDEO_CS_601;
 		break;
 	}
-	out.range = full ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+	out.range = f->full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
 
 	int w = f->width, h = f->height;
 	if (rot == 0 && !mirror) {
@@ -1076,11 +1035,23 @@ static void output_frame(struct mc_source *s, AVFrame *f, int rot, bool mirror)
 	video_format_get_parameters_for_format(cs, out.range, out.format, out.color_matrix, out.color_range_min,
 					       out.color_range_max);
 
-	int64_t pts_us = f->pts != AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp;
+	int64_t pts_us = f->pts_us;
 	out.timestamp = map_timestamp(s, pts_us, false);
 	obs_source_output_video2(s->source, &out);
 	s->had_video = true;
 	s->ever_video = true;
+}
+
+struct frame_ctx {
+	struct mc_source *s;
+	int rot;
+	bool mirror;
+};
+
+static void on_frame(void *opaque, const struct mc_frame *f)
+{
+	struct frame_ctx *c = opaque;
+	output_frame(c->s, f, c->rot, c->mirror);
 }
 
 static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, int64_t pts, bool key, int rot,
@@ -1092,39 +1063,18 @@ static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, 
 		return;
 	s->need_key = false;
 
-	s->pkt->data = (uint8_t *)data;
-	s->pkt->size = (int)len;
-	s->pkt->pts = pts;
-	s->pkt->dts = pts;
-	s->pkt->flags = key ? AV_PKT_FLAG_KEY : 0;
-
-	int r = avcodec_send_packet(s->dec, s->pkt);
-	if (r < 0 && r != AVERROR(EAGAIN)) {
+	struct frame_ctx c = {s, rot, mirror};
+	switch (g_ff->decode(s->dec, data, len, pts, key, on_frame, &c)) {
+	case MC_DEC_NEED_KEY:
 		s->need_key = true;
-		return;
-	}
-	for (;;) {
-		r = avcodec_receive_frame(s->dec, s->frame);
-		if (r < 0)
-			break;
-		AVFrame *f = s->frame;
-		if (f->format == MC_HW_PIX) {
-			av_frame_unref(s->sw_frame);
-			if (av_hwframe_transfer_data(s->sw_frame, f, 0) < 0) {
-				LOG(LOG_WARNING, "hw transfer failed, switching to software decoding");
-				s->hw_failed = true;
-				av_frame_unref(f);
-				decoder_open(s, false);
-				return;
-			}
-			s->sw_frame->pts = f->pts;
-			s->sw_frame->best_effort_timestamp = f->best_effort_timestamp;
-			s->sw_frame->color_range = f->color_range;
-			s->sw_frame->colorspace = f->colorspace;
-			f = s->sw_frame;
-		}
-		output_frame(s, f, rot, mirror);
-		av_frame_unref(s->frame);
+		break;
+	case MC_DEC_HW_FAILED:
+		LOG(LOG_WARNING, "hw transfer failed, switching to software decoding");
+		s->hw_failed = true;
+		decoder_open(s, false);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -1218,7 +1168,7 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c)
 	dstr_printf(q, "/stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=", c->width, c->height, c->fps,
 		    c->bitrate_kbps, c->audio ? 1 : 0);
 	url_encode(q, c->camera);
-	if (c->hevc && avcodec_find_decoder(AV_CODEC_ID_HEVC))
+	if (c->hevc && g_ff && g_ff->has_hevc())
 		dstr_cat(q, "&codec=hevc");
 	if (c->control) {
 		dstr_catf(q, "&framing=%d&lock=%d&bg=%s&bg_strength=%.2f", c->framing ? 1 : 0, c->lock ? 1 : 0, c->bg,
@@ -1365,7 +1315,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 			LOG(LOG_WARNING, "packet too large: %u", len);
 			break;
 		}
-		size_t need = (size_t)len + AV_INPUT_BUFFER_PADDING_SIZE + 1;
+		size_t need = (size_t)len + MC_INPUT_PADDING + 1;
 		if (need > s->payload_cap) {
 			bfree(s->payload);
 			s->payload_cap = need * 2;
@@ -1373,7 +1323,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		}
 		if (len && !recv_all(sock, s->payload, len))
 			break;
-		memset(s->payload + len, 0, AV_INPUT_BUFFER_PADDING_SIZE + 1);
+		memset(s->payload + len, 0, MC_INPUT_PADDING + 1);
 
 		EnterCriticalSection(&s->lock);
 		int rot = s->rotation < 0 ? s->phone_orient : s->rotation;
@@ -1452,9 +1402,6 @@ MC_THREAD_FN(net_thread, param)
 {
 	struct mc_source *s = param;
 	os_set_thread_name("magercam-net");
-	s->pkt = av_packet_alloc();
-	s->frame = av_frame_alloc();
-	s->sw_frame = av_frame_alloc();
 
 	LONG last_gen = s->gen;
 	while (!s->stop) {
@@ -1489,9 +1436,6 @@ MC_THREAD_FN(net_thread, param)
 			wait_or_wake(s, 1000);
 	}
 
-	av_packet_free(&s->pkt);
-	av_frame_free(&s->frame);
-	av_frame_free(&s->sw_frame);
 	MC_THREAD_RETURN;
 }
 
@@ -2087,8 +2031,18 @@ bool obs_module_load(void)
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 	InitializeCriticalSection(&g_found_lock);
+#ifdef _WIN32
+	/* сначала то, что OBS уже загрузил сам, иначе ищу рядом с obs64.exe; новые версии вперёд */
+	const struct mc_ffapi *(*const variants[])(bool) = {mc_ff8_api, mc_ff7_api, mc_ff6_api};
+	for (int pass = 0; pass < 2 && !g_ff; pass++)
+		for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]) && !g_ff; i++)
+			g_ff = variants[i](pass == 1);
+#else
+	g_ff = mc_ff_api(true);
+#endif
+	/* источник регистрирую и без FFmpeg: тогда он покажет понятную ошибку, а не пропадёт из списка */
 	obs_register_source(&magercam_source);
-	LOG(LOG_INFO, "plugin loaded, version " PLUGIN_VERSION);
+	LOG(LOG_INFO, "plugin loaded, version " PLUGIN_VERSION ", decoder %s", g_ff ? g_ff->name : "not found");
 	return true;
 }
 
