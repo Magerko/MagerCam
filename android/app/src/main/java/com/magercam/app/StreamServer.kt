@@ -10,7 +10,6 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
@@ -24,7 +23,11 @@ class StreamServer(private val core: Core) {
     val streamClients = CopyOnWriteArrayList<StreamClient>()
     val mjpegClients = CopyOnWriteArrayList<MjpegClient>()
     private val jpegWaiters = CopyOnWriteArrayList<JpegWaiter>()
-    private val failures = ConcurrentHashMap<String, Pair<Int, Long>>()
+    /** Неверные коды по адресам: сколько подряд и когда был последний. Трогаю только под synchronized(failures). */
+    private val failures = HashMap<String, Pair<Int, Long>>()
+    private val globalFailures = ArrayDeque<Long>()
+    /** Сколько соединений обслуживаю одновременно; без предела тысяча медленных соединений съест всю память. */
+    private val slots = java.util.concurrent.Semaphore(48)
 
     @Volatile var lastVideoConfig: ByteArray? = null
         private set
@@ -41,7 +44,8 @@ class StreamServer(private val core: Core) {
         acceptThread = Thread({
             while (running) {
                 val s = try { ss.accept() } catch (e: IOException) { break }
-                Thread({ handle(s) }, "mc-http").start()
+                if (!slots.tryAcquire()) { try { s.close() } catch (_: Exception) {}; continue }
+                Thread({ try { handle(s) } finally { slots.release() } }, "mc-http").start()
             }
         }, "mc-accept").also { it.start() }
         Log.i(TAG, "listening on $port")
@@ -80,13 +84,15 @@ class StreamServer(private val core: Core) {
     private fun handle(sock: Socket) {
         try {
             sock.tcpNoDelay = true
-            sock.soTimeout = 15000
+            sock.soTimeout = 5000
             val input = sock.getInputStream()
-            val requestLine = readLine(input) ?: return sock.close()
+            // заголовки должны прийти целиком за 10 с и не больше 64 строк, иначе по байту можно держать поток вечно
+            val deadline = System.currentTimeMillis() + 10_000
+            val requestLine = readLine(input, deadline) ?: return sock.close()
             var headerKey: String? = null
             var contentLength = 0
-            while (true) {
-                val l = readLine(input) ?: break
+            for (i in 0 until 64) {
+                val l = readLine(input, deadline) ?: return sock.close()
                 if (l.isEmpty()) break
                 if (l.startsWith("X-MagerCam-Key:", ignoreCase = true)) headerKey = l.substringAfter(':').trim()
                 if (l.startsWith("Content-Length:", ignoreCase = true)) contentLength = l.substringAfter(':').trim().toIntOrNull() ?: 0
@@ -146,12 +152,24 @@ class StreamServer(private val core: Core) {
         val addr = sock.inetAddress
         if (!s.authEnabled || addr.isLoopbackAddress) return null
         val ip = addr.hostAddress ?: ""
-        val now = System.currentTimeMillis()
-        val (count, since) = failures[ip] ?: (0 to now)
-        if (count >= 10 && now - since < 60_000) return 429
-        if (key != null && key.filter { it.isDigit() } == s.pin) { failures.remove(ip); return null }
-        if (key != null) failures[ip] = (if (now - since > 60_000) 1 else count + 1) to (if (now - since > 60_000) now else since)
-        return 401
+        // Проверка и учёт попытки идут под одной блокировкой: иначе сотня параллельных запросов
+        // видит один и тот же счётчик и проходит мимо лимита.
+        synchronized(failures) {
+            val now = System.currentTimeMillis()
+            // Счётчик на адрес не спасает от атакующего с кучей адресов (в IPv6 их сколько угодно),
+            // поэтому есть и общий: больше 30 неверных кодов за минуту — минуту не сверяю вообще ничего.
+            globalFailures.removeAll { now - it > 60_000 }
+            if (globalFailures.size >= 30) return 429
+            val (count, last) = failures[ip] ?: (0 to 0L)
+            if (count >= 10 && now - last < 60_000) return 429
+            if (key != null && key.filter { it.isDigit() } == s.pin) { failures.remove(ip); return null }
+            if (key != null) {
+                failures[ip] = (if (now - last > 60_000) 1 else count + 1) to now
+                globalFailures += now
+                if (failures.size > 1000) failures.entries.removeAll { now - it.value.second > 60_000 }
+            }
+            return 401
+        }
     }
 
     private fun serveStream(sock: Socket, query: Map<String, String>) {
@@ -169,7 +187,12 @@ class StreamServer(private val core: Core) {
         val ac = ByteBuffer.allocate(5).putInt(AudioCapture.RATE).put(AudioCapture.CHANNELS.toByte()).array()
         client.enqueueOther(packet(PKT_AUDIO_CONFIG, ac, 0, false), droppable = false)
         client.enqueueOther(packet(PKT_STATUS, core.statusJson().toByteArray(), 0, false), droppable = false)
-        lastVideoConfig?.let { client.enqueueVideo(it, PKT_VIDEO_CONFIG, true) }
+        // Конфиг прошлого кодера отдаю, только если тот ещё работает и кодек клиенту по силам. Иначе клиент без
+        // декодера H.265 получал устаревший конфиг HEVC, отваливался и снова приходил к нему же, по кругу.
+        lastVideoConfig?.let {
+            val hevc = it[3].toInt() and FLAG_HEVC != 0
+            if (core.engine.encoderRunning && (wantsHevc || !hevc)) client.enqueueVideo(it, PKT_VIDEO_CONFIG, true)
+        }
         streamClients += client
         Log.i(TAG, "stream client ${sock.inetAddress.hostAddress} audio=$wantsAudio")
         core.onClientsChanged()
@@ -243,9 +266,10 @@ class StreamServer(private val core: Core) {
         out.flush()
     }
 
-    private fun readLine(input: InputStream): String? {
+    private fun readLine(input: InputStream, deadline: Long = Long.MAX_VALUE): String? {
         val sb = StringBuilder()
         while (sb.length < 8192) {
+            if (System.currentTimeMillis() > deadline) return null
             val c = input.read()
             if (c < 0) return if (sb.isEmpty()) null else sb.toString()
             if (c == '\n'.code) return sb.toString().trimEnd('\r')

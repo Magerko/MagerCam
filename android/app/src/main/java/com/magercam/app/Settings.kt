@@ -72,6 +72,7 @@ class Settings(context: Context) {
 
     companion object {
         private val rnd = SecureRandom()
-        fun newPin(): String = "%06d".format(rnd.nextInt(1_000_000))
+        // Locale.ROOT, потому что на арабской или персидской локали иначе выйдут не ASCII-цифры, и код не совпадёт
+        fun newPin(): String = String.format(java.util.Locale.ROOT, "%06d", rnd.nextInt(1_000_000))
     }
 }

@@ -473,7 +473,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             append("🔋 $bat%"); if (charging) append(" ⚡"); append(" · ${"%.0f".format(temp)}°C")
         }
-        val err = c.serverError ?: c.engine.error ?: c.engine.recordError ?: c.engine.bgError
+        val err = c.serverError ?: c.engine.error ?: c.engine.recordError ?: c.engine.recorder.lastError ?: c.engine.bgError
             ?: if (c.overheated && s.heatGuard) "Телефон перегрелся: снижаю до 30 к/с и 6 Мбит/с. Снимите чехол и уберите его от солнца." else null
         tvErr.text = err ?: ""
         tvErr.visibility = if (err != null) View.VISIBLE else View.GONE
@@ -607,14 +607,44 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             return
         }
         stopScan()
-        doPair(u)
+        doPair(u, confirmed = true)
     }
 
-    private fun doPair(u: Uri) {
+    /** Только IPv4-адрес цифрами из частных диапазонов, 100.64/10 (Tailscale) или link-local. Имена не принимаю. */
+    private fun isLocalAddress(h: String): Boolean {
+        val p = h.split('.').map { it.toIntOrNull() ?: return false }
+        if (p.size != 4 || p.any { it !in 0..255 }) return false
+        return p[0] == 10 || (p[0] == 172 && p[1] in 16..31) || (p[0] == 192 && p[1] == 168) ||
+            (p[0] == 100 && p[1] in 64..127) || (p[0] == 169 && p[1] == 254)
+    }
+
+    /**
+     * Сопряжение отдаёт ПК код доступа, поэтому шлю его только на адреса локальной сети: домашней, рабочей
+     * или Tailscale. Ссылку magercam://pair может подсунуть любая страница или чужой QR, и без этой проверки
+     * код ушёл бы на сервер в интернете. [confirmed] — ссылку отсканировали кнопкой в самом приложении.
+     */
+    private fun doPair(u: Uri, confirmed: Boolean = false) {
         val c = core ?: return
-        val hosts = u.getQueryParameter("h")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
-        val port = u.getQueryParameter("p")?.toIntOrNull() ?: 4850
+        val all = u.getQueryParameter("h")?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+        val hosts = all.filter { isLocalAddress(it) }
+        val port = u.getQueryParameter("p")?.toIntOrNull()?.takeIf { it in 1..65535 } ?: 4850
         val nonce = u.getQueryParameter("n") ?: return
+        if (hosts.isEmpty()) {
+            AlertDialog.Builder(this).setTitle("Не получилось")
+                .setMessage("В QR-коде нет адреса ПК из локальной сети${if (all.isNotEmpty()) ": " + all.joinToString() else ""}. " +
+                    "Код доступа на такие адреса не отправляю.")
+                .setPositiveButton("OK", null).show()
+            return
+        }
+        if (!confirmed) {
+            AlertDialog.Builder(this).setTitle("Сопрячь с ПК?")
+                .setMessage("Телефон передаст код доступа компьютеру ${hosts.joinToString()}. " +
+                    "Соглашайтесь, только если QR-код показывает ваша программа MagerCam.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Сопрячь") { _, _ -> doPair(u, true) }
+                .show()
+            return
+        }
         Toast.makeText(this, "Сопряжение с ПК…", Toast.LENGTH_SHORT).show()
         Thread {
             var err: String? = "В QR-коде нет адреса ПК"

@@ -4,8 +4,8 @@
 1 RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,1,3,0
-PRODUCTVERSION 1,1,3,0
+FILEVERSION 1,2,0,0
+PRODUCTVERSION 1,2,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -15,9 +15,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "MagerCam"
       VALUE "FileDescription", "MagerCam - phone as a webcam"
-      VALUE "FileVersion", "1.1.3"
+      VALUE "FileVersion", "1.2.0"
       VALUE "ProductName", "MagerCam"
-      VALUE "ProductVersion", "1.1.3"
+      VALUE "ProductVersion", "1.2.0"
       VALUE "OriginalFilename", "MagerCam.exe"
     END
   END

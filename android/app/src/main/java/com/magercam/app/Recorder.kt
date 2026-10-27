@@ -44,6 +44,10 @@ class Recorder(private val ctx: Context) {
         private set
     @Volatile var lastFileName: String? = null
         private set
+    // почему последняя запись не сохранилась; показываю в статусе
+    @Volatile var lastError: String? = null
+        private set
+    private var videoFormatAt = 0L
 
     val isRunning get() = running
 
@@ -77,6 +81,7 @@ class Recorder(private val ctx: Context) {
             muxer!!.setOrientationHint(orientation)
             lastFileName = name
             videoTrack = -1; audioTrack = -1; muxerStarted = false
+            videoFormatAt = 0; lastError = null
             lastVideoPts = -1; lastAudioPts = -1
             v.start()
             audio?.start()
@@ -137,10 +142,29 @@ class Recorder(private val ctx: Context) {
                 val v = video ?: break
                 drainOne(v, info, true, 10_000)
                 audio?.let { drainOne(it, info, false, 0) }
+                waitAudioTimeout()
             }
         } catch (e: Exception) {
             Log.e(TAG, "drain loop", e)
             running = false
+        }
+    }
+
+    /**
+     * Muxer стартует, только когда известны все дорожки. Если микрофон так и не дал звука
+     * (занят другим приложением, выключен), за 2 с после видео начинаю писать без звука,
+     * иначе файл остался бы пустым и молча удалился.
+     */
+    private fun waitAudioTimeout() {
+        synchronized(lock) {
+            if (muxerStarted || audio == null || audioTrack >= 0 || videoTrack < 0) return
+            if (System.currentTimeMillis() - videoFormatAt < AUDIO_WAIT_MS) return
+            try {
+                muxer?.start(); muxerStarted = true
+                Log.w(TAG, "no audio format in ${AUDIO_WAIT_MS}ms, recording video only")
+            } catch (e: Exception) {
+                Log.w(TAG, "muxer start: $e")
+            }
         }
     }
 
@@ -154,6 +178,7 @@ class Recorder(private val ctx: Context) {
                 if (muxerStarted || (if (isVideo) videoTrack else audioTrack) >= 0) return
                 try {
                     if (isVideo) videoTrack = m.addTrack(c.outputFormat) else audioTrack = m.addTrack(c.outputFormat)
+                    if (isVideo) videoFormatAt = System.currentTimeMillis()
                     if (videoTrack >= 0 && (audio == null || audioTrack >= 0)) { m.start(); muxerStarted = true }
                 } catch (e: Exception) {
                     Log.w(TAG, "muxer track: $e")
@@ -215,6 +240,7 @@ class Recorder(private val ctx: Context) {
             }
         }
         if (!ok) file?.delete()
+        if (finish && !ok) lastError = "Запись не сохранилась: камера не успела дать ни одного кадра"
         uri = null; file = null
         startedAt = 0
         if (finish) Log.i(TAG, "recording stopped ok=$ok")
@@ -222,5 +248,6 @@ class Recorder(private val ctx: Context) {
 
     companion object {
         private const val TAG = "MC.Recorder"
+        private const val AUDIO_WAIT_MS = 2000L
     }
 }

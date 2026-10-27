@@ -75,8 +75,9 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private val jpegHandler = Handler(jpegThread.looper)
 
     private val encoder = VideoEncoder { t, p, k -> listener.onEncoderPacket(t, p, k) }
+    val encoderRunning get() = encoder.isRunning
     val recorder = Recorder(ctx)
-    private var recordRequested = false
+    @Volatile private var recordRequested = false
     private var recordAudio = false
     private var recordOrientation = 0
     private var encoderWantedHevc = false
@@ -189,7 +190,14 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     fun requestKeyFrame() = handler.post { encoder.requestKeyFrame() }
 
-    fun setRecording(on: Boolean, withAudio: Boolean, orientation: Int) = handler.post {
+    fun setRecording(on: Boolean, withAudio: Boolean, orientation: Int): Boolean {
+        // флаг ставлю сразу, а не в потоке камеры: Core тут же решает по нему, включать ли микрофон,
+        // и раньше видел старое значение, отчего запись выходила без звука
+        recordRequested = on
+        return handler.post { applyRecording(on, withAudio, orientation) }
+    }
+
+    private fun applyRecording(on: Boolean, withAudio: Boolean, orientation: Int) {
         recordRequested = on
         recordAudio = withAudio
         recordOrientation = orientation

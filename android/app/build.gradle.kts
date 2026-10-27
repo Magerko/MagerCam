@@ -13,8 +13,8 @@ android {
         applicationId = "com.magercam.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.1.4"
+        versionCode = 6
+        versionName = "1.2.0"
         // x86_64 только для эмулятора; 32-битный x86 давно не встречается
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
@@ -27,6 +27,8 @@ android {
     // свой ключ лежит вне репозитория и описан в android/keystore.properties; без него подписываю отладочным
     val keyProps = rootProject.file("keystore.properties").takeIf { it.exists() }
         ?.let { f -> Properties().apply { f.inputStream().use { load(it) } } }
+    // такой APK не встанет поверх релизного с GitHub, поэтому предупреждаю громко, а не молча
+    if (keyProps == null) logger.warn("MagerCam: keystore.properties не найден, release подписан отладочным ключом")
 
     signingConfigs {
         if (keyProps != null) create("release") {

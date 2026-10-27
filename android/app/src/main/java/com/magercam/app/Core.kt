@@ -275,7 +275,7 @@ class Core(val context: Context) : CameraEngine.Listener {
             }
         }
         if ("mic" in p) { settings.micEnabled = b("mic"); audioChanged = true }
-        p["audio_source"]?.let { if (it != settings.audioSource) { settings.audioSource = it; audio.stop(); audioChanged = true } }
+        p["audio_source"]?.let { if (it in listOf("camcorder", "mic", "voice", "unprocessed") && it != settings.audioSource) { settings.audioSource = it; audio.stop(); audioChanged = true } }
         p["torch"]?.let { settings.torch = if (it == "toggle") !settings.torch else b("torch"); controls = true }
         f("zoom")?.let { settings.zoom = it.coerceIn(0.1f, 100f); controls = true }
         f("ev")?.let { settings.ev = it.coerceIn(-10f, 10f); controls = true }
@@ -390,7 +390,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         engine.bgError?.let { o.put("bg_error", it) }
         o.put("rec", engine.recorder.isRunning)
         if (engine.recorder.isRunning) o.put("rec_ms", System.currentTimeMillis() - engine.recorder.startedAt)
-        engine.recordError?.let { o.put("rec_error", it) }
+        (engine.recordError ?: engine.recorder.lastError)?.let { o.put("rec_error", it) }
         o.put("hot", overheated).put("heat_guard", settings.heatGuard)
         engine.error?.let { o.put("error", it) }
         serverError?.let { o.put("error", it) }

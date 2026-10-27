@@ -1,6 +1,7 @@
 # build output
 dist/
 build/
+obs-plugin/build-linux/
 *.apk
 *.res
 *.o

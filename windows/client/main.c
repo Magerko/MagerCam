@@ -17,7 +17,7 @@
 #include "../common/mcv_nv12.h"
 #include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.1.3"
+#define APP_VERSION "1.2.0"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
@@ -451,6 +451,10 @@ struct session {
 	/* наименьшая разница «время прихода − pts», то есть задержка сети без очереди; от неё меряю отставание */
 	int64_t lat_base;
 	bool lat_valid, lagging, wait_key;
+	/* последний конфиг видео: по нему пересоздаю декодер, если тот сломался посреди потока */
+	uint8_t *cfg;
+	uint32_t cfg_len;
+	bool cfg_hevc;
 };
 
 /* Если декодер или сеть не успевают (4K, слабый Wi-Fi), кадры приходят всё позже, и задержка сама уже не уходит.
@@ -653,12 +657,18 @@ static int stream_session(const struct settings *cfg, LONG gen)
 		case PKT_VIDEO_CONFIG:
 			/* конфиг приходит заново при смене разрешения или камеры, поэтому декодер пересоздаю */
 			decoder_destroy(s.dec);
+			free(s.cfg);
+			s.cfg = malloc(len ? len : 1);
+			if (s.cfg)
+				memcpy(s.cfg, payload, len);
+			s.cfg_len = len;
 			/* бит 1 во флагах конфига: телефон кодирует в H.265 */
-			s.dec = decoder_create(on_frame, &s, (flags & 2) != 0);
+			s.cfg_hevc = (flags & 2) != 0;
+			s.dec = decoder_create(on_frame, &s, s.cfg_hevc);
 			if (!s.dec) {
-				set_net_status((flags & 2) ? L"Ошибка: нет декодера H.265. Отключите «H.265» или поставьте «Расширения для видео HEVC»."
-							   : L"Ошибка: декодер H.264 Windows недоступен");
-				ok = false;
+				/* сессию не рву: телефон пришлёт новый конфиг, когда сменит кодек, а до тех пор кадры пропускаю */
+				set_net_status(s.cfg_hevc ? L"Ошибка: нет декодера H.265. Отключите «H.265» или поставьте «Расширения для видео HEVC»."
+							  : L"Ошибка: декодер H.264 Windows недоступен");
 				break;
 			}
 			decoder_feed(s.dec, payload, len, pts);
@@ -675,14 +685,22 @@ static int stream_session(const struct settings *cfg, LONG gen)
 			}
 			s.wait_key = false;
 			if (s.dec && !decoder_feed(s.dec, payload, len, pts)) {
+				/* раньше тут ждал следующего конфига, а он приходит только при смене формата,
+				   и картинка замирала навсегда; пересоздаю декодер сразу и жду ключевой кадр,
+				   телефон шлёт их сам раз в пару секунд */
 				decoder_destroy(s.dec);
-				s.dec = NULL; /* жду следующий конфиг */
+				s.dec = s.cfg ? decoder_create(on_frame, &s, s.cfg_hevc) : NULL;
+				if (s.dec)
+					decoder_feed(s.dec, s.cfg, s.cfg_len, pts);
+				s.wait_key = true;
 			}
 			break;
 		case PKT_AUDIO_CONFIG:
 			if (len >= 5) {
-				s.a_rate = (int)(((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
+				int rate = (int)(((uint32_t)payload[0] << 24) | ((uint32_t)payload[1] << 16) |
 						 ((uint32_t)payload[2] << 8) | payload[3]);
+				/* мусорную частоту в WASAPI не передаю, звук просто не включится */
+				s.a_rate = rate >= 8000 && rate <= 192000 ? rate : 0;
 				s.a_ch = payload[4];
 				close_audio(&s);
 			}
@@ -695,7 +713,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 			LeaveCriticalSection(&app.lock);
 			if (dev_changed || !want)
 				close_audio(&s);
-			if (want && !s.aout && s.a_ch >= 1 && s.a_ch <= 2)
+			if (want && !s.aout && s.a_rate && s.a_ch >= 1 && s.a_ch <= 2)
 				s.aout = audio_open(audio_dev, s.a_rate, s.a_ch);
 			if (s.aout)
 				audio_write(s.aout, (const int16_t *)payload, (int)(len / (2 * s.a_ch)));
@@ -739,6 +757,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 	closesocket(sock);
 	decoder_destroy(s.dec);
 	close_audio(&s);
+	free(s.cfg);
 	free(s.small);
 	free(payload);
 	if (was && !app.quit && app.gen == gen)

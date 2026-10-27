@@ -2,12 +2,12 @@
  * Плагин MagerCam для OBS: телефон как камера.
  * Принимаю H.264 + PCM от приложения MagerCam (см. docs/PROTOCOL.md) по Wi-Fi или по USB через adb forward.
  */
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iphlpapi.h>
-#include <mswsock.h>
-#include <windows.h>
+#include "compat.h"
+#ifndef _WIN32
+#include <cairo.h>
+#include <signal.h>
+#include <sys/wait.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.1.3"
+#define PLUGIN_VERSION "1.2.0"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -89,8 +89,9 @@ struct mc_source {
 	volatile LONG gen;
 	volatile bool stop;
 	volatile bool showing;
-	HANDLE thread;
-	HANDLE wake;
+	mc_thread_t thread;
+	bool has_thread;
+	mc_event_t wake;
 	SOCKET sock;
 
 	/* статус от телефона, трогаю только под lock */
@@ -129,6 +130,7 @@ struct mc_source {
 	int phone_fps[8], phone_nfps;
 };
 
+#ifdef _WIN32
 static wchar_t *utf8_to_wide(const char *s)
 {
 	int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
@@ -206,6 +208,79 @@ static void show_card(struct mc_source *s, const char *msg)
 	DeleteObject(bmp);
 	DeleteDC(dc);
 }
+#else
+static bool file_exists_utf8(const char *path)
+{
+	return access(path, X_OK) == 0;
+}
+
+/* То же, что версия для Windows, только рисую через cairo: он есть в любом Linux с графической средой */
+static void show_card(struct mc_source *s, const char *msg)
+{
+	const int W = 1280, H = 720;
+	cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_RGB24, W, H);
+	if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(surf);
+		return;
+	}
+	cairo_t *cr = cairo_create(surf);
+	cairo_set_source_rgb(cr, 24 / 255.0, 26 / 255.0, 32 / 255.0);
+	cairo_paint(cr);
+
+	cairo_text_extents_t ext;
+	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+	cairo_set_font_size(cr, 96);
+	cairo_set_source_rgb(cr, 1.0, 152 / 255.0, 0);
+	cairo_text_extents(cr, "MagerCam", &ext);
+	cairo_move_to(cr, (W - ext.width) / 2 - ext.x_bearing, 250 - ext.height / 2 - ext.y_bearing);
+	cairo_show_text(cr, "MagerCam");
+
+	/* cairo сам строки не переносит: собираю их по словам, пока ширина влезает */
+	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	cairo_set_font_size(cr, 40);
+	cairo_set_source_rgb(cr, 220 / 255.0, 224 / 255.0, 232 / 255.0);
+	const double max_w = W - 240;
+	double y = 400;
+	char line[512] = "";
+	const char *p = msg;
+	while (*p && y < H - 60) {
+		const char *sp = strchr(p, ' ');
+		size_t wl = sp ? (size_t)(sp - p) : strlen(p);
+		char trial[512];
+		snprintf(trial, sizeof(trial), "%s%s%.*s", line, *line ? " " : "", (int)wl, p);
+		cairo_text_extents(cr, trial, &ext);
+		if (ext.width > max_w && *line) {
+			cairo_text_extents(cr, line, &ext);
+			cairo_move_to(cr, (W - ext.width) / 2 - ext.x_bearing, y);
+			cairo_show_text(cr, line);
+			y += 52;
+			line[0] = 0;
+			continue;
+		}
+		snprintf(line, sizeof(line), "%s", trial);
+		p += wl;
+		while (*p == ' ')
+			p++;
+	}
+	if (*line && y < H - 60) {
+		cairo_text_extents(cr, line, &ext);
+		cairo_move_to(cr, (W - ext.width) / 2 - ext.x_bearing, y);
+		cairo_show_text(cr, line);
+	}
+	cairo_destroy(cr);
+	cairo_surface_flush(surf);
+
+	struct obs_source_frame f = {0};
+	f.format = VIDEO_FORMAT_BGRX;
+	f.width = W;
+	f.height = H;
+	f.data[0] = cairo_image_surface_get_data(surf);
+	f.linesize[0] = (uint32_t)cairo_image_surface_get_stride(surf);
+	f.timestamp = os_gettime_ns();
+	obs_source_output_video(s->source, &f);
+	cairo_surface_destroy(surf);
+}
+#endif
 
 static void set_status(struct mc_source *s, const char *fmt, ...)
 {
@@ -256,11 +331,10 @@ static SOCKET tcp_connect(const char *host, int port, int timeout_ms)
 		return INVALID_SOCKET;
 	}
 
-	u_long nb = 1;
-	ioctlsocket(sock, FIONBIO, &nb);
+	mc_set_nonblock(sock, true);
 	int r = connect(sock, res->ai_addr, (int)res->ai_addrlen);
 	freeaddrinfo(res);
-	if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+	if (r == SOCKET_ERROR && !mc_connect_pending()) {
 		closesocket(sock);
 		return INVALID_SOCKET;
 	}
@@ -271,14 +345,22 @@ static SOCKET tcp_connect(const char *host, int port, int timeout_ms)
 	FD_SET(sock, &wfds);
 	FD_SET(sock, &efds);
 	struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-	r = select(0, NULL, &wfds, &efds, &tv);
+	r = select((int)sock + 1, NULL, &wfds, &efds, &tv);
 	if (r <= 0 || FD_ISSET(sock, &efds)) {
 		closesocket(sock);
 		return INVALID_SOCKET;
 	}
+#ifndef _WIN32
+	/* в Linux отказ в соединении приходит как «готов к записи», настоящий итог лежит в SO_ERROR */
+	int soerr = 0;
+	socklen_t elen = sizeof(soerr);
+	if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &elen) != 0 || soerr != 0) {
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+#endif
 
-	nb = 0;
-	ioctlsocket(sock, FIONBIO, &nb);
+	mc_set_nonblock(sock, false);
 	int one = 1;
 	setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 	int rcvbuf = 4 * 1024 * 1024;
@@ -288,14 +370,24 @@ static SOCKET tcp_connect(const char *host, int port, int timeout_ms)
 
 static void set_recv_timeout(SOCKET sock, int ms)
 {
+#ifdef _WIN32
 	DWORD t = (DWORD)ms;
+#else
+	struct timeval t = {ms / 1000, (ms % 1000) * 1000};
+#endif
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
 }
+
+#ifdef MSG_NOSIGNAL
+#define MC_SEND_FLAGS MSG_NOSIGNAL /* иначе оборванное соединение убьёт весь OBS сигналом SIGPIPE */
+#else
+#define MC_SEND_FLAGS 0
+#endif
 
 static bool recv_all(SOCKET sock, uint8_t *buf, size_t n)
 {
 	while (n > 0) {
-		int r = recv(sock, (char *)buf, (int)(n > 1 << 20 ? 1 << 20 : n), 0);
+		int r = (int)recv(sock, (char *)buf, (int)(n > 1 << 20 ? 1 << 20 : n), 0);
 		if (r <= 0)
 			return false;
 		buf += r;
@@ -307,7 +399,7 @@ static bool recv_all(SOCKET sock, uint8_t *buf, size_t n)
 static bool send_all(SOCKET sock, const char *buf, size_t n)
 {
 	while (n > 0) {
-		int r = send(sock, buf, (int)n, 0);
+		int r = (int)send(sock, buf, (int)n, MC_SEND_FLAGS);
 		if (r <= 0)
 			return false;
 		buf += r;
@@ -352,6 +444,7 @@ static bool http_get(const char *host, int port, const char *path, const char *k
 	return code == 200;
 }
 
+#ifdef _WIN32
 static bool run_process(const char *exe, const char *args, char *out, size_t outsz, DWORD timeout_ms)
 {
 	struct dstr cmd = {0};
@@ -474,12 +567,117 @@ static bool find_adb(const char *configured, char *out, size_t sz)
 	}
 	return false;
 }
+#else
+/* Аргументы adb у меня без пробелов внутри, поэтому строку просто режу по пробелам */
+static bool run_process(const char *exe, const char *args, char *out, size_t outsz, DWORD timeout_ms)
+{
+	char buf[512];
+	snprintf(buf, sizeof(buf), "%s", args);
+	char *argv[24];
+	int argc = 0;
+	argv[argc++] = (char *)exe;
+	char *ctx = NULL;
+	for (char *t = strtok_r(buf, " ", &ctx); t && argc < 23; t = strtok_r(NULL, " ", &ctx))
+		argv[argc++] = t;
+	argv[argc] = NULL;
+
+	int fds[2];
+	if (pipe(fds) != 0)
+		return false;
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return false;
+	}
+	if (pid == 0) {
+		dup2(fds[1], STDOUT_FILENO);
+		dup2(fds[1], STDERR_FILENO);
+		close(fds[0]);
+		close(fds[1]);
+		execv(exe, argv);
+		_exit(127);
+	}
+	close(fds[1]);
+	fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK);
+
+	size_t len = 0;
+	ULONGLONG start = GetTickCount64();
+	int status = 0;
+	bool exited = false;
+	for (;;) {
+		char tmp[512];
+		ssize_t got = read(fds[0], tmp, sizeof(tmp));
+		if (got > 0) {
+			if (out && len + 1 < outsz) {
+				size_t c = (size_t)got < outsz - 1 - len ? (size_t)got : outsz - 1 - len;
+				memcpy(out + len, tmp, c);
+				len += c;
+			}
+			continue;
+		}
+		if (got == 0 && exited)
+			break;
+		if (!exited && waitpid(pid, &status, WNOHANG) == pid) {
+			exited = true;
+			continue; /* дочитываю то, что осталось в трубе */
+		}
+		if (exited)
+			break;
+		if (GetTickCount64() - start > timeout_ms) {
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			status = 1 << 8;
+			break;
+		}
+		Sleep(20);
+	}
+	close(fds[0]);
+	if (out)
+		out[len] = 0;
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool find_adb(const char *configured, char *out, size_t sz)
+{
+	if (configured && *configured && file_exists_utf8(configured)) {
+		snprintf(out, sz, "%s", configured);
+		return true;
+	}
+	const char *path = getenv("PATH");
+	if (path) {
+		char copy[4096];
+		snprintf(copy, sizeof(copy), "%s", path);
+		char *ctx = NULL;
+		for (char *dir = strtok_r(copy, ":", &ctx); dir; dir = strtok_r(NULL, ":", &ctx)) {
+			snprintf(out, sz, "%s/adb", dir);
+			if (file_exists_utf8(out))
+				return true;
+		}
+	}
+	char *bundled = obs_find_module_file(obs_current_module(), "adb/adb");
+	if (bundled) {
+		snprintf(out, sz, "%s", bundled);
+		bfree(bundled);
+		if (file_exists_utf8(out))
+			return true;
+	}
+	/* Android Studio кладёт SDK в домашнюю папку */
+	const char *home = getenv("HOME");
+	if (home) {
+		snprintf(out, sz, "%s/Android/Sdk/platform-tools/adb", home);
+		if (file_exists_utf8(out))
+			return true;
+	}
+	return false;
+}
+#endif
 
 static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 {
 	char adb[1024];
 	if (!find_adb(adb_cfg, adb, sizeof(adb))) {
-		set_status(s, "USB: adb.exe не найден (укажите путь в настройках)");
+		set_status(s, "USB: " MC_ADB_NAME " не найден (укажите путь в настройках)");
 		return false;
 	}
 
@@ -498,7 +696,7 @@ static bool adb_prepare(struct mc_source *s, const char *adb_cfg, int port)
 		char copy[4096];
 		snprintf(copy, sizeof(copy), "%s", out);
 		char *ctx = NULL;
-		for (char *line = strtok_s(copy, "\r\n", &ctx); line; line = strtok_s(NULL, "\r\n", &ctx)) {
+		for (char *line = mc_strtok(copy, "\r\n", &ctx); line; line = mc_strtok(NULL, "\r\n", &ctx)) {
 			char ser[128], state[64];
 			if (sscanf(line, "%127s %63s", ser, state) != 2)
 				continue;
@@ -561,10 +759,12 @@ static void discovery_run(int timeout_ms)
 		return;
 	int one = 1;
 	setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&one, sizeof(one));
+#ifdef _WIN32
 	/* иначе ICMP «порт закрыт» от соседей по подсети рвёт приём ошибкой WSAECONNRESET */
 	BOOL no_reset = FALSE;
 	DWORD ret = 0;
 	WSAIoctl(sock, SIO_UDP_CONNRESET, &no_reset, sizeof(no_reset), NULL, 0, &ret, NULL, NULL);
+#endif
 	struct sockaddr_in local = {0};
 	local.sin_family = AF_INET;
 	bind(sock, (struct sockaddr *)&local, sizeof(local));
@@ -577,6 +777,9 @@ static void discovery_run(int timeout_ms)
 	sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
 
 	/* шлю направленный broadcast на каждый адаптер: 255.255.255.255 уходит только через одну сетевуху */
+	uint32_t ips[16], masks[16];
+	int nif = 0;
+#ifdef _WIN32
 	ULONG size = 32 * 1024;
 	IP_ADAPTER_ADDRESSES *addrs = bmalloc(size);
 	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
@@ -584,28 +787,47 @@ static void discovery_run(int timeout_ms)
 		for (IP_ADAPTER_ADDRESSES *a = addrs; a; a = a->Next) {
 			if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
 				continue;
-			for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
-				struct sockaddr_in *sin = (struct sockaddr_in *)u->Address.lpSockaddr;
+			for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && nif < 16; u = u->Next) {
 				ULONG prefix = u->OnLinkPrefixLength;
 				if (prefix == 0 || prefix >= 32)
 					continue;
-				uint32_t ip = ntohl(sin->sin_addr.s_addr);
-				uint32_t mask = prefix ? 0xFFFFFFFFu << (32 - prefix) : 0;
-				dst.sin_addr.s_addr = htonl((ip & mask) | ~mask);
-				sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
-				/* broadcast часто глушит роутер или сам телефон в экономии энергии, а на прямой запрос
-				 * он ответит, и брандмауэр пропустит ответ. Поэтому опрашиваю ещё всю свою /24 */
-				uint32_t net = ip & 0xFFFFFF00u;
-				for (uint32_t h = 1; h < 255; h++) {
-					if ((net | h) == ip)
-						continue;
-					dst.sin_addr.s_addr = htonl(net | h);
-					sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
-				}
+				ips[nif] = ntohl(((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr.s_addr);
+				masks[nif++] = 0xFFFFFFFFu << (32 - prefix);
 			}
 		}
 	}
 	bfree(addrs);
+#else
+	struct ifaddrs *ifa = NULL;
+	if (getifaddrs(&ifa) == 0) {
+		for (struct ifaddrs *a = ifa; a && nif < 16; a = a->ifa_next) {
+			if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !a->ifa_netmask)
+				continue;
+			if (!(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK))
+				continue;
+			uint32_t mask = ntohl(((struct sockaddr_in *)a->ifa_netmask)->sin_addr.s_addr);
+			if (mask == 0 || mask == 0xFFFFFFFFu)
+				continue;
+			ips[nif] = ntohl(((struct sockaddr_in *)a->ifa_addr)->sin_addr.s_addr);
+			masks[nif++] = mask;
+		}
+		freeifaddrs(ifa);
+	}
+#endif
+	for (int i = 0; i < nif; i++) {
+		uint32_t ip = ips[i], mask = masks[i];
+		dst.sin_addr.s_addr = htonl((ip & mask) | ~mask);
+		sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+		/* broadcast часто глушит роутер или сам телефон в экономии энергии, а на прямой запрос
+		 * он ответит, и брандмауэр пропустит ответ. Поэтому опрашиваю ещё всю свою /24 */
+		uint32_t net = ip & 0xFFFFFF00u;
+		for (uint32_t h = 1; h < 255; h++) {
+			if ((net | h) == ip)
+				continue;
+			dst.sin_addr.s_addr = htonl(net | h);
+			sendto(sock, msg, sizeof(msg) - 1, 0, (struct sockaddr *)&dst, sizeof(dst));
+		}
+	}
 
 	struct found_device found[MAX_FOUND];
 	int count = 0;
@@ -619,12 +841,12 @@ static void discovery_run(int timeout_ms)
 		FD_ZERO(&fds);
 		FD_SET(sock, &fds);
 		struct timeval tv = {left / 1000, (left % 1000) * 1000};
-		if (select(0, &fds, NULL, NULL, &tv) <= 0)
+		if (select((int)sock + 1, &fds, NULL, NULL, &tv) <= 0)
 			break;
 		char buf[1024];
 		struct sockaddr_in from;
-		int fromlen = sizeof(from);
-		int r = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fromlen);
+		socklen_t fromlen = sizeof(from);
+		int r = (int)recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fromlen);
 		if (r <= 0)
 			continue;
 		buf[r] = 0;
@@ -660,10 +882,20 @@ static void discovery_run(int timeout_ms)
 	LOG(LOG_INFO, "discovery: found %d device(s)", count);
 }
 
+#ifdef _WIN32
+#define MC_HW_PIX AV_PIX_FMT_D3D11
+#define MC_HW_DEVICE AV_HWDEVICE_TYPE_D3D11VA
+#define MC_HW_NAME "D3D11VA"
+#else
+#define MC_HW_PIX AV_PIX_FMT_VAAPI
+#define MC_HW_DEVICE AV_HWDEVICE_TYPE_VAAPI
+#define MC_HW_NAME "VA-API"
+#endif
+
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmts)
 {
 	for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
-		if (*p == AV_PIX_FMT_D3D11)
+		if (*p == MC_HW_PIX)
 			return *p;
 	return avcodec_default_get_format(ctx, fmts);
 }
@@ -691,12 +923,12 @@ static bool decoder_open(struct mc_source *s, bool hw)
 	s->dec->thread_count = 0;
 
 	if (hw && !s->hw_failed) {
-		if (av_hwdevice_ctx_create(&s->hw_dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) == 0) {
+		if (av_hwdevice_ctx_create(&s->hw_dev, MC_HW_DEVICE, NULL, NULL, 0) == 0) {
 			s->dec->hw_device_ctx = av_buffer_ref(s->hw_dev);
 			s->dec->get_format = get_hw_format;
-			LOG(LOG_INFO, "hardware decoding (D3D11VA) enabled");
+			LOG(LOG_INFO, "hardware decoding (" MC_HW_NAME ") enabled");
 		} else {
-			LOG(LOG_WARNING, "D3D11VA unavailable, using software decoding");
+			LOG(LOG_WARNING, MC_HW_NAME " unavailable, using software decoding");
 			s->hw_failed = true;
 		}
 	}
@@ -876,7 +1108,7 @@ static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, 
 		if (r < 0)
 			break;
 		AVFrame *f = s->frame;
-		if (f->format == AV_PIX_FMT_D3D11) {
+		if (f->format == MC_HW_PIX) {
 			av_frame_unref(s->sw_frame);
 			if (av_hwframe_transfer_data(s->sw_frame, f, 0) < 0) {
 				LOG(LOG_WARNING, "hw transfer failed, switching to software decoding");
@@ -1031,7 +1263,7 @@ static bool video_lagging(struct mc_source *s, int64_t pts_us, bool key)
 static void wait_or_wake(struct mc_source *s, DWORD ms)
 {
 	if (!s->stop)
-		WaitForSingleObject(s->wake, ms);
+		mc_event_wait(s->wake, ms);
 }
 
 /* false — телефон отказал по коду доступа, повторять без смены кода бессмысленно */
@@ -1168,13 +1400,15 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 			break;
 		case PKT_AUDIO_CONFIG:
 			if (len >= 5) {
-				s->a_rate = (int)(((uint32_t)s->payload[0] << 24) | ((uint32_t)s->payload[1] << 16) |
-						  ((uint32_t)s->payload[2] << 8) | s->payload[3]);
+				int rate = (int)(((uint32_t)s->payload[0] << 24) | ((uint32_t)s->payload[1] << 16) |
+						 ((uint32_t)s->payload[2] << 8) | s->payload[3]);
+				/* мусорную частоту в ресемплер OBS не передаю, звук тогда просто молчит */
+				s->a_rate = rate >= 8000 && rate <= 192000 ? rate : 0;
 				s->a_ch = s->payload[4];
 			}
 			break;
 		case PKT_AUDIO: {
-			if (!cfg->audio || s->a_ch < 1 || s->a_ch > 2)
+			if (!cfg->audio || !s->a_rate || s->a_ch < 1 || s->a_ch > 2)
 				break;
 			struct obs_source_audio a = {0};
 			a.data[0] = s->payload;
@@ -1214,7 +1448,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	return retry;
 }
 
-static DWORD WINAPI net_thread(LPVOID param)
+MC_THREAD_FN(net_thread, param)
 {
 	struct mc_source *s = param;
 	os_set_thread_name("magercam-net");
@@ -1258,7 +1492,7 @@ static DWORD WINAPI net_thread(LPVOID param)
 	av_packet_free(&s->pkt);
 	av_frame_free(&s->frame);
 	av_frame_free(&s->sw_frame);
-	return 0;
+	MC_THREAD_RETURN;
 }
 
 static void force_reconnect(struct mc_source *s)
@@ -1268,7 +1502,7 @@ static void force_reconnect(struct mc_source *s)
 	if (s->sock != INVALID_SOCKET)
 		shutdown(s->sock, SD_BOTH);
 	LeaveCriticalSection(&s->lock);
-	SetEvent(s->wake);
+	mc_event_set(s->wake);
 }
 
 /* Запросы /api/set шлю не из UI-потока, чтобы OBS не подвисал на сети. */
@@ -1280,13 +1514,13 @@ struct control_req {
 	char key[16];
 };
 
-static DWORD WINAPI control_thread(LPVOID param)
+MC_THREAD_FN(control_thread, param)
 {
 	struct control_req *r = param;
 	if (!http_get(r->host, r->port, r->path, r->key))
 		LOG(LOG_WARNING, "control request failed: %s", r->path);
 	bfree(r);
-	return 0;
+	MC_THREAD_RETURN;
 }
 
 static void send_control(struct mc_source *s, const char *query)
@@ -1302,10 +1536,7 @@ static void send_control(struct mc_source *s, const char *query)
 		bfree(r);
 		return;
 	}
-	HANDLE h = CreateThread(NULL, 0, control_thread, r, 0, NULL);
-	if (h)
-		CloseHandle(h);
-	else
+	if (!mc_thread_detached(control_thread, r))
 		bfree(r);
 }
 
@@ -1429,7 +1660,7 @@ static void mc_update(void *data, obs_data_t *st)
 		return;
 	}
 
-	SetEvent(s->wake); /* deactivate_hidden мог поменяться */
+	mc_event_set(s->wake); /* deactivate_hidden мог поменяться */
 
 	if (!connected)
 		return;
@@ -1480,11 +1711,11 @@ static void *mc_create(obs_data_t *st, obs_source_t *source)
 	s->sock = INVALID_SOCKET;
 	s->rotation = -1;
 	InitializeCriticalSection(&s->lock);
-	s->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+	s->wake = mc_event_create();
 	snprintf(s->status, sizeof(s->status), "Запуск…");
 	mc_update(s, st);
 	s->showing = obs_source_showing(source);
-	s->thread = CreateThread(NULL, 0, net_thread, s, 0, NULL);
+	s->has_thread = mc_thread_start(&s->thread, net_thread, s);
 	return s;
 }
 
@@ -1493,11 +1724,9 @@ static void mc_destroy(void *data)
 	struct mc_source *s = data;
 	s->stop = true;
 	force_reconnect(s);
-	if (s->thread) {
-		WaitForSingleObject(s->thread, INFINITE);
-		CloseHandle(s->thread);
-	}
-	CloseHandle(s->wake);
+	if (s->has_thread)
+		mc_thread_join(s->thread);
+	mc_event_destroy(s->wake);
 	DeleteCriticalSection(&s->lock);
 	bfree(s->rot_buf);
 	bfree(s->payload);
@@ -1509,7 +1738,7 @@ static void mc_show(void *data)
 {
 	struct mc_source *s = data;
 	s->showing = true;
-	SetEvent(s->wake);
+	mc_event_set(s->wake);
 }
 
 static void mc_hide(void *data)
@@ -1826,7 +2055,7 @@ static obs_properties_t *mc_properties(void *data)
 
 	obs_properties_t *adv = obs_properties_create();
 	obs_properties_add_bool(adv, "low_latency", "Минимальная задержка (без буферизации)");
-	obs_properties_add_bool(adv, "hw_decode", "Аппаратное декодирование (D3D11)");
+	obs_properties_add_bool(adv, "hw_decode", MC_HW_LABEL);
 	obs_properties_add_bool(adv, "deactivate_hidden", "Отключаться, когда источник не виден");
 	obs_properties_add_bool(adv, "clear_on_disconnect", "Очищать картинку при потере связи");
 	obs_properties_add_group(props, "grp_adv", "Дополнительно", OBS_GROUP_NORMAL, adv);
@@ -1853,8 +2082,10 @@ static struct obs_source_info magercam_source = {
 
 bool obs_module_load(void)
 {
+#ifdef _WIN32
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
 	InitializeCriticalSection(&g_found_lock);
 	obs_register_source(&magercam_source);
 	LOG(LOG_INFO, "plugin loaded, version " PLUGIN_VERSION);
@@ -1864,7 +2095,9 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	DeleteCriticalSection(&g_found_lock);
+#ifdef _WIN32
 	WSACleanup();
+#endif
 }
 
 const char *obs_module_name(void)

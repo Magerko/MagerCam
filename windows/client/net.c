@@ -511,6 +511,22 @@ static void put_utf8(char **o, unsigned cp)
 	*o = d;
 }
 
+/* Четыре шестнадцатеричные цифры до end, иначе -1. */
+static int hex4(const char *p, const char *end)
+{
+	int v = 0;
+	for (int i = 0; i < 4; i++) {
+		if (p + i >= end)
+			return -1;
+		char c = p[i];
+		int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+		if (d < 0)
+			return -1;
+		v = v * 16 + d;
+	}
+	return v;
+}
+
 static char *jp_string(struct jp *s)
 {
 	if (*s->p != '"')
@@ -540,22 +556,19 @@ static char *jp_string(struct jp *s)
 		case 'b': *o++ = '\b'; break;
 		case 'f': *o++ = '\f'; break;
 		case 'u': {
-			unsigned cp = 0;
-			for (int i = 1; i <= 4 && q[i]; i++) {
-				char c = q[i];
-				cp = cp * 16 + (unsigned)(c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0');
-			}
+			/* обрезанный или битый \u раньше уводил чтение за конец строки; теперь такой символ пропускаю */
+			int cp = hex4(q + 1, s->p);
+			if (cp < 0)
+				break;
 			q += 4;
-			if (cp >= 0xD800 && cp < 0xDC00 && q[1] == '\\' && q[2] == 'u') {
-				unsigned lo = 0;
-				for (int i = 3; i <= 6; i++) {
-					char c = q[i];
-					lo = lo * 16 + (unsigned)(c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0');
-				}
+			if (cp >= 0xD800 && cp < 0xDC00) {
+				int lo = q + 2 < s->p && q[1] == '\\' && q[2] == 'u' ? hex4(q + 3, s->p) : -1;
+				if (lo < 0xDC00 || lo > 0xDFFF)
+					break; /* половинка суррогатной пары без пары */
 				cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
 				q += 6;
 			}
-			put_utf8(&o, cp);
+			put_utf8(&o, (unsigned)cp);
 			break;
 		}
 		default: *o++ = *q;

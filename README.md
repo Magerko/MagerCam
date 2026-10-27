@@ -7,6 +7,7 @@
   <a href="../../releases"><img src="https://img.shields.io/github/downloads/Magerko/MagerCam/total?label=%D1%81%D0%BA%D0%B0%D1%87%D0%B8%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F&color=4caf50" alt="Скачивания"></a>
   <img src="https://img.shields.io/badge/Android-8.0%2B-3ddc84?logo=android&logoColor=white" alt="Android 8.0+">
   <img src="https://img.shields.io/badge/Windows-11-0078d4?logo=windows11&logoColor=white" alt="Windows 11">
+  <img src="https://img.shields.io/badge/Linux-OBS-fcc624?logo=linux&logoColor=black" alt="Linux: плагин OBS">
   <img src="https://img.shields.io/badge/OBS_Studio-%D0%BF%D0%BB%D0%B0%D0%B3%D0%B8%D0%BD-302e31?logo=obsstudio&logoColor=white" alt="Плагин OBS Studio">
   <a href="LICENSE"><img src="https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-GPL--2.0-blue" alt="GPL-2.0"></a>
 </p>
@@ -57,12 +58,12 @@
 |-------|-----|------------|
 | Android-приложение | `android/` → `MagerCam.apk` | Камера (Camera2) → H.264/H.265 (аппаратный MediaCodec) + звук 48 кГц → сеть |
 | Программа для Windows | `windows/` → `MagerCam.exe` | Принимает видео с телефона и показывает его как веб-камеру **«MagerCam»** в Zoom, Discord, Teams, Telegram, браузере |
-| Плагин OBS | `obs-plugin/` | Источник «MagerCam (телефон)» прямо в OBS: видео + звук, управление камерой телефона |
+| Плагин OBS | `obs-plugin/` | Источник «MagerCam (телефон)» прямо в OBS на Windows и Linux: видео + звук, управление камерой телефона |
 | Веб-панель | встроена в приложение | `http://IP:4848/`: просмотр и управление из браузера, MJPEG для любых программ |
 
 ## Установка
 
-Готовые файлы лежат в [Releases](../../releases/latest): `MagerCam.apk`, `MagerCam-Windows.zip`, `MagerCam-OBS-plugin.zip`.
+Готовые файлы лежат в [Releases](../../releases/latest): `MagerCam.apk`, `MagerCam-Windows.zip`, `MagerCam-OBS-plugin.zip` и `MagerCam-OBS-plugin-linux.tar.gz`.
 
 ### 1. Приложение на телефон
 
@@ -84,7 +85,7 @@
 
 Быстрее всего подключиться по QR: нажмите в программе «QR-сопряжение…» и отсканируйте код кнопкой **QR** в приложении
 (или обычной камерой телефона). Телефон сам передаст свой адрес и код доступа, вводить ничего не нужно.
-Установщик открывает для этого входящие TCP-порты 4850–4859 в частных сетях.
+Установщик открывает для этого входящие TCP-порты 4850–4859 только для MagerCam.exe, во всех профилях сети: домашний Wi-Fi Windows часто помечает как общедоступный. Порт слушается, только пока открыто окно с QR-кодом.
 
 Что умеет программа:
 - **Виртуальная камера «MagerCam»** без отдельного драйвера. Используется встроенный в **Windows 11** механизм виртуальных камер (Media Foundation, `MFCreateVirtualCamera`). Отдаёт NV12 от 640×360 до 3840×2160 (4K) при 30 и 60 к/с. Пока телефон не подключён, показывает заставку «Нет сигнала».
@@ -114,6 +115,27 @@
 
 Удаление: `uninstall-obs-plugin.bat`.
 
+### 2в. Плагин OBS для Linux
+
+Нужен OBS Studio 30 или новее из пакетов дистрибутива (`sudo apt install obs-studio`) или из PPA `obsproject/obs-studio`.
+OBS из Flatpak не подойдёт: он не видит плагины из домашней папки.
+
+```sh
+tar xzf MagerCam-OBS-plugin-linux.tar.gz
+sh MagerCam-OBS-plugin-linux/install.sh
+```
+
+Скрипт сам выбирает сборку под ту версию FFmpeg, с которой собран ваш OBS, и кладёт плагин в
+`~/.config/obs-studio/plugins/magercam`, права root не нужны. Проверено на Ubuntu 24.04 / Linux Mint 22,
+Debian 13 / Ubuntu 25.x и Ubuntu 26.04. Дальше всё как в Windows: перезапустите OBS и добавьте источник **MagerCam (телефон)**.
+Для USB поставьте adb: `sudo apt install adb`. Аппаратное декодирование работает через VA-API, если драйвер видеокарты его даёт,
+иначе плагин сам декодирует программно.
+
+Чтобы картинка появилась в Zoom, Discord или браузере, включите в OBS «Запустить виртуальную камеру»
+(нужен модуль `v4l2loopback`: `sudo apt install v4l2loopback-dkms`).
+
+Удаление: `sh MagerCam-OBS-plugin-linux/uninstall.sh`. На другом дистрибутиве плагин можно собрать из исходников, см. «Сборка».
+
 Телефон и ПК должны быть в одной сети (для Wi-Fi).
 Чтобы подключаться через интернет (с дачи, из другого офиса), поставьте [Tailscale](https://tailscale.com/) на телефон и ПК
 и впишите в MagerCam адрес телефона вида `100.x.y.z` (он виден на экране приложения) или подключитесь по QR — телефон передаст все свои адреса.
@@ -132,7 +154,7 @@
 - При перегрузке сети кадры сбрасываются до ближайшего ключевого, чтобы задержка не накапливалась
 - **Адаптивный битрейт**: на слабом Wi-Fi картинка становится мягче, но не замирает
 - **H.265** для клиентов, которые его умеют: вдвое меньше трафика
-- **Код доступа** из 6 цифр (включён по умолчанию) и сопряжение по QR. После 10 неверных попыток адрес блокируется на минуту
+- **Код доступа** из 6 цифр (включён по умолчанию) и сопряжение по QR. После 10 неверных попыток адрес блокируется на минуту, а после 30 неверных кодов со всех адресов телефон минуту не принимает никакие
 - **Профили** «Звонок», «Стрим», «Документ»: разрешение, к/с, битрейт, объектив, стабилизация и звук одним нажатием
 - **Автокадрирование**: кадр плавно следует за лицом, как Center Stage
 - **Размытие и замена фона** на телефоне (модель сегментации работает прямо на телефоне, без интернета)
@@ -141,7 +163,7 @@
 
 **Плагин OBS**
 - Wi-Fi с автопоиском (UDP) или USB через ADB (выбирает устройство, где запущен MagerCam)
-- Видео H.264/H.265 (программное или аппаратное D3D11-декодирование) + звук, синхронизированные по общим меткам времени
+- Видео H.264/H.265 (программное или аппаратное декодирование: D3D11 в Windows, VA-API в Linux) + звук, синхронизированные по общим меткам времени
 - Код доступа, профили, фон, автокадрирование, блокировка экспозиции и кнопка записи на телефон
 - Режим минимальной задержки, автопереподключение, отключение при скрытии источника
 - Поворот 0/90/180/270/авто, зеркало
@@ -177,13 +199,20 @@ sh windows/build.sh            # → windows/build/MagerCam.exe, magercam-vcam.d
 cd android && ./gradlew assembleRelease   # APK (JDK 17 + Android SDK 34)
 ```
 
+Плагин для Linux собирается на самом Linux (нужны `build-essential pkg-config libobs-dev libavcodec-dev libavutil-dev libcairo2-dev`):
+
+```sh
+sh obs-plugin/build-linux.sh          # → obs-plugin/build-linux/magercam.so
+sh obs-plugin/linux/build-all.sh      # в Docker сразу три сборки для релиза: Ubuntu 24.04, Debian 13, Ubuntu 26.04
+```
+
 Для отладки: `node tools/fake-phone.js [порт] [--key 123456]` эмулирует телефон (тестовая картинка, тон 440 Гц, несколько объективов, H.264 и H.265 через ffmpeg, код доступа) по протоколу MagerCam. `node tools/obs-test.js ws://127.0.0.1:4455 <пароль>` автоматически тестирует источник через obs-websocket.
 
 ## Структура
 
 ```
 android/       приложение (Kotlin, Camera2, MediaCodec, встроенный HTTP-сервер)
-obs-plugin/    плагин OBS (C, libobs + FFmpeg из OBS)
+obs-plugin/    плагин OBS для Windows и Linux (C, libobs + FFmpeg из OBS)
 windows/       программа и виртуальная камера для Windows 11
 docs/          протокол
 tools/         эмулятор телефона и автотесты
