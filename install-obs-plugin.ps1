@@ -100,6 +100,10 @@ function Find-Obs {
 function Copy-Plugin([string]$dll, [string]$binDir, [string]$dataDir) {
 	New-Item -ItemType Directory -Force -Path $binDir, $dataDir | Out-Null
 	Copy-Item -LiteralPath $dll -Destination (Join-Path $binDir 'magercam.dll') -Force
+	# В issue #1 советовали подложить к плагину FFmpeg от OBS 31. Новому плагину он не нужен, поэтому убираю его.
+	Get-ChildItem -LiteralPath $binDir -Filter '*.dll' -ErrorAction SilentlyContinue |
+		Where-Object { $_.Name -match '^(avcodec|avutil|avformat|swresample|swscale)-\d+\.dll$' } |
+		ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force; Say "Убрал лишний $($_.Name)" } catch {} }
 }
 
 function Test-NeedsAdmin([string]$dir) {
