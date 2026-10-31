@@ -101,6 +101,7 @@ struct mc_source {
 	int battery;
 	bool connected;
 	obs_data_array_t *cameras;
+	char profile_live[16]; /* профиль, который сейчас стоит на телефоне: его и прошу при переподключении */
 
 	/* это трогает только сетевой поток */
 	struct mc_dec *dec;
@@ -1142,6 +1143,7 @@ static void apply_status_json(struct mc_source *s, const char *json)
 		s->cameras = cams;
 	}
 	s->phone_rec = obs_data_get_bool(d, "rec");
+	snprintf(s->profile_live, sizeof(s->profile_live), "%s", obs_data_get_string(d, "profile"));
 	LeaveCriticalSection(&s->lock);
 	char extra[160] = "";
 	int br = (int)obs_data_get_int(d, "bitrate_now");
@@ -1163,21 +1165,30 @@ static void apply_status_json(struct mc_source *s, const char *json)
 	obs_data_release(d);
 }
 
-static void build_stream_query(struct dstr *q, const struct mc_config *c)
+/* Если на телефоне стоял профиль, прошу его, а то, что он задаёт сам, не шлю: иначе телефон
+ * примет мои разрешение и камеру за ручную правку и сбросит профиль при первом же переподключении. */
+static void build_stream_query(struct dstr *q, const struct mc_config *c, const char *profile)
 {
-	dstr_printf(q, "/stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=", c->width, c->height, c->fps,
-		    c->bitrate_kbps, c->audio ? 1 : 0);
-	url_encode(q, c->camera);
+	dstr_printf(q, "/stream?audio=%d", c->audio ? 1 : 0);
+	if (*profile) {
+		dstr_cat(q, "&profile=");
+		url_encode(q, profile);
+	} else {
+		dstr_catf(q, "&w=%d&h=%d&fps=%d&bitrate=%d&camera=", c->width, c->height, c->fps, c->bitrate_kbps);
+		url_encode(q, c->camera);
+	}
 	if (c->hevc && g_ff && g_ff->has_hevc())
 		dstr_cat(q, "&codec=hevc");
 	if (c->control) {
-		dstr_catf(q, "&framing=%d&lock=%d&bg=%s&bg_strength=%.2f", c->framing ? 1 : 0, c->lock ? 1 : 0, c->bg,
-			  c->bg_strength);
-		dstr_catf(q, "&zoom=%.2f&ev=%.2f&stab=%d", c->zoom, c->ev, c->stab ? 1 : 0);
+		if (!*profile) {
+			dstr_catf(q, "&framing=%d&bg=%s&stab=%d", c->framing ? 1 : 0, c->bg, c->stab ? 1 : 0);
+			dstr_cat(q, "&focus=");
+			url_encode(q, c->focus);
+		}
+		dstr_catf(q, "&lock=%d&bg_strength=%.2f&zoom=%.2f&ev=%.2f", c->lock ? 1 : 0, c->bg_strength, c->zoom,
+			  c->ev);
 		dstr_cat(q, "&wb=");
 		url_encode(q, c->wb);
-		dstr_cat(q, "&focus=");
-		url_encode(q, c->focus);
 		dstr_cat(q, "&antibanding=");
 		url_encode(q, c->antibanding);
 	}
@@ -1249,7 +1260,11 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 
 	set_recv_timeout(sock, 5000);
 	struct dstr q = {0}, req = {0};
-	build_stream_query(&q, cfg);
+	char profile[16];
+	EnterCriticalSection(&s->lock);
+	snprintf(profile, sizeof(profile), "%s", s->profile_live);
+	LeaveCriticalSection(&s->lock);
+	build_stream_query(&q, cfg, profile);
 	dstr_printf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: MagerCam-OBS/" PLUGIN_VERSION "\r\n", q.array,
 		    host);
 	if (cfg->key[0])
@@ -1575,6 +1590,14 @@ static bool stream_params_differ(const struct mc_config *a, const struct mc_conf
 	       strcmp(a->key, b->key) != 0 || a->hevc != b->hevc;
 }
 
+/* то, что задаёт профиль (см. profileParams в Core.kt) */
+static bool profile_fields_differ(const struct mc_config *a, const struct mc_config *b)
+{
+	return a->width != b->width || a->height != b->height || a->fps != b->fps || a->bitrate_kbps != b->bitrate_kbps ||
+	       strcmp(a->camera, b->camera) != 0 || a->framing != b->framing || a->stab != b->stab ||
+	       strcmp(a->focus, b->focus) != 0 || strcmp(a->bg, b->bg) != 0;
+}
+
 static void mc_update(void *data, obs_data_t *st)
 {
 	struct mc_source *s = data;
@@ -1584,6 +1607,17 @@ static void mc_update(void *data, obs_data_t *st)
 	EnterCriticalSection(&s->lock);
 	struct mc_config old = s->cfg;
 	bool first = !s->initialized;
+	if (first || strcmp(old.profile, c.profile) != 0) {
+		if (c.profile[0])
+			snprintf(s->profile_live, sizeof(s->profile_live), "%s", c.profile);
+	} else if (profile_fields_differ(&old, &c)) {
+		/* правка руками отменяет профиль, иначе при переподключении он вернул бы всё назад */
+		s->profile_live[0] = 0;
+		if (c.profile[0]) {
+			c.profile[0] = 0;
+			obs_data_set_string(st, "profile", "");
+		}
+	}
 	s->cfg = c;
 	s->initialized = true;
 	s->rotation = (int)obs_data_get_int(st, "rotation");

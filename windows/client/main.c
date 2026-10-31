@@ -118,6 +118,7 @@ static struct {
 	CRITICAL_SECTION lock;
 	struct settings cfg;
 	struct phone_status ph;
+	char profile_live[16]; /* профиль, который стоял на телефоне: его и прошу при переподключении */
 	wchar_t net_status[256];
 	bool connected;
 	uint32_t *preview_bgra;
@@ -418,6 +419,7 @@ static void apply_status_json(const char *text)
 	json_free(j);
 	EnterCriticalSection(&app.lock);
 	app.ph = p;
+	snprintf(app.profile_live, sizeof(app.profile_live), "%s", p.profile);
 	LeaveCriticalSection(&app.lock);
 	PostMessageW(app.wnd, WM_APP_STATUS, 1, 0);
 }
@@ -583,15 +585,27 @@ static int stream_session(const struct settings *cfg, LONG gen)
 	LeaveCriticalSection(&app.lock);
 
 	set_recv_timeout(sock, 5000);
-	char cam[200], req[1024], keyhdr[64] = "";
-	url_encode(cam, sizeof(cam), cfg->camera);
+	char cam[200], params[300], req[1024], keyhdr[64] = "";
+	/* Если на телефоне стоял профиль, прошу его вместо своих разрешения и камеры: иначе телефон
+	 * принял бы их за ручную правку и сбросил профиль при первом же переподключении. */
+	EnterCriticalSection(&app.lock);
+	char profile[16];
+	snprintf(profile, sizeof(profile), "%s", app.profile_live);
+	LeaveCriticalSection(&app.lock);
+	if (profile[0]) {
+		url_encode(cam, sizeof(cam), profile);
+		snprintf(params, sizeof(params), "profile=%s", cam);
+	} else {
+		url_encode(cam, sizeof(cam), cfg->camera);
+		snprintf(params, sizeof(params), "w=%d&h=%d&fps=%d&bitrate=%d&camera=%s", cfg->width, cfg->height,
+			 cfg->fps, cfg->bitrate_kbps, cam);
+	}
 	if (cfg->key[0])
 		snprintf(keyhdr, sizeof(keyhdr), "X-MagerCam-Key: %s\r\n", cfg->key);
 	int n = snprintf(req, sizeof(req),
-			 "GET /stream?w=%d&h=%d&fps=%d&bitrate=%d&audio=%d&camera=%s%s HTTP/1.1\r\nHost: %s\r\n"
+			 "GET /stream?%s&audio=%d%s HTTP/1.1\r\nHost: %s\r\n"
 			 "User-Agent: MagerCam-Windows/" APP_VERSION "\r\n%s\r\n",
-			 cfg->width, cfg->height, cfg->fps, cfg->bitrate_kbps, cfg->audio ? 1 : 0, cam,
-			 cfg->hevc && g_hevc_decoder ? "&codec=hevc" : "", host, keyhdr);
+			 params, cfg->audio ? 1 : 0, cfg->hevc && g_hevc_decoder ? "&codec=hevc" : "", host, keyhdr);
 	bool ok = send_all(sock, req, (size_t)n);
 	int code = ok ? read_http_header(sock) : -1;
 	int result = SESSION_RETRY;
@@ -1531,8 +1545,10 @@ static void on_command(int id, int code)
 				snprintf(id_str, sizeof(id_str), "%s", i == 1001 ? "front" : "back");
 			else if (i >= 0 && i < app.ph.ncams)
 				snprintf(id_str, sizeof(id_str), "%s", app.ph.cams[i].id);
-			if (id_str[0])
+			if (id_str[0]) {
 				snprintf(app.cfg.camera, sizeof(app.cfg.camera), "%s", id_str);
+				app.profile_live[0] = 0; /* выбор руками отменяет профиль */
+			}
 			bool conn = app.connected;
 			LeaveCriticalSection(&app.lock);
 			save_settings();
@@ -1553,6 +1569,7 @@ static void on_command(int id, int code)
 			app.cfg.height = HIWORD(r);
 			app.cfg.fps = (int)combo_data(app.fps);
 			app.cfg.bitrate_kbps = (int)combo_data(app.bitrate);
+			app.profile_live[0] = 0;
 			struct settings c = app.cfg;
 			LeaveCriticalSection(&app.lock);
 			save_settings();
