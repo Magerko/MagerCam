@@ -24,7 +24,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.2.0"
+#define PLUGIN_VERSION "1.2.1"
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848

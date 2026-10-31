@@ -17,7 +17,7 @@
 #include "../common/mcv_nv12.h"
 #include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.2.0"
+#define APP_VERSION "1.2.1"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
