@@ -112,6 +112,9 @@ function Test-NeedsAdmin([string]$dir) {
 		$probe = Join-Path $dir ('.write-test-' + [guid]::NewGuid())
 		[IO.File]::WriteAllText($probe, '')
 		Remove-Item -LiteralPath $probe -Force
+		# ProgramData lets users create files but not overwrite ones an admin created, so I check the old dll too
+		Get-ChildItem -LiteralPath $dir -Recurse -Filter 'magercam.dll' -ErrorAction SilentlyContinue |
+			ForEach-Object { [IO.File]::Open($_.FullName, 'Open', 'ReadWrite', 'ReadWrite').Close() }
 		return $false
 	} catch { return $true }
 }
@@ -161,6 +164,63 @@ function Install-Adb([string[]]$dataDirs) {
 	}
 }
 
+# OBS 32+ skips plugins unticked in its Plugin Manager, so I tick MagerCam back
+$ModuleRe = [regex]'\{[^{}]*"module_name"\s*:\s*"magercam"[^{}]*\}'
+
+# modules.json менеджера плагинов: у портативной OBS свой, у обычных один общий в %APPDATA%
+function Get-ModulesFiles($list, [bool]$withAppData) {
+	$r = @()
+	foreach ($o in $list | Where-Object Portable) {
+		$r += [pscustomobject]@{ Path = Join-Path $o.Root 'config\obs-studio\plugin_manager\modules.json'; Root = $o.Root }
+	}
+	if ($withAppData) {
+		$r += [pscustomobject]@{ Path = Join-Path $env:APPDATA 'obs-studio\plugin_manager\modules.json'; Root = '' }
+	}
+	$r | Where-Object { Test-Path -LiteralPath $_.Path }
+}
+
+# Root пустой — ищу любой запущенный obs64, который не из портативной папки
+function Test-ObsRunning([string]$root, [string[]]$portableRoots) {
+	foreach ($p in @(Get-Process obs64 -ErrorAction SilentlyContinue)) {
+		$pp = $null
+		try { $pp = $p.Path } catch {}
+		if ($root) {
+			if ($pp -and $pp.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+		} else {
+			$inPortable = $false
+			foreach ($pr in $portableRoots) {
+				if ($pp -and $pp.StartsWith($pr + '\', [StringComparison]::OrdinalIgnoreCase)) { $inPortable = $true }
+			}
+			if (-not $inPortable) { return $true }
+		}
+	}
+	return $false
+}
+
+function Enable-PluginInManager($mf, [string[]]$portableRoots) {
+	try {
+		$text = [IO.File]::ReadAllText($mf.Path)
+		$new = $ModuleRe.Replace($text, { param($m) [regex]::Replace($m.Value, '"enabled"\s*:\s*false', '"enabled": true') })
+		if ($new -ceq $text) { return }
+		if (Test-ObsRunning $mf.Root $portableRoots) {
+			Say 'MagerCam выключен в OBS. После перезапуска OBS включите его: «Сервис» → «Менеджер плагинов» → галочка у MagerCam.' Yellow
+			return
+		}
+		[IO.File]::WriteAllText($mf.Path, $new, (New-Object Text.UTF8Encoding $false))
+		Say 'Плагин был выключен в менеджере плагинов OBS — включил.'
+	} catch {
+		Say "[!] Не удалось проверить менеджер плагинов OBS ($($mf.Path)): $($_.Exception.Message)" Yellow
+	}
+}
+
+function Get-ManagerState($mf) {
+	try {
+		$m = $ModuleRe.Match([IO.File]::ReadAllText($mf.Path))
+		if (-not $m.Success) { return 'нет записи' }
+		if ($m.Value -match '"enabled"\s*:\s*false') { return 'выключен' }
+		return 'включён'
+	} catch { return 'не удалось прочитать' }
+}
 # --- что ставить ---
 $here = $PSScriptRoot
 $src = Join-Path $here 'magercam'
@@ -256,6 +316,11 @@ if ($found.Count -eq 0) {
 
 if ($installed) { Install-Adb $dataDirs }
 
+if ($installed) {
+	$portableRoots = @($found | Where-Object Portable | ForEach-Object { $_.Root })
+	foreach ($mf in Get-ModulesFiles $found $needProgramData) { Enable-PluginInManager $mf $portableRoots }
+}
+
 Say ''
 foreach ($w in $warnings) { Say "[!] $w" Yellow }
 if (Get-Process obs64 -ErrorAction SilentlyContinue) {
@@ -278,5 +343,8 @@ foreach ($o in $found) {
 		$(if ($o.FFmpeg) { $o.FFmpeg } else { 'нет' }), $o.Root)
 }
 Say ("Плагин: {0}" -f $(if ($installed) { 'установлен' } else { 'НЕ установлен' }))
+foreach ($mf in Get-ModulesFiles $found $needProgramData) {
+	Say ("Менеджер плагинов: MagerCam {0}{1}" -f (Get-ManagerState $mf), $(if ($mf.Root) { " ($($mf.Root))" } else { '' }))
+}
 Say '-------------------------------------------------------------------'
 if ($Elevated) { Read-Host 'Нажмите Enter' }
