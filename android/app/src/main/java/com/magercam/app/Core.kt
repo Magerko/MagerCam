@@ -19,6 +19,7 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class Core(val context: Context) : CameraEngine.Listener {
     val settings = Settings(context)
@@ -324,6 +325,8 @@ class Core(val context: Context) : CameraEngine.Listener {
         }
         f("focus_dist")?.let { settings.focusDist = it.coerceIn(0f, 1f); controls = true }
         p["wb"]?.let { settings.wb = it; controls = true }
+        f("wb_temp")?.takeIf { !it.isNaN() }?.let { settings.wbTemp = it.roundToInt().coerceIn(WhiteBalance.TEMP_MIN, WhiteBalance.TEMP_MAX); controls = true }
+        f("wb_tint")?.takeIf { !it.isNaN() }?.let { settings.wbTint = it.roundToInt().coerceIn(-WhiteBalance.TINT_LIMIT, WhiteBalance.TINT_LIMIT); controls = true }
         p["antibanding"]?.let { settings.antibanding = it; controls = true }
         if ("stab" in p) { settings.stab = b("stab"); controls = true }
         if ("ae_lock" in p) { settings.aeLock = b("ae_lock"); controls = true }
@@ -415,6 +418,8 @@ class Core(val context: Context) : CameraEngine.Listener {
         o.put("ev", settings.ev.toDouble()).put("ev_min", engine.evMin.toDouble()).put("ev_max", engine.evMax.toDouble())
         o.put("focus", settings.focus).put("focus_dist", settings.focusDist.toDouble())
         o.put("wb", settings.wb).put("antibanding", settings.antibanding).put("stab", settings.stab)
+        o.put("wb_temp", settings.wbTemp).put("wb_tint", settings.wbTint)
+        o.put("wb_manual", engine.wbManualPath).put("wb_manual_available", true)
         o.put("ae_lock", settings.aeLock).put("awb_lock", settings.awbLock).put("mirror", settings.mirrorPreview)
         o.put("battery", bat).put("charging", charging).put("temp", temp.toDouble())
         o.put("clients", server.streamClients.size).put("viewers", server.mjpegClients.size)

@@ -27,7 +27,8 @@ import java.util.concurrent.TimeUnit
 /**
  * Промежуточная GL-ступень для размытия и замены фона: камера пишет в SurfaceTexture, я смешиваю резкий кадр
  * с размытым (или с картинкой) по маске человека и рисую результат в кодер, запись и превью.
- * Пока фон выключен, этой ступени нет вовсе и камера пишет в кодер напрямую.
+ * Пока фон выключен, этой ступени нет вовсе и камера пишет в кодер напрямую. Она же сдвигает баланс белого,
+ * если камера не даёт задать его вручную.
  */
 class GlRenderer(private val ctx: Context, private val settings: Settings) : SurfaceTexture.OnFrameAvailableListener {
     private val thread = HandlerThread("mc-gl").apply { start() }
@@ -78,6 +79,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
     @Volatile var orient = 0
     @Volatile var error: String? = null
         private set
+    /** Ручной баланс белого: матрица для линейного sRGB (по столбцам) или null, если кадр не трогаю. */
+    @Volatile var wbMatrix: FloatArray? = null
 
     private fun sync(block: () -> Unit) {
         val latch = CountDownLatch(1)
@@ -322,6 +325,7 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
         val upright = if (orient % 180 == 0) inW.toFloat() / inH else inH.toFloat() / inW
         val img = if (bgH > 0) bgW.toFloat() / bgH else upright
         val bgScale = if (img > upright) floatArrayOf(upright / img, 1f) else floatArrayOf(1f, img / upright)
+        val wb = wbMatrix
         for (o in outputs) {
             if (!EGL14.eglMakeCurrent(display, o.egl, o.egl, context)) continue
             GLES20.glViewport(0, 0, o.w, o.h)
@@ -346,6 +350,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uMode"), mode.toFloat())
             GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uHasMask"), if (hasMask) 1f else 0f)
             GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uBgScale"), bgScale[0], bgScale[1])
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uWbOn"), if (wb != null) 1f else 0f)
+            GLES20.glUniformMatrix3fv(GLES20.glGetUniformLocation(prog, "uWb"), 1, false, wb ?: IDENTITY, 0)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             EGLExt.eglPresentationTimeANDROID(display, o.egl, ts)
@@ -532,13 +538,21 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             uniform float uMode;
             uniform float uHasMask;
             uniform vec2 uBgScale;
+            uniform mat3 uWb;
+            uniform float uWbOn;
             varying vec2 vCam;
             varying vec2 vUv;
             varying vec2 vMask;
+            // баланс белого считается в линейном свете, а кадр приходит с гаммой; 2.2 вместо точной кривой sRGB хватает
+            vec4 wb(vec4 c) {
+                if (uWbOn < 0.5) return c;
+                vec3 lin = uWb * pow(c.rgb, vec3(2.2));
+                return vec4(pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2)), c.a);
+            }
             void main() {
-                vec4 sharp = texture2D(uCam, vCam);
+                vec4 sharp = wb(texture2D(uCam, vCam));
                 float m = uHasMask > 0.5 ? smoothstep(0.3, 0.7, texture2D(uMaskT, vMask).r) : 1.0;
-                vec4 bg = uMode > 1.5 ? texture2D(uBg, (vMask - 0.5) * uBgScale + 0.5) : texture2D(uBlur, vUv);
+                vec4 bg = uMode > 1.5 ? texture2D(uBg, (vMask - 0.5) * uBgScale + 0.5) : wb(texture2D(uBlur, vUv));
                 gl_FragColor = mix(bg, sharp, m);
             }
         """

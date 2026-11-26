@@ -4,7 +4,7 @@
 // С --key требую код доступа даже с localhost, иначе проверить его на одном компьютере нельзя.
 // --bframes: кодирую с B-кадрами (как режим «Качество» на телефоне), pts беру из MPEG-TS, кадры идут в порядке
 // декодирования и с флагом B-кадров в VIDEO_CONFIG; --no-reorder-flag этот флаг не ставит (так видно, что будет
-// у клиента, который о B-кадрах не знает). --old: веду себя как телефон до bitrate=auto и enc.
+// у клиента, который о B-кадрах не знает). --old: веду себя как телефон до bitrate=auto, enc и ручного баланса белого.
 'use strict';
 const net = require('net');
 const dgram = require('dgram');
@@ -33,6 +33,7 @@ const state = {
   has_flash: true, zoom_min: 1,
   orient: 0, audio: true, torch: false, zoom: 1, zoom_max: 8, ev: 0, ev_min: -2, ev_max: 2,
   focus: 'continuous', wb: 'auto', antibanding: 'auto', stab: false,
+  wb_temp: 5000, wb_tint: 0, wb_manual: 'none', wb_manual_available: true,
   battery: 77, charging: false, temp: 30, clients: 0,
 };
 const t0 = process.hrtime.bigint();
@@ -65,6 +66,11 @@ function applyParams(q) {
     }
     else if (k === 'enc') { if (!OLD && (v === 'latency' || v === 'quality')) state.enc = v; }
     else if (k === 'bframes') {}
+    else if (k === 'wb_temp' || k === 'wb_tint') {
+      // старый телефон этих ключей не знал и пропускал их
+      if (!OLD && Number.isFinite(+v)) state[k] = k === 'wb_temp' ? Math.min(10000, Math.max(2000, Math.round(+v)))
+        : Math.min(50, Math.max(-50, Math.round(+v)));
+    }
     else if (k === 'camera') {
       const c = state.cameras.find((x) => x.id === v);
       if (c) { state.camera = c.id; state.front = c.front; }
@@ -87,8 +93,10 @@ const snapshot = () => {
   if (state.rec) state.rec_ms = Date.now() - recStart; else delete state.rec_ms;
   if (state.bitrate_auto) state.bitrate = autoBitrate(state.w, state.h, state.fps, state.codec === 'hevc');
   state.bitrate_now = state.bitrate;
+  state.wb_manual = state.wb === 'manual' ? 'gl' : 'none';
   const out = { ...state };
   if (OLD) { delete out.bitrate_auto; delete out.enc; delete out.bframes; }
+  if (OLD) { delete out.wb_temp; delete out.wb_tint; delete out.wb_manual; delete out.wb_manual_available; }
   return Buffer.from(JSON.stringify(out));
 };
 
@@ -113,7 +121,8 @@ function startStream(sock, query) {
   state.bframes = BFRAMES;
   console.log(`[stream] client ${sock.remoteAddress} ${state.w}x${state.h}@${state.fps} ${state.bitrate}kbps` +
     `${state.bitrate_auto ? ' (auto)' : ''} front=${state.front} ${state.codec} enc=${state.enc}` +
-    ` client-bframes=${query.get('bframes') === '1'} sending-bframes=${BFRAMES} reorder-flag=${BFRAMES && REORDER_FLAG}`);
+    ` client-bframes=${query.get('bframes') === '1'} sending-bframes=${BFRAMES} reorder-flag=${BFRAMES && REORDER_FLAG}` +
+    ` wb=${state.wb}${state.wb === 'manual' ? ` ${state.wb_temp}K tint ${state.wb_tint}` : ''}`);
   sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/x-magercam\r\n\r\n');
   // --stall: каждые 15 с на 3 с придерживаю пакеты, потом отдаю пачкой — так выглядит пробка в Wi-Fi
   let held = null;

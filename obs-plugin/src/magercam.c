@@ -67,6 +67,7 @@ struct mc_config {
 	bool control;
 	double zoom, ev;
 	char wb[32], focus[32], antibanding[16];
+	int wb_temp, wb_tint; /* для wb=manual: температура света в кельвинах и оттенок -50..50 (плюс — в пурпур) */
 	bool stab;
 	char key[16];     /* код доступа с экрана телефона */
 	bool hevc;        /* просить H.265: вдвое меньше трафика при том же качестве */
@@ -1239,6 +1240,9 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c, const 
 			  c->ev);
 		dstr_cat(q, "&wb=");
 		url_encode(q, c->wb);
+		/* телефон до ручного баланса примет manual за авто, а температуру пропустит */
+		if (strcmp(c->wb, "manual") == 0)
+			dstr_catf(q, "&wb_temp=%d&wb_tint=%d", c->wb_temp, c->wb_tint);
 		dstr_cat(q, "&antibanding=");
 		url_encode(q, c->antibanding);
 	}
@@ -1584,6 +1588,8 @@ static void mc_defaults(obs_data_t *st)
 	obs_data_set_default_double(st, "zoom", 1.0);
 	obs_data_set_default_double(st, "ev", 0.0);
 	obs_data_set_default_string(st, "wb", "auto");
+	obs_data_set_default_int(st, "wb_temp", 5000);
+	obs_data_set_default_int(st, "wb_tint", 0);
 	obs_data_set_default_string(st, "focus", "continuous");
 	obs_data_set_default_string(st, "antibanding", "auto");
 	obs_data_set_default_bool(st, "stab", false);
@@ -1628,6 +1634,8 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 	c->zoom = obs_data_get_double(st, "zoom");
 	c->ev = obs_data_get_double(st, "ev");
 	snprintf(c->wb, sizeof(c->wb), "%s", obs_data_get_string(st, "wb"));
+	c->wb_temp = (int)obs_data_get_int(st, "wb_temp");
+	c->wb_tint = (int)obs_data_get_int(st, "wb_tint");
 	snprintf(c->focus, sizeof(c->focus), "%s", obs_data_get_string(st, "focus"));
 	snprintf(c->antibanding, sizeof(c->antibanding), "%s", obs_data_get_string(st, "antibanding"));
 	c->stab = obs_data_get_bool(st, "stab");
@@ -1716,9 +1724,16 @@ static void mc_update(void *data, obs_data_t *st)
 			dstr_catf(&q, "&zoom=%.2f", c.zoom);
 		if (old.ev != c.ev || !old.control)
 			dstr_catf(&q, "&ev=%.2f", c.ev);
-		if (strcmp(old.wb, c.wb) != 0 || !old.control) {
+		bool wb_changed = strcmp(old.wb, c.wb) != 0 || !old.control;
+		if (wb_changed) {
 			dstr_cat(&q, "&wb=");
 			url_encode(&q, c.wb);
+		}
+		if (strcmp(c.wb, "manual") == 0) {
+			if (wb_changed || old.wb_temp != c.wb_temp)
+				dstr_catf(&q, "&wb_temp=%d", c.wb_temp);
+			if (wb_changed || old.wb_tint != c.wb_tint)
+				dstr_catf(&q, "&wb_tint=%d", c.wb_tint);
 		}
 		if (strcmp(old.focus, c.focus) != 0 || !old.control) {
 			dstr_cat(&q, "&focus=");
@@ -1852,6 +1867,15 @@ static bool on_bitrate_auto_changed(obs_properties_t *props, obs_property_t *p, 
 {
 	UNUSED_PARAMETER(p);
 	obs_property_set_visible(obs_properties_get(props, "bitrate"), !obs_data_get_bool(st, "bitrate_auto"));
+	return true;
+}
+
+static bool on_wb_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *st)
+{
+	UNUSED_PARAMETER(p);
+	bool manual = strcmp(obs_data_get_string(st, "wb"), "manual") == 0;
+	obs_property_set_visible(obs_properties_get(props, "wb_temp"), manual);
+	obs_property_set_visible(obs_properties_get(props, "wb_tint"), manual);
 	return true;
 }
 
@@ -2087,6 +2111,12 @@ static obs_properties_t *mc_properties(void *data)
 	obs_property_list_add_string(p, "Лампа накаливания", "incandescent");
 	obs_property_list_add_string(p, "Флуоресцентная лампа", "fluorescent");
 	obs_property_list_add_string(p, "Сумерки", "twilight");
+	obs_property_list_add_string(p, "Вручную (температура)", "manual");
+	obs_property_set_modified_callback(p, on_wb_changed);
+	p = obs_properties_add_int_slider(cam, "wb_temp", "Температура, K", 2000, 10000, 100);
+	obs_property_set_long_description(p, "Температура света, который должен стать белым: под лампой 3200 K ставьте "
+					     "3200. Меньше — картинка холоднее, больше — теплее.");
+	obs_properties_add_int_slider(cam, "wb_tint", "Оттенок (− зелень, + пурпур)", -50, 50, 1);
 	p = obs_properties_add_list(cam, "antibanding", "Антимерцание", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "Авто", "auto");
 	obs_property_list_add_string(p, "50 Гц (Россия/Европа)", "50");

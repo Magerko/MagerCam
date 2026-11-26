@@ -761,8 +761,55 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         val audioSrcValues = listOf("camcorder", "mic", "voice", "unprocessed")
         val audioSp = spinner("Источник звука", listOf("Видеокамера (по умолчанию)", "Микрофон", "Голос (шумоподавление)", "Без обработки"), audioSrcValues, s.audioSource)
-        val wbValues = listOf("auto", "daylight", "cloudy", "shade", "incandescent", "fluorescent", "twilight")
-        val wbSp = spinner("Баланс белого", listOf("Авто", "Дневной свет", "Облачно", "Тень", "Лампа накаливания", "Флуоресцентная", "Сумерки"), wbValues, s.wb)
+        val wbValues = listOf("auto", "daylight", "cloudy", "shade", "incandescent", "fluorescent", "twilight", "manual")
+        val wbSp = spinner("Баланс белого", listOf("Авто", "Дневной свет", "Облачно", "Тень", "Лампа накаливания", "Флуоресцентная", "Сумерки",
+            "Вручную (температура)"), wbValues, s.wb)
+        // баланс применяю сразу, чтобы подбирать его по превью, а «Отмена» возвращает прежний
+        val wbWas = mapOf("wb" to s.wb, "wb_temp" to "${s.wbTemp}", "wb_tint" to "${s.wbTint}")
+        val wbBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; box.addView(this) }
+        val tempLabel = TextView(this).apply { wbBox.addView(this) }
+        val tempBar = SeekBar(this).apply {
+            max = (WhiteBalance.TEMP_MAX - WhiteBalance.TEMP_MIN) / WB_TEMP_STEP
+            progress = (s.wbTemp - WhiteBalance.TEMP_MIN) / WB_TEMP_STEP
+            wbBox.addView(this)
+        }
+        wbBox.addView(TextView(this).apply {
+            text = "Свет лампы 3200 K — ставьте 3200. Меньше — картинка холоднее, больше — теплее"
+            textSize = 12f; alpha = 0.7f; setPadding(0, 0, 0, dpi(6))
+        })
+        val tintLabel = TextView(this).apply { wbBox.addView(this) }
+        val tintBar = SeekBar(this).apply {
+            max = WhiteBalance.TINT_LIMIT * 2
+            progress = s.wbTint + WhiteBalance.TINT_LIMIT
+            wbBox.addView(this)
+        }
+        fun wbTemp() = WhiteBalance.TEMP_MIN + tempBar.progress * WB_TEMP_STEP
+        fun wbTint() = tintBar.progress - WhiteBalance.TINT_LIMIT
+        fun applyWb() {
+            val wb = wbValues[wbSp.selectedItemPosition]
+            val t = wbTint()
+            tempLabel.text = "Температура, K: ${wbTemp()}"
+            tintLabel.text = "Оттенок: " + when {
+                t > 0 -> "+$t (пурпурнее)"
+                t < 0 -> "$t (зеленее)"
+                else -> "0"
+            }
+            wbBox.visibility = if (wb == "manual") View.VISIBLE else View.GONE
+            if (wb != s.wb || wbTemp() != s.wbTemp || t != s.wbTint)
+                c.applyParams(mapOf("wb" to wb, "wb_temp" to "${wbTemp()}", "wb_tint" to "$t"))
+        }
+        applyWb()
+        wbSp.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) = applyWb()
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+        val wbSeek = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) applyWb() }
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) {}
+        }
+        tempBar.setOnSeekBarChangeListener(wbSeek)
+        tintBar.setOnSeekBarChangeListener(wbSeek)
         val abValues = listOf("auto", "50", "60", "off")
         val abSp = spinner("Антимерцание", listOf("Авто", "50 Гц (Россия/Европа)", "60 Гц", "Выкл"), abValues, s.antibanding)
         val codecValues = listOf("auto", "h264")
@@ -820,11 +867,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val portEt = EditText(this).apply { setText(s.port.toString()); inputType = InputType.TYPE_CLASS_NUMBER; box.addView(this) }
 
         val scroll = ScrollView(this).apply { addView(box) }
+        var saved = false
         AlertDialog.Builder(this)
             .setTitle("Настройки")
             .setView(scroll)
             .setNegativeButton("Отмена", null)
+            .setOnDismissListener {
+                if (!saved && (wbWas["wb"] != s.wb || wbWas["wb_temp"] != "${s.wbTemp}" || wbWas["wb_tint"] != "${s.wbTint}")) {
+                    c.applyParams(wbWas)
+                    refreshUi()
+                }
+            }
             .setPositiveButton("Сохранить") { _, _ ->
+                saved = true
                 val p = HashMap<String, String>()
                 val prof = profValues[profSp.selectedItemPosition]
                 if (prof.isNotEmpty() && prof != s.profile) {
@@ -838,6 +893,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 p["bitrate"] = brValues[brSp.selectedItemPosition].let { if (it == 0) "auto" else "$it" }
                 p["audio_source"] = audioSrcValues[audioSp.selectedItemPosition]
                 p["wb"] = wbValues[wbSp.selectedItemPosition]
+                p["wb_temp"] = "${wbTemp()}"
+                p["wb_tint"] = "${wbTint()}"
                 p["antibanding"] = abValues[abSp.selectedItemPosition]
                 p["orientation_mode"] = orValues[orSp.selectedItemPosition]
                 p["stab"] = if (swStab.isChecked) "1" else "0"
@@ -876,6 +933,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 }
 
 private const val REQ_BG = 7
+private const val WB_TEMP_STEP = 50
 
 class AspectFrame(ctx: Context) : FrameLayout(ctx) {
     var ratio = 0f

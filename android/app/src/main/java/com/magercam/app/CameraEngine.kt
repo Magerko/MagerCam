@@ -19,7 +19,9 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.Face
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaRecorder
@@ -155,6 +157,21 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var lastFaceAt = 0L
     private var frameNo = 0L
 
+    // ручной баланс белого силами камеры: AWB выключен, усиления каналов и матрицу цвета задаю сам
+    @Volatile private var wbCameraCapable = false
+    private var wbCalib: WhiteBalance.Calibration? = null
+    private var wbCalibChecked = false
+    // матрица цвета и усиления, которые камера сама выбрала в авторежиме: без её матрицы цвета уходят
+    private var autoCcm: ColorSpaceTransform? = null
+    private var autoGains: RggbChannelVector? = null
+    private var wbWaitingAuto = false
+    private var wbAutoFrames = 0
+    private var ccModeTemplate: Int? = null
+    private var wbLogged = ""
+    private var wbVerify = false
+    private var wbSentCcm: ColorSpaceTransform? = null
+    private var wbSentGains: RggbChannelVector? = null
+
     val cameras: List<CameraInfo> by lazy { listCameras() }
 
     private val reconfigureRunnable = Runnable { doReconfigure() }
@@ -191,7 +208,18 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     fun restart() = handler.post { requestReconfigure() }
 
-    fun updateControls() = handler.post { applyRepeating() }
+    fun updateControls() = handler.post {
+        // ручной баланс без поддержки камеры делает GL-ступень, а её включение требует пересобрать сессию
+        if (wantGl() != glActive) requestReconfigure() else applyRepeating()
+    }
+
+    /** Чем сейчас делается ручной баланс белого: "camera", "gl" или "none", если он не выбран. */
+    val wbManualPath: String
+        get() = when {
+            settings.wb != "manual" -> "none"
+            wbCameraCapable -> "camera"
+            else -> "gl"
+        }
 
     fun setBitrate(kbps: Int) = handler.post { encoder.setBitrate(kbps) }
 
@@ -390,14 +418,22 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         imageReader = null
     }
 
+    private fun needCamera() = streamDemand || mjpegDemand || previewSurface != null || recordRequested || qrListener != null
+
+    /**
+     * Превью, трансляция и запись — три потока с камеры, а на 60 к/с многие телефоны (OnePlus в том числе) такое
+     * не собирают. Тогда камера пишет в один GL-поток, а дальше кадр раздаю сама программа.
+     * Там же делаю ручной баланс белого, если камера не даёт задать его сама.
+     */
+    private fun wantGl() = needCamera() &&
+        (settings.background != "off" || recordRequested || (settings.wb == "manual" && !wbCameraCapable))
+
     private fun doReconfigure() {
-        val needCamera = streamDemand || mjpegDemand || previewSurface != null || recordRequested || qrListener != null
+        val needCamera = needCamera()
         closeSession()
         // GL обязан отпустить поверхности кодера и превью раньше, чем их пересоздадут или отдадут камере
         gl?.setOutputs(emptyList())
-        // Превью, трансляция и запись — три потока с камеры, а на 60 к/с многие телефоны (OnePlus в том числе) такое
-        // не собирают. Тогда камера пишет в один GL-поток, а дальше кадр раздаю сама программа.
-        val wantGl = needCamera && (settings.background != "off" || recordRequested)
+        val wantGl = wantGl()
         if (wantGl != glActive) {
             // одна поверхность не может принадлежать и камере, и EGL, поэтому при смене режима кодер пересоздаю
             encoder.stop()
@@ -493,6 +529,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         val surfaces = ArrayList<Surface>()
         if (glActive && outs.isNotEmpty()) {
             val g = gl ?: GlRenderer(ctx, settings).also { gl = it; it.orient = orientProvider() }
+            syncGlWb()
             val input = g.start(size.width, size.height)
             bgError = if (settings.background != "off") g.error else null
             if (input != null) {
@@ -647,6 +684,19 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         framingAvailable = physicalId == null && faceModes.any { it != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF }
         framingCrop = null
         framingTarget = null
+        // запросы идут в открытое устройство, поэтому и умение смотрю у него
+        val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val awbModes = ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
+        wbCameraCapable = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING) &&
+            awbModes.contains(CameraMetadata.CONTROL_AWB_MODE_OFF)
+        wbCalib = if (wbCameraCapable) WhiteBalance.Calibration.of(sc) ?: WhiteBalance.Calibration.of(ch) else null
+        wbCalibChecked = false
+        autoCcm = null
+        autoGains = null
+        wbWaitingAuto = false
+        wbLogged = ""
+        Log.i(TAG, "camera $id: manual WB ${if (wbCameraCapable) "by camera" else "by GL"}, " +
+            "sensor calibration ${if (wbCalib != null) "present" else "absent"}")
     }
 
     private fun videoSizes(ch: CameraCharacteristics): List<Size> {
@@ -716,13 +766,36 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         return Rect(l, t, l + cw, t + chh)
     }
 
+    /** В GL-ступени баланс сдвигаю поверх автобаланса камеры: она не знает, под какой свет он настроен. */
+    private fun syncGlWb() {
+        val g = gl ?: return
+        if (settings.wb == "manual" && !wbCameraCapable) {
+            g.wbMatrix = WhiteBalance.toGl(WhiteBalance.adaptSrgb(settings.wbTemp, settings.wbTint, WhiteBalance.REF_KELVIN))
+            logWb("gl", "relative to auto WB taken as ${WhiteBalance.REF_KELVIN} K")
+        } else {
+            g.wbMatrix = null
+        }
+    }
+
+    private fun logWb(path: String, how: String) {
+        val key = "$path ${settings.wbTemp} ${settings.wbTint} $how"
+        if (key == wbLogged) return
+        wbLogged = key
+        if (path == "camera") wbVerify = true
+        Log.i(TAG, "manual WB via $path: ${settings.wbTemp} K, tint ${settings.wbTint}, $how")
+    }
+
     private fun applyRepeating() {
+        syncGlWb()
         val dev = device ?: return
         val s = session ?: return
         try {
             val b = builder ?: dev.createCaptureRequest(
                 if (encoder.isRunning) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
-            ).also { nb -> sessionSurfaces.forEach { nb.addTarget(it) } }
+            ).also { nb ->
+                sessionSurfaces.forEach { nb.addTarget(it) }
+                ccModeTemplate = nb.get(CaptureRequest.COLOR_CORRECTION_MODE)
+            }
             builder = b
             applyControls(b)
             s.setRepeatingRequest(b.build(), captureCallback, handler)
@@ -736,9 +809,75 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
             result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDistance = it }
             frameNo++
+            if (wbCameraCapable) trackAutoWb(r, result)
             if (framingOn()) onFaces(result.get(CaptureResult.STATISTICS_FACES) ?: emptyArray())
             else facesVisible = 0
         }
+    }
+
+    /**
+     * Пока камера сама ведёт баланс, запоминаю её матрицу цвета и усиления: ручной режим берёт их за основу.
+     * Если ручной режим уже выбран, а матрицы ещё нет, жду, пока автобаланс сойдётся, и только потом выключаю его.
+     */
+    private fun trackAutoWb(r: CaptureRequest, result: TotalCaptureResult) {
+        val mode = result.get(CaptureResult.CONTROL_AWB_MODE) ?: return
+        if (mode == CameraMetadata.CONTROL_AWB_MODE_OFF) {
+            if (wbVerify && r.get(CaptureRequest.COLOR_CORRECTION_TRANSFORM) == wbSentCcm &&
+                r.get(CaptureRequest.COLOR_CORRECTION_GAINS) == wbSentGains) {
+                // в лог — что камера реально применила: если она молча игнорирует ручной баланс, это видно здесь
+                wbVerify = false
+                val g = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                val m = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { WhiteBalance.toDoubles(it) }
+                Log.i(TAG, "camera applied manual WB: cc mode ${result.get(CaptureResult.COLOR_CORRECTION_MODE)}, " +
+                    "gains ${g?.let { "r=%.3f g=%.3f b=%.3f".format(java.util.Locale.ROOT, it.red, it.greenEven, it.blue) }}, " +
+                    "ccm row0 ${m?.let { "%.3f %.3f %.3f".format(java.util.Locale.ROOT, it[0], it[1], it[2]) }}")
+            }
+            return
+        }
+        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { autoCcm = it }
+        result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { autoGains = it }
+        if (!wbWaitingAuto) return
+        wbAutoFrames++
+        val state = result.get(CaptureResult.CONTROL_AWB_STATE)
+        val settled = state == CameraMetadata.CONTROL_AWB_STATE_CONVERGED || state == CameraMetadata.CONTROL_AWB_STATE_LOCKED
+        if (autoCcm != null && autoGains != null && (settled || wbAutoFrames >= 30)) {
+            wbWaitingAuto = false
+            applyRepeating()
+        } else if (wbAutoFrames >= 90) {
+            // камера заявила ручную обработку цвета, но своих матрицы и усилений не отдаёт: без них цвета не собрать
+            Log.w(TAG, "no colour correction in capture results, manual WB falls back to GL")
+            wbWaitingAuto = false
+            wbCameraCapable = false
+            requestReconfigure()
+        }
+    }
+
+    /** Усиления и матрица для ручного баланса или null, пока нет данных автобаланса. */
+    private fun manualWbParams(): Pair<RggbChannelVector, ColorSpaceTransform>? {
+        val ccm = autoCcm ?: return null
+        val ag = autoGains ?: return null
+        val agG = (ag.greenEven + ag.greenOdd) / 2.0
+        if (ag.red <= 0f || ag.blue <= 0f || agG <= 0.0) return null
+        val t = settings.wbTemp
+        val tint = settings.wbTint
+        if (!wbCalibChecked) {
+            wbCalibChecked = true
+            wbCalib?.let { c ->
+                // калибровка из характеристик должна сходиться с тем, что делает сам процессор камеры
+                val (k, err) = c.fit(ag.red.toDouble(), agG, ag.blue.toDouble())
+                Log.i(TAG, "auto WB gains r=%.3f g=%.3f b=%.3f ~ %d K (calibration mismatch %.2f)".format(
+                    java.util.Locale.ROOT, ag.red, agG, ag.blue, k, err))
+                if (err > 0.35) wbCalib = null
+            }
+        }
+        wbCalib?.gains(t, tint)?.let { g ->
+            logWb("camera", "sensor calibration: gains r=%.3f g=%.3f b=%.3f".format(java.util.Locale.ROOT, g[0], g[1], g[2]))
+            return RggbChannelVector(g[0].toFloat(), g[1].toFloat(), g[1].toFloat(), g[2].toFloat()) to ccm
+        }
+        // без калибровки абсолютных кельвинов не знаю: оставляю усиления автобаланса и сдвигаю его матрицей цвета
+        val a = WhiteBalance.adaptSrgb(t, tint, WhiteBalance.REF_KELVIN)
+        logWb("camera", "relative to auto WB taken as ${WhiteBalance.REF_KELVIN} K")
+        return ag to WhiteBalance.toTransform(WhiteBalance.mul(a, WhiteBalance.toDoubles(ccm)))
     }
 
     private fun framingOn() = settings.framing && framingAvailable
@@ -831,6 +970,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         }
         if (abModes.contains(ab)) b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE, ab)
 
+        val manual = if (settings.wb == "manual" && wbCameraCapable) manualWbParams() else null
+        val waiting = settings.wb == "manual" && wbCameraCapable && manual == null
+        if (waiting && !wbWaitingAuto) wbAutoFrames = 0
+        wbWaitingAuto = waiting
         val awbModes = ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
         val awb = when (settings.wb) {
             "daylight" -> CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT
@@ -841,7 +984,17 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             "twilight" -> CameraMetadata.CONTROL_AWB_MODE_TWILIGHT
             else -> CameraMetadata.CONTROL_AWB_MODE_AUTO
         }
-        b.set(CaptureRequest.CONTROL_AWB_MODE, if (awbModes.contains(awb)) awb else CameraMetadata.CONTROL_AWB_MODE_AUTO)
+        if (manual != null) {
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            b.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, manual.first)
+            b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, manual.second)
+            wbSentCcm = manual.second
+            wbSentGains = manual.first
+        } else {
+            b.set(CaptureRequest.CONTROL_AWB_MODE, if (awbModes.contains(awb)) awb else CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            if (wbCameraCapable) ccModeTemplate?.let { b.set(CaptureRequest.COLOR_CORRECTION_MODE, it) }
+        }
         b.set(CaptureRequest.CONTROL_AWB_LOCK, settings.awbLock)
 
         val afModes = ch.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()

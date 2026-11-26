@@ -91,7 +91,12 @@
     <label>Баланс белого <select id="wb">
       <option value="auto">Авто</option><option value="daylight">Дневной свет</option><option value="cloudy">Облачно</option>
       <option value="shade">Тень</option><option value="incandescent">Лампа накаливания</option>
-      <option value="fluorescent">Флуоресцентная</option><option value="twilight">Сумерки</option></select></label>
+      <option value="fluorescent">Флуоресцентная</option><option value="twilight">Сумерки</option>
+      <option value="manual" id="wbManual">Вручную (температура)</option></select></label>
+    <div id="wbl">
+      <label>Температура: <span id="wbtv"></span><input type="range" id="wbt" min="2000" max="10000" step="50"></label>
+      <label>Оттенок: <span id="wbiv"></span><input type="range" id="wbi" min="-50" max="50"></label>
+    </div>
     <label>Антимерцание <select id="antibanding">
       <option value="auto">Авто</option><option value="50">50 Гц</option><option value="60">60 Гц</option><option value="off">Выкл</option></select></label>
     <div class="row">
@@ -196,6 +201,7 @@ function render() {
     const r = st.ev_max - st.ev_min; $('evr').value = r > 0 ? Math.round((st.ev - st.ev_min) / r * 100) : 50;
     $('focus').value = st.focus; $('fd').value = Math.round(st.focus_dist * 100);
     $('wb').value = st.wb; $('antibanding').value = st.antibanding;
+    $('wbt').value = st.wb_temp ?? 5000; $('wbi').value = st.wb_tint ?? 0;
     $('profile').value = st.profile || '';
     $('bg').value = st.bg || 'off';
     $('bgs').value = Math.round((st.bg_strength ?? .6) * 100);
@@ -205,6 +211,11 @@ function render() {
   $('zv').textContent = (+st.zoom).toFixed(1) + 'x';
   $('ev').textContent = (st.ev >= 0 ? '+' : '') + (+st.ev).toFixed(1) + ' EV';
   $('fdl').style.display = st.focus === 'manual' ? '' : 'none';
+  $('wbManual').hidden = !st.wb_manual_available;
+  $('wbl').style.display = st.wb === 'manual' && st.wb_manual_available ? '' : 'none';
+  $('wbtv').textContent = $('wbt').value + ' K';
+  const tint = +$('wbi').value;
+  $('wbiv').textContent = tint > 0 ? `+${tint} (пурпурнее)` : tint < 0 ? `${tint} (зеленее)` : '0';
   $('bgsl').style.display = st.bg === 'blur' ? '' : 'none';
   $('bTorch').classList.toggle('on', st.torch);
   $('bMic').classList.toggle('on', st.audio);
@@ -254,6 +265,8 @@ $('evr').oninput = (e) => set({ ev: (st.ev_min + (st.ev_max - st.ev_min) * e.tar
 $('focus').onchange = (e) => set({ focus: e.target.value });
 $('fd').oninput = (e) => set({ focus_dist: (e.target.value / 100).toFixed(2) });
 $('wb').onchange = (e) => set({ wb: e.target.value });
+$('wbt').oninput = (e) => set({ wb: 'manual', wb_temp: e.target.value });
+$('wbi').oninput = (e) => set({ wb: 'manual', wb_tint: e.target.value });
 $('antibanding').onchange = (e) => set({ antibanding: e.target.value });
 $('bTorch').onclick = () => set({ torch: 'toggle' });
 $('bMic').onclick = () => set({ mic: st.audio ? 0 : 1 });

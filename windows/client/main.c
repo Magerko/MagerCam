@@ -39,6 +39,7 @@ enum {
 	ID_PREVIEW, ID_TOTRAY,
 	ID_KEY, ID_PAIR, ID_HEVC, ID_MORE, ID_QUALITY,
 	ID_PROFILE, ID_BG, ID_BG_STRENGTH, ID_BG_PICK, ID_FRAMING, ID_LOCK, ID_ABR, ID_HEAT, ID_REC,
+	ID_WB, ID_WB_TEMP, ID_WB_TINT,
 	ID_BRIGHT, ID_CONTRAST, ID_SAT, ID_WARM, ID_DOC, ID_LUT, ID_COLOR_RESET,
 	ID_TRAY_OPEN = 300, ID_TRAY_CONNECT, ID_TRAY_EXIT,
 };
@@ -46,6 +47,10 @@ enum {
 /* чем закончилась сессия: после отказа в коде доступа не долблю телефон повторами,
  * иначе он закроется от меня на минуту */
 enum { SESSION_RETRY, SESSION_AUTH_FAILED };
+
+/* порядок как в списке «Баланс белого»; manual — по температуре (wb_temp, wb_tint) */
+#define WB_MODES 8
+static const char *wb_modes[WB_MODES] = {"auto", "daylight", "cloudy", "shade", "incandescent", "fluorescent", "twilight", "manual"};
 
 struct settings {
 	int conn; /* 0 — Wi-Fi, 1 — USB */
@@ -85,6 +90,9 @@ struct phone_status {
 	/* протокол v2 */
 	char profile[16], codec[8], bg[8];
 	bool abr, lock, framing, framing_available, faces, bg_image, rec, hot, heat_guard, bitrate_auto;
+	char wb[16];
+	int wb_temp, wb_tint;
+	bool wb_manual_available; /* телефон умеет wb=manual с wb_temp и wb_tint */
 	int bitrate_now;
 	double bg_strength;
 	long long rec_ms;
@@ -101,6 +109,7 @@ static struct {
 	HWND wifi, usb, autoconnect, autostart, totray, torch;
 	HWND key, hevc, profile, bg, bg_strength, bg_strength_label, framing, lock_btn, abr, heat, quality, rec, phone_info;
 	HWND bright, contrast, sat, warm, doc, lut_btn;
+	HWND wb, wb_temp, wb_tint, wb_temp_label, wb_tint_label;
 	NOTIFYICONDATAW nid;
 	int slot;              /* номер камеры: 0 — «MagerCam», 1 — «MagerCam 2»… */
 	wchar_t section[32];   /* секция client.ini для этой камеры */
@@ -140,7 +149,7 @@ static struct {
 	int ndevs;
 	struct found_device found[32];
 	int nfound;
-	bool zoom_dirty, ev_dirty, updating_ui;
+	bool zoom_dirty, ev_dirty, wb_dirty, updating_ui;
 	wchar_t ini[MAX_PATH];
 } app;
 
@@ -385,6 +394,10 @@ static void apply_status_json(const char *text)
 	p.heat_guard = json_bool(j, "heat_guard", false);
 	p.bitrate_now = (int)json_num(j, "bitrate_now", 0);
 	p.bitrate_auto = json_bool(j, "bitrate_auto", false);
+	snprintf(p.wb, sizeof(p.wb), "%s", json_str(j, "wb", "auto"));
+	p.wb_temp = (int)json_num(j, "wb_temp", 5000);
+	p.wb_tint = (int)json_num(j, "wb_tint", 0);
+	p.wb_manual_available = json_bool(j, "wb_manual_available", false);
 	p.bg_strength = json_num(j, "bg_strength", 0.6);
 	p.rec_ms = (long long)json_num(j, "rec_ms", 0);
 	if ((err = json_str(j, "bg_error", NULL)) != NULL) {
@@ -1156,6 +1169,22 @@ static void fill_format_lists(const struct phone_status *ph, int cur_w, int cur_
 	}
 }
 
+/* шаг 50 K: точнее глаз разницу всё равно не видит, а телефон не дёргаю на каждый пиксель ползунка */
+static int wb_temp_pos(void)
+{
+	int t = (int)SendMessageW(app.wb_temp, TBM_GETPOS, 0, 0);
+	return (t + 25) / 50 * 50;
+}
+
+static void set_wb_labels(void)
+{
+	wchar_t b[64];
+	_snwprintf(b, 64, L"Темп.: %d K", wb_temp_pos());
+	SetWindowTextW(app.wb_temp_label, b);
+	_snwprintf(b, 64, L"Оттенок: %+d", (int)SendMessageW(app.wb_tint, TBM_GETPOS, 0, 0));
+	SetWindowTextW(app.wb_tint_label, b);
+}
+
 static void sync_phone_controls(void)
 {
 	EnterCriticalSection(&app.lock);
@@ -1209,9 +1238,22 @@ static void sync_phone_controls(void)
 	_snwprintf(b, 64, L"Экспозиция: %+.1f", on ? ph.ev : 0.0);
 	SetWindowTextW(app.ev_label, b);
 
-	HWND phone_ctl[] = {app.profile, app.bg, app.framing, app.lock_btn, app.abr, app.heat, app.rec};
+	HWND phone_ctl[] = {app.profile, app.bg, app.framing, app.lock_btn, app.abr, app.heat, app.rec, app.wb};
 	for (size_t i = 0; i < sizeof(phone_ctl) / sizeof(phone_ctl[0]); i++)
 		EnableWindow(phone_ctl[i], on);
+	bool wb_manual = on && strcmp(ph.wb, "manual") == 0;
+	EnableWindow(app.wb_temp, wb_manual && ph.wb_manual_available);
+	EnableWindow(app.wb_tint, wb_manual && ph.wb_manual_available);
+	if (on && !app.wb_dirty) {
+		int wi = 0;
+		for (int i = 0; i < WB_MODES; i++)
+			if (!strcmp(ph.wb, wb_modes[i]))
+				wi = i;
+		combo_select_data(app.wb, wi);
+		SendMessageW(app.wb_temp, TBM_SETPOS, TRUE, ph.wb_temp);
+		SendMessageW(app.wb_tint, TBM_SETPOS, TRUE, ph.wb_tint);
+		set_wb_labels();
+	}
 	EnableWindow(app.bg_strength, on && strcmp(ph.bg, "blur") == 0);
 	if (on) {
 		static const char *profiles[] = {"", "call", "stream", "doc"};
@@ -1253,7 +1295,9 @@ static void sync_phone_controls(void)
 		if (ph.bg_error[0])
 			ADD(L"Фон: %ls  ", ph.bg_error);
 		if (ph.rec_error[0])
-			ADD(L"Запись: %ls", ph.rec_error);
+			ADD(L"Запись: %ls  ", ph.rec_error);
+		if (wb_manual && !ph.wb_manual_available)
+			ADD(L"Ручной баланс белого: обновите приложение на телефоне");
 #undef ADD
 	}
 	SetWindowTextW(app.phone_info, info);
@@ -1317,7 +1361,7 @@ static void build_ui(void)
 	app.connect = mk(L"BUTTON", L"Подключить", BS_DEFPUSHBUTTON | WS_TABSTOP, x + 12, 88, w - 24, 32, ID_CONNECT);
 	app.autoconnect = mk(L"BUTTON", L"Подключаться при запуске", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 126, w - 24, 22, ID_AUTOCONNECT);
 
-	group(L"Камера телефона", x, 162, w, 222);
+	group(L"Камера телефона", x, 162, w, 312);
 	app.camera = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 12, 184, w - 24, 300, ID_CAMERA);
 	app.res = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 12, 216, 110, 200, ID_RES);
 	app.fps = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 128, 216, 72, 200, ID_FPS);
@@ -1329,16 +1373,29 @@ static void build_ui(void)
 	app.ev_label = label(L"Экспозиция", x + 12, 332, 200, 18);
 	app.ev = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 6, 350, w - 12, 28, ID_EV);
 	SendMessageW(app.zoom, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+	label(L"Баланс белого:", x + 12, 388, 96, 20);
+	app.wb = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 108, 384, 180, 300, ID_WB);
+	app.wb_temp_label = label(L"", x + 12, 418, 108, 20);
+	app.wb_temp = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 120, 414, 172, 26, ID_WB_TEMP);
+	SendMessageW(app.wb_temp, TBM_SETRANGE, TRUE, MAKELPARAM(2000, 10000));
+	SendMessageW(app.wb_temp, TBM_SETLINESIZE, 0, 100);
+	SendMessageW(app.wb_temp, TBM_SETPAGESIZE, 0, 500);
+	SendMessageW(app.wb_temp, TBM_SETPOS, TRUE, 5000);
+	app.wb_tint_label = label(L"", x + 12, 448, 108, 20);
+	app.wb_tint = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 120, 444, 172, 26, ID_WB_TINT);
+	SendMessageW(app.wb_tint, TBM_SETRANGE, TRUE, MAKELPARAM(-50, 50));
+	SendMessageW(app.wb_tint, TBM_SETPAGESIZE, 0, 5);
+	set_wb_labels();
 
-	group(L"Изображение", x, 390, w, 84);
-	label(L"Поворот:", x + 12, 414, 70, 20);
-	app.rot = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 80, 410, 208, 200, ID_ROT);
-	app.mirror = mk(L"BUTTON", L"Зеркально", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 444, 110, 22, ID_MIRROR);
-	app.fill = mk(L"BUTTON", L"Без полей (обрезать)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 124, 444, 164, 22, ID_FILL);
+	group(L"Изображение", x, 480, w, 84);
+	label(L"Поворот:", x + 12, 504, 70, 20);
+	app.rot = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 80, 500, 208, 200, ID_ROT);
+	app.mirror = mk(L"BUTTON", L"Зеркально", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 534, 110, 22, ID_MIRROR);
+	app.fill = mk(L"BUTTON", L"Без полей (обрезать)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 124, 534, 164, 22, ID_FILL);
 
-	group(L"Звук телефона", x, 480, w, 82);
-	app.audio = mk(L"BUTTON", L"Выводить микрофон телефона в:", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 500, w - 24, 22, ID_AUDIO);
-	app.audio_dev = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 12, 526, w - 24, 300, ID_AUDIO_DEV);
+	group(L"Звук телефона", x, 570, w, 82);
+	app.audio = mk(L"BUTTON", L"Выводить микрофон телефона в:", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 590, w - 24, 22, ID_AUDIO);
+	app.audio_dev = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, x + 12, 616, w - 24, 300, ID_AUDIO_DEV);
 
 	x = 980;
 	group(L"Доступ", x, 6, w, 92);
@@ -1393,6 +1450,10 @@ static void build_ui(void)
 	combo_add(app.bg, L"Без обработки", 0);
 	combo_add(app.bg, L"Размыть фон", 1);
 	combo_add(app.bg, L"Заменить картинкой", 2);
+	static const wchar_t *wb_names[WB_MODES] = {L"Авто", L"Дневной свет", L"Облачно", L"Тень", L"Лампа накаливания",
+						    L"Флуоресцентная", L"Сумерки", L"Вручную (температура)"};
+	for (int i = 0; i < WB_MODES; i++)
+		combo_add(app.wb, wb_names[i], i);
 	wchar_t *kw = utf8_to_wide(app.cfg.key);
 	SetWindowTextW(app.key, kw);
 	free(kw);
@@ -1740,6 +1801,13 @@ static void on_command(int id, int code)
 				send_control("bg=%s", modes[i]);
 		}
 		break;
+	case ID_WB:
+		if (code == CBN_SELCHANGE) {
+			int i = (int)combo_data(app.wb);
+			if (i >= 0 && i < WB_MODES)
+				send_control("wb=%s", wb_modes[i]);
+		}
+		break;
 	case ID_BG_PICK: {
 		wchar_t path[MAX_PATH] = L"";
 		OPENFILENAMEW ofn = {sizeof(ofn)};
@@ -1914,6 +1982,10 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 			app.ev_dirty = true;
 		else if (tb == app.bg_strength)
 			app.bg_dirty = true;
+		else if (tb == app.wb_temp || tb == app.wb_tint) {
+			app.wb_dirty = true;
+			set_wb_labels();
+		}
 		SetTimer(w, TIMER_CONTROLS, 120, NULL);
 		return 0;
 	}
@@ -1939,11 +2011,14 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 			}
 			if (app.bg_dirty && ph.valid)
 				send_control("bg_strength=%.2f", (int)SendMessageW(app.bg_strength, TBM_GETPOS, 0, 0) / 100.0);
+			if (app.wb_dirty && ph.valid)
+				send_control("wb=manual&wb_temp=%d&wb_tint=%d", wb_temp_pos(),
+					     (int)SendMessageW(app.wb_tint, TBM_GETPOS, 0, 0));
 			/* даю телефону подтвердить значение, иначе старый статус дёрнет ползунки обратно */
 			SetTimer(w, TIMER_CONTROLS + 10, 1500, NULL);
 		} else if (wp == TIMER_CONTROLS + 10) {
 			KillTimer(w, wp);
-			app.zoom_dirty = app.ev_dirty = app.bg_dirty = false;
+			app.zoom_dirty = app.ev_dirty = app.bg_dirty = app.wb_dirty = false;
 		} else if (wp == TIMER_COLOR) {
 			KillTimer(w, wp);
 			rebuild_color();
@@ -2113,7 +2188,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
 	wc.hIconSm = wc.hIcon;
 	RegisterClassExW(&wc);
-	RECT r = {0, 0, S(1292), S(596)};
+	RECT r = {0, 0, S(1292), S(662)};
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 	AdjustWindowRect(&r, style, FALSE);
 	wchar_t title[96];

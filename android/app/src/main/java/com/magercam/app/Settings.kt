@@ -27,6 +27,9 @@ class Settings(context: Context) {
     @Volatile var focus = prefs.getString("focus", "continuous") ?: "continuous"
     @Volatile var focusDist = prefs.getFloat("focus_dist", 0f)
     @Volatile var wb = prefs.getString("wb", "auto") ?: "auto"
+    /** Для wb = manual: температура света в кельвинах и оттенок (плюс — в пурпур, минус — в зелень). */
+    @Volatile var wbTemp = prefs.getInt("wb_temp", WhiteBalance.TEMP_DEFAULT)
+    @Volatile var wbTint = prefs.getInt("wb_tint", 0)
     @Volatile var antibanding = prefs.getString("antibanding", "auto") ?: "auto"
     @Volatile var stab = prefs.getBoolean("stab", false)
     @Volatile var aeLock = false
@@ -66,6 +69,7 @@ class Settings(context: Context) {
             .putBoolean("keep_screen_on", keepScreenOn).putString("orientation_mode", orientationMode)
             .putFloat("zoom", zoom).putFloat("ev", ev).putString("focus", focus)
             .putFloat("focus_dist", focusDist).putString("wb", wb)
+            .putInt("wb_temp", wbTemp).putInt("wb_tint", wbTint)
             .putString("antibanding", antibanding).putBoolean("stab", stab)
             .putBoolean("mirror", mirrorPreview)
             .putBoolean("auth", authEnabled).putString("pin", pin).putString("profile", profile)
