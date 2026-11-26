@@ -13,8 +13,8 @@ android {
         applicationId = "com.magercam.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.2.0"
+        versionCode = 7
+        versionName = "1.3.0"
         // x86_64 только для эмулятора; 32-битный x86 давно не встречается
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }

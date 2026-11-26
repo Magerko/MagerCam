@@ -296,7 +296,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
             s.capture(b.build(), null, handler)
             b.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
-            s.setRepeatingRequest(b.build(), null, handler)
+            s.setRepeatingRequest(b.build(), captureCallback, handler)
         } catch (e: Exception) {
             Log.w(TAG, "focusAt: $e")
         }
