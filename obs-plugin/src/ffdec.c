@@ -83,6 +83,7 @@ struct mc_dec {
 	AVPacket *pkt;
 	AVFrame *frame;
 	AVFrame *sw_frame;
+	bool reorder;
 };
 
 static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmts)
@@ -105,7 +106,7 @@ static void dec_close(struct mc_dec *d)
 	bfree(d);
 }
 
-static struct mc_dec *dec_open(bool hevc, bool hw, bool *hw_failed)
+static struct mc_dec *dec_open(bool hevc, bool reorder, bool hw, bool *hw_failed)
 {
 	const AVCodec *codec = avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
 	if (!codec)
@@ -119,7 +120,9 @@ static struct mc_dec *dec_open(bool hevc, bool hw, bool *hw_failed)
 		dec_close(d);
 		return NULL;
 	}
-	d->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	d->reorder = reorder;
+	if (!reorder)
+		d->ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 	d->ctx->thread_type = FF_THREAD_SLICE;
 	d->ctx->thread_count = 0;
@@ -187,7 +190,8 @@ static enum mc_dec_result dec_decode(struct mc_dec *d, const uint8_t *data, size
 	d->pkt->data = (uint8_t *)data;
 	d->pkt->size = (int)len;
 	d->pkt->pts = pts;
-	d->pkt->dts = pts;
+	/* с B-кадрами пакеты идут в порядке декодирования, и pts в них скачет; dts тогда не знаю, пусть FFmpeg считает сам */
+	d->pkt->dts = d->reorder ? AV_NOPTS_VALUE : pts;
 	d->pkt->flags = key ? AV_PKT_FLAG_KEY : 0;
 
 	int r = avcodec_send_packet(d->ctx, d->pkt);

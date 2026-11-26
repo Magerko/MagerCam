@@ -81,6 +81,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var recordAudio = false
     private var recordOrientation = 0
     private var encoderWantedHevc = false
+    private var encoderWantedQuality = false
+    private var encoderWantedBframes = false
     private var gl: GlRenderer? = null
     private var glActive = false
 
@@ -129,7 +131,10 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     /** Потолок частоты кадров при перегреве, 0 — без ограничения. */
     @Volatile var fpsCap = 0
     @Volatile var wantHevc = false
-    @Volatile var bitrateOverride = 0
+    /** Все клиенты потока умеют переупорядочивать кадры, значит в режиме «Качество» можно включать B-кадры. */
+    @Volatile var wantBframes = false
+    /** С каким битрейтом запускать кодер: (ширина, высота, к/с, HEVC, потолок кодера в кбит/с) -> кбит/с. */
+    @Volatile var bitrateFor: (Int, Int, Int, Boolean, Int) -> Int = { _, _, _, _, _ -> settings.bitrateKbps }
     @Volatile var bgError: String? = null; private set
     var orientProvider: () -> Int = { 0 }
 
@@ -138,6 +143,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         get() = gl?.orient ?: 0
         set(v) { gl?.orient = v }
     @Volatile var encoderHevc = false; private set
+    @Volatile var encoderBframes = false; private set
+    @Volatile var encoderMaxKbps = 0; private set
     @Volatile var framingAvailable = false; private set
     @Volatile var facesVisible = 0; private set
     @Volatile var recordError: String? = null; private set
@@ -431,13 +438,20 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
         if (streamDemand) {
             val hevc = wantHevc && settings.codec != "h264"
+            val quality = settings.encMode == "quality"
+            val bframes = quality && wantBframes
             if (!encoder.isRunning || encoder.width != size.width || encoder.height != size.height || encoder.fps != fps ||
-                encoderWantedHevc != hevc) {
+                encoderWantedHevc != hevc || encoderWantedQuality != quality || encoderWantedBframes != bframes) {
                 encoderWantedHevc = hevc
-                if (!encoder.start(size.width, size.height, fps, if (bitrateOverride > 0) bitrateOverride else settings.bitrateKbps, hevc)) {
+                encoderWantedQuality = quality
+                encoderWantedBframes = bframes
+                val w = size.width; val h = size.height
+                if (!encoder.start(w, h, fps, { hv, max -> bitrateFor(w, h, fps, hv, max) }, hevc, quality, bframes)) {
                     error = "Кодировщик видео не запустился для ${size.width}x${size.height}"
                 }
                 encoderHevc = encoder.hevc
+                encoderBframes = encoder.bframes
+                encoderMaxKbps = encoder.maxKbps
             }
         } else encoder.stop()
 
@@ -445,7 +459,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             if (!recorder.isRunning) {
                 // для записи битрейт с запасом: 1080p30 примерно 16 Мбит/с, дальше пропорционально пикселям и кадрам
                 val auto = (size.width.toLong() * size.height * fps * 16000 / (1920L * 1080 * 30)).toInt()
-                val kbps = maxOf(auto, settings.bitrateKbps * 2).coerceIn(4000, 50000)
+                val manual = if (settings.bitrateAuto) 0 else settings.bitrateKbps * 2
+                val kbps = maxOf(auto, manual).coerceIn(4000, 50000)
                 if (!recorder.start(size.width, size.height, fps, kbps, recordAudio, recordOrientation)) {
                     recordRequested = false
                     recordError = "Не удалось начать запись"

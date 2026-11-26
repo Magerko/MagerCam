@@ -43,6 +43,11 @@ class Settings(context: Context) {
     @Volatile var bgStrength = prefs.getFloat("bg_strength", 0.6f)
     @Volatile var heatGuard = prefs.getBoolean("heat_guard", true)
     @Volatile var autoDim = prefs.getBoolean("auto_dim", false)
+    /** Битрейт подбираю по размеру, частоте и кодеку. Кто битрейт не трогал (прежние 8 Мбит/с без профиля), тоже получает авто. */
+    @Volatile var bitrateAuto = prefs.getBoolean("bitrate_auto",
+        prefs.getInt("bitrate", 8000) == 8000 && prefs.getString("profile", "").isNullOrEmpty())
+    /** "latency" — кодер ради минимальной задержки, "quality" — VBR и B-кадры. */
+    @Volatile var encMode = prefs.getString("enc", "latency") ?: "latency"
 
     val displayName: String
         get() = deviceName.ifBlank { "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}" }
@@ -67,6 +72,7 @@ class Settings(context: Context) {
             .putBoolean("abr", abr).putString("codec", codec).putBoolean("framing", framing)
             .putString("bg", background).putFloat("bg_strength", bgStrength)
             .putBoolean("heat_guard", heatGuard).putBoolean("auto_dim", autoDim)
+            .putBoolean("bitrate_auto", bitrateAuto).putString("enc", encMode)
             .apply()
     }
 

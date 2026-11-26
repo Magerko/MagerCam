@@ -75,6 +75,7 @@
       <label style="flex:2">Разрешение <select id="res"></select></label>
       <label style="flex:1">FPS <select id="fps"><option>15</option><option>24</option><option>25</option><option>30</option><option>50</option><option>60</option></select></label>
     </div>
+    <label class="chk"><input type="checkbox" id="brAuto"> Битрейт автоматически (по разрешению, к/с и кодеку)</label>
     <label>Битрейт (для OBS): <span id="brv"></span><input type="range" id="bitrate" min="1" max="50"></label>
     <div class="row">
       <button id="bTorch">🔦 Фонарик</button>
@@ -117,6 +118,9 @@
     <div class="row">
       <button id="bAbr">Адаптивный битрейт</button>
       <button id="bHeat">Защита от нагрева</button>
+    </div>
+    <div class="row">
+      <button id="bQuality" title="Лучше детализация, задержка +1–2 кадра">Режим «Качество»</button>
     </div>
     <span class="note" id="fxNote"></span>
 
@@ -187,6 +191,7 @@ function render() {
   if (fresh) {
     cam.value = st.camera; res.value = `${st.w}x${st.h}`; $('fps').value = st.fps;
     $('bitrate').value = Math.round(st.bitrate / 1000);
+    $('brAuto').checked = !!st.bitrate_auto;
     $('zoom').value = zoomTo(st.zoom);
     const r = st.ev_max - st.ev_min; $('evr').value = r > 0 ? Math.round((st.ev - st.ev_min) / r * 100) : 50;
     $('focus').value = st.focus; $('fd').value = Math.round(st.focus_dist * 100);
@@ -195,7 +200,8 @@ function render() {
     $('bg').value = st.bg || 'off';
     $('bgs').value = Math.round((st.bg_strength ?? .6) * 100);
   }
-  $('brv').textContent = $('bitrate').value + ' Мбит/с';
+  $('brv').textContent = $('bitrate').value + ' Мбит/с' + (st.bitrate_auto ? ' (авто)' : '');
+  $('bitrate').disabled = !!st.bitrate_auto;
   $('zv').textContent = (+st.zoom).toFixed(1) + 'x';
   $('ev').textContent = (st.ev >= 0 ? '+' : '') + (+st.ev).toFixed(1) + ' EV';
   $('fdl').style.display = st.focus === 'manual' ? '' : 'none';
@@ -209,6 +215,7 @@ function render() {
   $('bLock').classList.toggle('on', !!st.lock);
   $('bAbr').classList.toggle('on', !!st.abr);
   $('bHeat').classList.toggle('on', !!st.heat_guard);
+  $('bQuality').classList.toggle('on', st.enc === 'quality');
   $('bRec').classList.toggle('on', !!st.rec);
   $('bRec').textContent = st.rec ? `■ Стоп записи ${mmss(st.rec_ms || 0)}` : '⏺ Запись на телефоне';
   const notes = [];
@@ -258,6 +265,8 @@ $('bFraming').onclick = () => set({ framing: st.framing ? 0 : 1 });
 $('bLock').onclick = () => set({ lock: st.lock ? 0 : 1 });
 $('bAbr').onclick = () => set({ abr: st.abr ? 0 : 1 });
 $('bHeat').onclick = () => set({ heat_guard: st.heat_guard ? 0 : 1 });
+$('bQuality').onclick = () => set({ enc: st.enc === 'quality' ? 'latency' : 'quality' });
+$('brAuto').onchange = (e) => set({ bitrate: e.target.checked ? 'auto' : $('bitrate').value * 1000 });
 $('bRec').onclick = () => set({ rec: st.rec ? 0 : 1 });
 $('bg').onchange = (e) => {
   if (e.target.value === 'image' && st && !st.bg_image) { $('bgFile').click(); return; }

@@ -179,11 +179,13 @@ class StreamServer(private val core: Core) {
         sock.tcpNoDelay = true
         val wantsAudio = query["audio"] != "0"
         val wantsHevc = query["codec"] == "hevc"
-        core.applyParams(query - "codec" - "key")
+        // B-кадры шлю только тем, кто сказал, что их переупорядочит: старый клиент с low delay показал бы кадры вразнобой
+        val acceptsBframes = query["bframes"] == "1"
+        core.applyParams(query - "codec" - "key" - "bframes")
         val out = BufferedOutputStream(sock.getOutputStream(), 64 * 1024)
         out.write("HTTP/1.1 200 OK\r\nContent-Type: application/x-magercam\r\nCache-Control: no-cache\r\n\r\n".toByteArray())
         out.flush()
-        val client = StreamClient(sock, out, wantsAudio, wantsHevc)
+        val client = StreamClient(sock, out, wantsAudio, wantsHevc, acceptsBframes)
         val ac = ByteBuffer.allocate(5).putInt(AudioCapture.RATE).put(AudioCapture.CHANNELS.toByte()).array()
         client.enqueueOther(packet(PKT_AUDIO_CONFIG, ac, 0, false), droppable = false)
         client.enqueueOther(packet(PKT_STATUS, core.statusJson().toByteArray(), 0, false), droppable = false)
@@ -191,7 +193,8 @@ class StreamServer(private val core: Core) {
         // декодера H.265 получал устаревший конфиг HEVC, отваливался и снова приходил к нему же, по кругу.
         lastVideoConfig?.let {
             val hevc = it[3].toInt() and FLAG_HEVC != 0
-            if (core.engine.encoderRunning && (wantsHevc || !hevc)) client.enqueueVideo(it, PKT_VIDEO_CONFIG, true)
+            val bf = it[3].toInt() and FLAG_BFRAMES != 0
+            if (core.engine.encoderRunning && (wantsHevc || !hevc) && (acceptsBframes || !bf)) client.enqueueVideo(it, PKT_VIDEO_CONFIG, true)
         }
         streamClients += client
         Log.i(TAG, "stream client ${sock.inetAddress.hostAddress} audio=$wantsAudio")
@@ -300,7 +303,8 @@ class StreamServer(private val core: Core) {
 
     private class Item(val pkt: ByteArray, val video: Boolean, val t: Long = System.nanoTime())
 
-    class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean, val wantsHevc: Boolean) {
+    class StreamClient(private val sock: Socket, private val out: OutputStream, val wantsAudio: Boolean, val wantsHevc: Boolean,
+                       val acceptsBframes: Boolean) {
         private val queue = LinkedBlockingDeque<Item>()
         private val queued = AtomicLong(0)
         val drops = java.util.concurrent.atomic.AtomicInteger(0)
@@ -447,6 +451,8 @@ class StreamServer(private val core: Core) {
         const val PKT_STATUS = 5
         const val PKT_PING = 6
         const val FLAG_HEVC = 2
+        /** Только в VIDEO_CONFIG: кодер выдаёт B-кадры, декодеру нельзя работать в режиме low delay. */
+        const val FLAG_BFRAMES = 4
         private const val BOUNDARY = "magercamframe"
         private const val MAX_QUEUE_BYTES = 6_000_000L
         private const val MAX_QUEUE_MS = 500L

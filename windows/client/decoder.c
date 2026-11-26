@@ -133,6 +133,8 @@ struct decoder *decoder_create(decoder_frame_cb cb, void *opaque, bool hevc)
 	}
 	IMFAttributes *attrs = NULL;
 	if (SUCCEEDED(IMFTransform_GetAttributes(d->mft, &attrs)) && attrs) {
+		/* B-кадры декодер переставляет и в этом режиме (по num_reorder_frames из SPS), а без него
+		 * копит в себе больше секунды видео */
 		IMFAttributes_SetUINT32(attrs, &MF_LOW_LATENCY, TRUE);
 		IMFAttributes_Release(attrs);
 	}
@@ -185,11 +187,13 @@ static void emit(struct decoder *d, IMFSample *s)
 		return;
 	BYTE *p = NULL;
 	DWORD len = 0;
+	LONGLONG t = 0;
+	IMFSample_GetSampleTime(s, &t);
 	if (SUCCEEDED(IMFMediaBuffer_Lock(b, &p, NULL, &len))) {
 		size_t need = (size_t)d->stride * d->h * 3 / 2;
 		if (len >= need && d->vis_w && d->vis_h)
 			d->cb(d->opaque, p, p + (size_t)d->stride * d->h, (int)d->stride, (int)d->vis_w & ~1,
-			      (int)d->vis_h & ~1);
+			      (int)d->vis_h & ~1, t / 10);
 		IMFMediaBuffer_Unlock(b);
 	}
 	IMFMediaBuffer_Release(b);

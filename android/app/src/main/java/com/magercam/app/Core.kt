@@ -74,6 +74,7 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     fun start() {
         engine.orientProvider = { streamOrientation() }
+        engine.bitrateFor = { w, h, fps, hevc, max -> startBitrate(w, h, fps, hevc, max) }
         startServer()
         discovery.start()
         if (orientationListener.canDetectOrientation()) orientationListener.enable()
@@ -105,6 +106,11 @@ class Core(val context: Context) : CameraEngine.Listener {
         // HEVC включаю, только если его попросили все подключённые клиенты: кодер у них общий
         val hevc = server.streamClients.isNotEmpty() && server.streamClients.all { it.wantsHevc }
         if (hevc != engine.wantHevc) { engine.wantHevc = hevc; engine.restart() }
+        val bf = server.streamClients.isNotEmpty() && server.streamClients.all { it.acceptsBframes }
+        if (bf != engine.wantBframes) {
+            engine.wantBframes = bf
+            if (settings.encMode == "quality") engine.restart()
+        }
         engine.setStreamDemand(server.streamClients.isNotEmpty())
         engine.setMjpegDemand(server.wantsJpeg)
         updateAudio()
@@ -125,8 +131,34 @@ class Core(val context: Context) : CameraEngine.Listener {
 
     fun requestKeyFrame() = engine.requestKeyFrame()
 
-    private fun targetBitrate(): Int =
-        if (overheated && settings.heatGuard) minOf(settings.bitrateKbps, HOT_BITRATE) else settings.bitrateKbps
+    /** Битрейт без поправки на перегрев: ручной или авто для этих размера, частоты и кодека. */
+    private fun baseBitrate(w: Int, h: Int, fps: Int, hevc: Boolean, maxKbps: Int): Int =
+        if (settings.bitrateAuto) autoBitrate(w, h, fps, hevc, maxKbps) else settings.bitrateKbps
+
+    private fun capHeat(kbps: Int) = if (overheated && settings.heatGuard) minOf(kbps, HOT_BITRATE) else kbps
+
+    /** Потолок для текущего кадра: пока кодер не запущен, считаю по настройкам и последнему кодеку. */
+    fun currentBaseBitrate(): Int = if (settings.bitrateAuto) autoBitrateNow() else settings.bitrateKbps
+
+    /** Сколько дал бы авто-битрейт сейчас, для подписи в настройках. */
+    fun autoBitrateNow(): Int {
+        // activeFps после закрытия камеры остаётся от прошлого раза, поэтому без activeSize беру всё из настроек
+        val size = engine.activeSize
+        val fps = if (size != null && engine.activeFps > 0) engine.activeFps else settings.fps
+        return autoBitrate(size?.width ?: settings.width, size?.height ?: settings.height, fps, engine.encoderHevc, engine.encoderMaxKbps)
+    }
+
+    private fun targetBitrate(): Int = capHeat(currentBaseBitrate())
+
+    /** Потолок, от которого сейчас считает адаптивный битрейт; сменился — значит, сменились размер, частота, кодек или ручная настройка. */
+    @Volatile private var lastBase = 0
+
+    /** Кодер при перезапуске спрашивает битрейт здесь: при том же потолке продолжаю с того, до чего спустился адаптивный. */
+    private fun startBitrate(w: Int, h: Int, fps: Int, hevc: Boolean, maxKbps: Int): Int {
+        val base = baseBitrate(w, h, fps, hevc, maxKbps)
+        val t = capHeat(base)
+        return if (base == lastBase && bitrateNow > 0) minOf(bitrateNow, t) else t
+    }
 
     /**
      * Адаптивный битрейт: если очередь на отправку растёт или кадры пришлось выкинуть, сразу сбавляю на 30%,
@@ -135,9 +167,15 @@ class Core(val context: Context) : CameraEngine.Listener {
      */
     private fun adaptBitrate() {
         val (drops, ageMs) = server.takeCongestion()
-        val target = targetBitrate()
+        val base = currentBaseBitrate()
+        val target = capHeat(base)
         var cur = bitrateNow
-        if (!settings.abr || server.streamClients.isEmpty()) {
+        if (base != lastBase) {
+            // новый размер или кодек: старое значение для них ничего не значит, начинаю с нового потолка
+            lastBase = base
+            cur = target
+            calmTicks = 0
+        } else if (!settings.abr || server.streamClients.isEmpty()) {
             cur = target
             calmTicks = 0
         } else if (drops > 0 || ageMs > 200) {
@@ -152,7 +190,6 @@ class Core(val context: Context) : CameraEngine.Listener {
         cur = cur.coerceAtMost(target)
         if (cur != bitrateNow) {
             bitrateNow = cur
-            engine.bitrateOverride = cur
             engine.setBitrate(cur)
         }
     }
@@ -196,7 +233,7 @@ class Core(val context: Context) : CameraEngine.Listener {
     }
 
     /** Ручная правка любого из этих значений означает, что профиль больше не действует. */
-    private fun profileSnapshot() = listOf(settings.width, settings.height, settings.fps, settings.bitrateKbps,
+    private fun profileSnapshot() = listOf(settings.width, settings.height, settings.fps, settings.bitrateKbps, settings.bitrateAuto,
         engine.resolveCameraId(settings.cameraId), settings.framing, settings.stab, settings.audioSource)
 
     /** Картинку для замены фона ужимаю до 1920 по большей стороне: больше кодеру всё равно не нужно. */
@@ -251,15 +288,18 @@ class Core(val context: Context) : CameraEngine.Listener {
             val v = it.coerceIn(5, 60)
             if (v != settings.fps) { settings.fps = v; restart = true }
         }
-        p["bitrate"]?.toIntOrNull()?.let {
-            val v = it.coerceIn(500, 50000)
-            if (v != settings.bitrateKbps) {
-                settings.bitrateKbps = v
+        p["bitrate"]?.let {
+            val auto = it == "auto"
+            val v = it.toIntOrNull()?.coerceIn(500, 50000)
+            if ((auto && !settings.bitrateAuto) || (v != null && (settings.bitrateAuto || v != settings.bitrateKbps))) {
+                settings.bitrateAuto = auto
+                if (v != null) settings.bitrateKbps = v
+                lastBase = currentBaseBitrate()
                 bitrateNow = targetBitrate()
-                engine.bitrateOverride = bitrateNow
                 engine.setBitrate(bitrateNow)
             }
         }
+        p["enc"]?.let { if (it in listOf("latency", "quality") && it != settings.encMode) { settings.encMode = it; restart = true } }
         p["camera"]?.let {
             // на "back"/"front" оставляю текущий объектив, если он уже смотрит в эту сторону
             val cur = engine.cameras.firstOrNull { c -> c.id == engine.resolveCameraId(settings.cameraId) }
@@ -357,7 +397,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         o.put("name", settings.displayName).put("ver", PROTOCOL_VERSION)
         o.put("w", size?.width ?: settings.width).put("h", size?.height ?: settings.height)
         o.put("fps", if (engine.activeFps > 0) engine.activeFps else settings.fps)
-        o.put("bitrate", settings.bitrateKbps)
+        o.put("bitrate", currentBaseBitrate()).put("bitrate_auto", settings.bitrateAuto)
         o.put("camera", engine.resolveCameraId(settings.cameraId)).put("front", engine.isFront)
         val cams = JSONArray()
         engine.cameras.forEach { cams.put(JSONObject().put("id", it.id).put("front", it.front).put("label", it.label)) }
@@ -383,6 +423,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         o.put("codec", if (engine.encoderHevc) "hevc" else "h264").put("codec_pref", settings.codec)
         o.put("hevc", VideoEncoder.isHevcSupported())
         o.put("abr", settings.abr).put("bitrate_now", bitrateNow)
+        o.put("enc", settings.encMode).put("bframes", engine.encoderRunning && engine.encoderBframes)
         o.put("lock", settings.aeLock && settings.awbLock)
         o.put("framing", settings.framing).put("framing_available", engine.framingAvailable).put("faces", engine.facesVisible)
         o.put("bg", settings.background).put("bg_strength", settings.bgStrength.toDouble())
@@ -430,6 +471,18 @@ class Core(val context: Context) : CameraEngine.Listener {
         const val PROTOCOL_VERSION = 2
         private const val MIN_BITRATE = 800
         private const val HOT_BITRATE = 6000
+
+        /**
+         * Авто-битрейт: 1080p30 H.264 — 12 Мбит/с, дальше чуть медленнее, чем растут пиксели и кадры
+         * (кодеру на большом кадре и частых кадрах легче), H.265 обходится примерно на треть меньшим.
+         */
+        fun autoBitrate(w: Int, h: Int, fps: Int, hevc: Boolean, maxKbps: Int): Int {
+            var k = 12000.0 * Math.pow(w.toDouble() * h / 2073600.0, 0.9) * Math.pow(fps.coerceAtLeast(1) / 30.0, 0.6)
+            if (hevc) k *= 0.65
+            var r = ((Math.round(k / 500.0) * 500).toInt()).coerceIn(2000, 50000)
+            if (maxKbps > 0) r = r.coerceAtMost(maxKbps)
+            return r
+        }
 
         @Volatile var instance: Core? = null
     }

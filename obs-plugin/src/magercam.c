@@ -59,6 +59,8 @@ struct mc_config {
 	bool usb;
 	char adb_path[512];
 	int width, height, fps, bitrate_kbps;
+	bool bitrate_auto; /* bitrate=auto: телефон сам подбирает битрейт под разрешение, к/с и кодек */
+	bool quality;      /* enc=quality: VBR и B-кадры, задержка на кадр-два больше */
 	bool audio;
 	char camera[64]; /* "back", "front" или id объектива из статуса телефона */
 	bool hw_decode;
@@ -95,7 +97,7 @@ struct mc_source {
 	SOCKET sock;
 
 	/* статус от телефона, трогаю только под lock */
-	char status[256];
+	char status[400];
 	char phone_name[96];
 	int phone_orient;
 	int battery;
@@ -117,6 +119,13 @@ struct mc_source {
 	bool had_video;
 	bool ever_video; /* был ли хоть один кадр; до первого показываю карточку со статусом */
 	bool stream_hevc; /* по флагу в VIDEO_CONFIG */
+	bool stream_reorder; /* тоже по флагу: в потоке B-кадры, декодер открываю без LOW_DELAY */
+	/* pts последнего показанного кадра: OBS нужны метки по возрастанию, кадр из прошлого не показываю */
+	int64_t last_out_pts;
+	bool out_valid;
+	bool out_warned;
+	int64_t st_min, st_max;
+	int st_frames, st_dropped;
 	/* наименьшая разница «время прихода − pts», то есть задержка сети без очереди; от неё меряю отставание */
 	int64_t lat_base;
 	bool lat_valid;
@@ -281,7 +290,7 @@ static void show_card(struct mc_source *s, const char *msg)
 
 static void set_status(struct mc_source *s, const char *fmt, ...)
 {
-	char buf[256];
+	char buf[400];
 	va_list ap;
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -896,7 +905,8 @@ static bool decoder_open(struct mc_source *s, bool hw)
 		set_status(s, "Ошибка: в этом OBS не нашлось FFmpeg (avcodec-60, 61 или 62). Нужен OBS 30 или новее");
 		return false;
 	}
-	s->dec = g_ff->open(s->stream_hevc, hw, &s->hw_failed);
+	s->dec = g_ff->open(s->stream_hevc, s->stream_reorder, hw, &s->hw_failed);
+	s->out_valid = false;
 	if (!s->dec) {
 		set_status(s, s->stream_hevc ? "Ошибка: не удалось открыть декодер H.265" : "Ошибка: не удалось открыть декодер H.264");
 		return false;
@@ -1052,7 +1062,35 @@ struct frame_ctx {
 static void on_frame(void *opaque, const struct mc_frame *f)
 {
 	struct frame_ctx *c = opaque;
-	output_frame(c->s, f, c->rot, c->mirror);
+	struct mc_source *s = c->s;
+	/* Кадр старше уже показанного бывает, только если декодер отдал B-кадры в порядке декодирования.
+	 * Такой кадр пропускаю: дёрнуть картинку назад хуже, чем потерять кадр. Скачок больше секунды — это
+	 * новые часы телефона, а не перестановка. */
+	if (s->out_valid && f->pts_us <= s->last_out_pts && s->last_out_pts - f->pts_us < 1000000) {
+		if (!s->out_warned)
+			LOG(LOG_WARNING, "decoder returned frame %lld us older than the previous one, dropping it",
+			    (long long)(s->last_out_pts - f->pts_us));
+		s->out_warned = true;
+		s->st_dropped++;
+		return;
+	}
+	/* шаг между метками соседних кадров: по нему в логе (--verbose) видно, ровно ли идёт видео */
+	if (s->out_valid) {
+		int64_t step = f->pts_us - s->last_out_pts;
+		if (!s->st_frames || step < s->st_min)
+			s->st_min = step;
+		if (!s->st_frames || step > s->st_max)
+			s->st_max = step;
+		if (++s->st_frames == 300) {
+			LOG(LOG_DEBUG, "video: 300 frames, pts step %.1f..%.1f ms, %d dropped as out of order%s",
+			    s->st_min / 1000.0, s->st_max / 1000.0, s->st_dropped, s->stream_reorder ? ", b-frames" : "");
+			s->st_frames = 0;
+			s->st_dropped = 0;
+		}
+	}
+	s->last_out_pts = f->pts_us;
+	s->out_valid = true;
+	output_frame(s, f, c->rot, c->mirror);
 }
 
 static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, int64_t pts, bool key, int rot,
@@ -1145,11 +1183,15 @@ static void apply_status_json(struct mc_source *s, const char *json)
 	s->phone_rec = obs_data_get_bool(d, "rec");
 	snprintf(s->profile_live, sizeof(s->profile_live), "%s", obs_data_get_string(d, "profile"));
 	LeaveCriticalSection(&s->lock);
-	char extra[160] = "";
+	char extra[256] = "";
 	int br = (int)obs_data_get_int(d, "bitrate_now");
 	if (br > 0)
-		snprintf(extra, sizeof(extra), ", %s %.1f Мбит/с", strcmp(obs_data_get_string(d, "codec"), "hevc") ? "H.264" : "H.265",
-			 br / 1000.0);
+		snprintf(extra, sizeof(extra), ", %s %.1f Мбит/с%s", strcmp(obs_data_get_string(d, "codec"), "hevc") ? "H.264" : "H.265",
+			 br / 1000.0, obs_data_get_bool(d, "bitrate_auto") ? " (авто)" : "");
+	if (strcmp(obs_data_get_string(d, "enc"), "quality") == 0) {
+		size_t o = strlen(extra);
+		snprintf(extra + o, sizeof(extra) - o, obs_data_get_bool(d, "bframes") ? ", «Качество», B-кадры" : ", «Качество»");
+	}
 	if (obs_data_get_bool(d, "rec")) {
 		long long ms = obs_data_get_int(d, "rec_ms");
 		size_t o = strlen(extra);
@@ -1174,11 +1216,19 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c, const 
 		dstr_cat(q, "&profile=");
 		url_encode(q, profile);
 	} else {
-		dstr_catf(q, "&w=%d&h=%d&fps=%d&bitrate=%d&camera=", c->width, c->height, c->fps, c->bitrate_kbps);
+		dstr_catf(q, "&w=%d&h=%d&fps=%d", c->width, c->height, c->fps);
+		/* старый телефон "auto" не разберёт как число и просто оставит свой битрейт */
+		if (c->bitrate_auto)
+			dstr_cat(q, "&bitrate=auto");
+		else
+			dstr_catf(q, "&bitrate=%d", c->bitrate_kbps);
+		dstr_cat(q, "&camera=");
 		url_encode(q, c->camera);
 	}
 	if (c->hevc && g_ff && g_ff->has_hevc())
 		dstr_cat(q, "&codec=hevc");
+	/* bframes=1: B-кадры я переупорядочу, флаг в VIDEO_CONFIG скажет, когда они пойдут */
+	dstr_catf(q, "&enc=%s&bframes=1", c->quality ? "quality" : "latency");
 	if (c->control) {
 		if (!*profile) {
 			dstr_catf(q, "&framing=%d&bg=%s&stab=%d", c->framing ? 1 : 0, c->bg, c->stab ? 1 : 0);
@@ -1293,6 +1343,8 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 
 	if (ok) {
 		s->stream_hevc = false;
+		s->stream_reorder = false;
+		s->out_warned = false;
 		decoder_open(s, cfg->hw_decode);
 		s->ts_valid = false;
 		s->lat_valid = false;
@@ -1349,6 +1401,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		case PKT_VIDEO_CONFIG:
 			/* новая сессия кодера: пересоздаю декодер, вдруг сменилось разрешение или кодек */
 			s->stream_hevc = (hdr[3] & 2) != 0;
+			s->stream_reorder = (hdr[3] & 4) != 0;
 			s->lat_valid = false;
 			s->lagging = false;
 			decoder_open(s, cfg->hw_decode);
@@ -1514,6 +1567,9 @@ static void mc_defaults(obs_data_t *st)
 	obs_data_set_default_string(st, "resolution", "1920x1080");
 	obs_data_set_default_int(st, "fps", 30);
 	obs_data_set_default_int(st, "bitrate", 8);
+	/* без сохранённого значения и у старых источников со слайдером тоже авто: так задумано */
+	obs_data_set_default_bool(st, "bitrate_auto", true);
+	obs_data_set_default_bool(st, "quality_mode", false);
 	obs_data_set_default_bool(st, "audio", true);
 	obs_data_set_default_int(st, "camera", 0);
 	obs_data_set_default_string(st, "camera_id", "");
@@ -1560,6 +1616,8 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 	}
 	c->fps = (int)obs_data_get_int(st, "fps");
 	c->bitrate_kbps = (int)obs_data_get_int(st, "bitrate") * 1000;
+	c->bitrate_auto = obs_data_get_bool(st, "bitrate_auto");
+	c->quality = obs_data_get_bool(st, "quality_mode");
 	c->audio = obs_data_get_bool(st, "audio");
 	const char *cam = obs_data_get_string(st, "camera_id");
 	if (!*cam) /* старые версии хранили камеру числом */
@@ -1593,7 +1651,8 @@ static bool stream_params_differ(const struct mc_config *a, const struct mc_conf
 /* то, что задаёт профиль (см. profileParams в Core.kt) */
 static bool profile_fields_differ(const struct mc_config *a, const struct mc_config *b)
 {
-	return a->width != b->width || a->height != b->height || a->fps != b->fps || a->bitrate_kbps != b->bitrate_kbps ||
+	return a->width != b->width || a->height != b->height || a->fps != b->fps || a->bitrate_auto != b->bitrate_auto ||
+	       (!a->bitrate_auto && a->bitrate_kbps != b->bitrate_kbps) ||
 	       strcmp(a->camera, b->camera) != 0 || a->framing != b->framing || a->stab != b->stab ||
 	       strcmp(a->focus, b->focus) != 0 || strcmp(a->bg, b->bg) != 0;
 }
@@ -1644,8 +1703,14 @@ static void mc_update(void *data, obs_data_t *st)
 		return;
 
 	struct dstr q = {0};
-	if (old.bitrate_kbps != c.bitrate_kbps)
-		dstr_catf(&q, "&bitrate=%d", c.bitrate_kbps);
+	if (old.bitrate_auto != c.bitrate_auto || (!c.bitrate_auto && old.bitrate_kbps != c.bitrate_kbps)) {
+		if (c.bitrate_auto)
+			dstr_cat(&q, "&bitrate=auto");
+		else
+			dstr_catf(&q, "&bitrate=%d", c.bitrate_kbps);
+	}
+	if (old.quality != c.quality)
+		dstr_catf(&q, "&enc=%s", c.quality ? "quality" : "latency");
 	if (c.control) {
 		if (old.zoom != c.zoom || !old.control)
 			dstr_catf(&q, "&zoom=%.2f", c.zoom);
@@ -1783,6 +1848,13 @@ static bool on_conn_changed(obs_properties_t *props, obs_property_t *p, obs_data
 	return true;
 }
 
+static bool on_bitrate_auto_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *st)
+{
+	UNUSED_PARAMETER(p);
+	obs_property_set_visible(obs_properties_get(props, "bitrate"), !obs_data_get_bool(st, "bitrate_auto"));
+	return true;
+}
+
 static bool on_discover(obs_properties_t *props, obs_property_t *p, void *data)
 {
 	UNUSED_PARAMETER(p);
@@ -1882,7 +1954,7 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
 
-	char status[300] = "Статус: —";
+	char status[440] = "Статус: —";
 	if (s) {
 		EnterCriticalSection(&s->lock);
 		snprintf(status, sizeof(status), "Статус: %s", s->status);
@@ -1960,7 +2032,15 @@ static obs_properties_t *mc_properties(void *data)
 		snprintf(name, sizeof(name), "%d", fps[i]);
 		obs_property_list_add_int(p, name, fps[i]);
 	}
+	p = obs_properties_add_bool(vid, "bitrate_auto", "Подбирать битрейт автоматически");
+	obs_property_set_long_description(p, "Телефон сам выберет битрейт под разрешение, частоту кадров и кодек "
+					     "(например, 1080p 30 — около 12 Мбит/с). Адаптивный битрейт при плохой сети "
+					     "по-прежнему снижает его.");
+	obs_property_set_modified_callback(p, on_bitrate_auto_changed);
 	p = obs_properties_add_int_slider(vid, "bitrate", "Битрейт (Мбит/с)", 1, 50, 1);
+	p = obs_properties_add_bool(vid, "quality_mode", "Режим «Качество» (лучше детализация, задержка +1–2 кадра)");
+	obs_property_set_long_description(p, "Телефон кодирует с переменным битрейтом и B-кадрами, если его кодер их умеет. "
+					     "Режим общий для всех, кто смотрит этот телефон.");
 	p = obs_properties_add_list(vid, "camera_id", "Камера", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "Задняя (основная)", "back");
 	obs_property_list_add_string(p, "Фронтальная", "front");

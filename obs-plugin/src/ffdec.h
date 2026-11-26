@@ -31,8 +31,9 @@ typedef void (*mc_frame_fn)(void *opaque, const struct mc_frame *f);
 struct mc_ffapi {
 	const char *name; /* например "avcodec-61", для лога */
 	bool (*has_hevc)(void);
-	/* NULL, если декодера нет или он не открылся; *hw_failed ставлю, когда аппаратное декодирование недоступно */
-	struct mc_dec *(*open)(bool hevc, bool hw, bool *hw_failed);
+	/* NULL, если декодера нет или он не открылся; *hw_failed ставлю, когда аппаратное декодирование недоступно.
+	 * reorder: в потоке есть B-кадры, декодер должен вернуть кадры в порядке показа, поэтому без LOW_DELAY */
+	struct mc_dec *(*open)(bool hevc, bool reorder, bool hw, bool *hw_failed);
 	void (*close)(struct mc_dec *d);
 	enum mc_dec_result (*decode)(struct mc_dec *d, const uint8_t *data, size_t len, int64_t pts, bool key,
 				     mc_frame_fn fn, void *opaque);

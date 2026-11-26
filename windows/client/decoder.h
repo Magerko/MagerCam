@@ -4,8 +4,8 @@
 
 struct decoder;
 
-/* плоскости валидны только внутри вызова, держать указатели дольше нельзя */
-typedef void (*decoder_frame_cb)(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h);
+/* плоскости валидны только внутри вызова, держать указатели дольше нельзя; pts_us — метка кадра с телефона */
+typedef void (*decoder_frame_cb)(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t pts_us);
 
 struct decoder *decoder_create(decoder_frame_cb cb, void *opaque, bool hevc);
 /* есть ли в системе декодер HEVC: только тогда прошу телефон слать H.265 */

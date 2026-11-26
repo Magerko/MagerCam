@@ -464,9 +464,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             if (v > 0) append(" · браузер: $v")
             append("\n")
             val codec = if (c.engine.encoderHevc) "HEVC" else "H.264"
-            val br = if (c.server.streamClients.isNotEmpty()) c.bitrateNow else s.bitrateKbps
-            if (size != null) append("${size.width}×${size.height} @${c.engine.activeFps} · $codec ${"%.1f".format(br / 1000f)} Мбит/с\n")
-            else append("${s.width}×${s.height} @${s.fps} · ${s.bitrateKbps / 1000} Мбит/с\n")
+            val br = if (c.server.streamClients.isNotEmpty()) c.bitrateNow else c.currentBaseBitrate()
+            val auto = if (s.bitrateAuto) " (авто)" else ""
+            if (size != null) append("${size.width}×${size.height} @${c.engine.activeFps} · $codec ${"%.1f".format(br / 1000f)} Мбит/с$auto\n")
+            else append("${s.width}×${s.height} @${s.fps} · ${"%.1f".format(br / 1000f)} Мбит/с$auto\n")
             if (c.engine.recorder.isRunning) {
                 val sec = (System.currentTimeMillis() - c.engine.recorder.startedAt) / 1000
                 append("⏺ Запись %d:%02d\n".format(sec / 60, sec % 60))
@@ -742,11 +743,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val fpsSp = spinner("Кадров в секунду", fpsValues.map { "$it" }, fpsValues, s.fps)
 
         // ползунком на 50 делений точно не попасть, поэтому даю готовые значения с подсказкой, что под что
-        val brValues = (listOf(2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000, 25000, 30000, 40000, 50000) + s.bitrateKbps)
+        // 0 — авто: битрейт считается от разрешения, частоты кадров и кодека
+        val brValues = listOf(0) + (listOf(2000, 3000, 4000, 6000, 8000, 10000, 12000, 16000, 20000, 25000, 30000, 40000, 50000) + s.bitrateKbps)
             .distinct().sorted()
+        fun mbps(kb: Int) = if (kb % 1000 == 0) "${kb / 1000}" else "%.1f".format(kb / 1000f)
         val brSp = spinner("Битрейт (верхняя граница)", brValues.map { kb ->
-            val mb = if (kb % 1000 == 0) "${kb / 1000}" else "%.1f".format(kb / 1000f)
-            mb + " Мбит/с" + when (kb) {
+            if (kb == 0) return@map "Авто (≈${mbps(c.autoBitrateNow())} Мбит/с)"
+            mbps(kb) + " Мбит/с" + when (kb) {
                 3000 -> " — 720p"
                 8000 -> " — 1080p 30"
                 12000 -> " — 1080p 60"
@@ -754,7 +757,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 40000 -> " — 4K 60, нужен хороший Wi-Fi"
                 else -> ""
             }
-        }, brValues, s.bitrateKbps)
+        }, brValues, if (s.bitrateAuto) 0 else s.bitrateKbps)
 
         val audioSrcValues = listOf("camcorder", "mic", "voice", "unprocessed")
         val audioSp = spinner("Источник звука", listOf("Видеокамера (по умолчанию)", "Микрофон", "Голос (шумоподавление)", "Без обработки"), audioSrcValues, s.audioSource)
@@ -777,6 +780,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val swFrame = if (c.engine.framingAvailable) switch("Автокадрирование: камера следит за лицом", s.framing) else null
         val swAbr = switch("Адаптивный битрейт (подстраиваться под Wi-Fi)", s.abr)
         val swHeat = switch("Беречь телефон: при перегреве снижать нагрузку", s.heatGuard)
+        val swQuality = switch("Режим «Качество»", s.encMode == "quality")
+        box.addView(TextView(this).apply {
+            text = "Лучше детализация, задержка +1–2 кадра"; textSize = 12f; alpha = 0.7f; setPadding(0, 0, 0, dpi(6))
+        })
 
         header("Фон (размытие или замена; работает на телефоне)")
         val bgValues = listOf("off", "blur", "image")
@@ -828,7 +835,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 if (cams.isNotEmpty()) p["camera"] = cams[camSp.selectedItemPosition].id
                 sizes.getOrNull(resSp.selectedItemPosition)?.let { p["w"] = "${it.width}"; p["h"] = "${it.height}" }
                 p["fps"] = "${fpsValues[fpsSp.selectedItemPosition]}"
-                p["bitrate"] = "${brValues[brSp.selectedItemPosition]}"
+                p["bitrate"] = brValues[brSp.selectedItemPosition].let { if (it == 0) "auto" else "$it" }
                 p["audio_source"] = audioSrcValues[audioSp.selectedItemPosition]
                 p["wb"] = wbValues[wbSp.selectedItemPosition]
                 p["antibanding"] = abValues[abSp.selectedItemPosition]
@@ -844,6 +851,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 swFrame?.let { p["framing"] = if (it.isChecked) "1" else "0" }
                 p["abr"] = if (swAbr.isChecked) "1" else "0"
                 p["heat_guard"] = if (swHeat.isChecked) "1" else "0"
+                p["enc"] = if (swQuality.isChecked) "quality" else "latency"
                 s.keepScreenOn = swScreen.isChecked
                 s.autoDim = swDim.isChecked
                 s.authEnabled = swAuth.isChecked

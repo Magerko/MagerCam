@@ -37,7 +37,7 @@ enum {
 	ID_CAMERA, ID_RES, ID_FPS, ID_BITRATE, ID_TORCH, ID_AF, ID_ZOOM, ID_EV, ID_ZOOM_LABEL, ID_EV_LABEL,
 	ID_ROT, ID_MIRROR, ID_FILL, ID_AUDIO, ID_AUDIO_DEV, ID_STATUS, ID_VCAM_STATE, ID_INSTALL, ID_AUTOSTART,
 	ID_PREVIEW, ID_TOTRAY,
-	ID_KEY, ID_PAIR, ID_HEVC, ID_MORE,
+	ID_KEY, ID_PAIR, ID_HEVC, ID_MORE, ID_QUALITY,
 	ID_PROFILE, ID_BG, ID_BG_STRENGTH, ID_BG_PICK, ID_FRAMING, ID_LOCK, ID_ABR, ID_HEAT, ID_REC,
 	ID_BRIGHT, ID_CONTRAST, ID_SAT, ID_WARM, ID_DOC, ID_LUT, ID_COLOR_RESET,
 	ID_TRAY_OPEN = 300, ID_TRAY_CONNECT, ID_TRAY_EXIT,
@@ -53,6 +53,8 @@ struct settings {
 	int port;
 	char camera[64];
 	int width, height, fps, bitrate_kbps;
+	bool bitrate_auto; /* bitrate=auto: телефон подбирает битрейт сам */
+	bool quality;      /* enc=quality: VBR и B-кадры на телефоне */
 	int rotation; /* -1 — беру ориентацию с телефона */
 	bool mirror, fill;
 	bool audio;
@@ -82,7 +84,7 @@ struct phone_status {
 	wchar_t error[160];
 	/* протокол v2 */
 	char profile[16], codec[8], bg[8];
-	bool abr, lock, framing, framing_available, faces, bg_image, rec, hot, heat_guard;
+	bool abr, lock, framing, framing_available, faces, bg_image, rec, hot, heat_guard, bitrate_auto;
 	int bitrate_now;
 	double bg_strength;
 	long long rec_ms;
@@ -97,7 +99,7 @@ static struct {
 	HWND wnd, preview, status, vcam_label, install_btn;
 	HWND host, connect, camera, res, fps, bitrate, zoom, ev, zoom_label, ev_label, rot, mirror, fill, audio, audio_dev;
 	HWND wifi, usb, autoconnect, autostart, totray, torch;
-	HWND key, hevc, profile, bg, bg_strength, bg_strength_label, framing, lock_btn, abr, heat, rec, phone_info;
+	HWND key, hevc, profile, bg, bg_strength, bg_strength_label, framing, lock_btn, abr, heat, quality, rec, phone_info;
 	HWND bright, contrast, sat, warm, doc, lut_btn;
 	NOTIFYICONDATAW nid;
 	int slot;              /* номер камеры: 0 — «MagerCam», 1 — «MagerCam 2»… */
@@ -196,6 +198,9 @@ static void load_settings(void)
 	c->height = ini_int(L"height", 1080);
 	c->fps = ini_int(L"fps", 30);
 	c->bitrate_kbps = ini_int(L"bitrate", 8000);
+	/* кто битрейт не трогал (остались прежние 8 Мбит/с), получает авто */
+	c->bitrate_auto = ini_int(L"bitrate_auto", c->bitrate_kbps == 8000) != 0;
+	c->quality = ini_int(L"quality", 0) != 0;
 	c->rotation = ini_int(L"rotation", -1);
 	c->mirror = ini_int(L"mirror", 0) != 0;
 	c->fill = ini_int(L"fill", 0) != 0;
@@ -233,6 +238,8 @@ static void save_settings(void)
 	ini_set_int(L"height", c.height);
 	ini_set_int(L"fps", c.fps);
 	ini_set_int(L"bitrate", c.bitrate_kbps);
+	ini_set_int(L"bitrate_auto", c.bitrate_auto);
+	ini_set_int(L"quality", c.quality);
 	ini_set_int(L"rotation", c.rotation);
 	ini_set_int(L"mirror", c.mirror);
 	ini_set_int(L"fill", c.fill);
@@ -377,6 +384,7 @@ static void apply_status_json(const char *text)
 	p.hot = json_bool(j, "hot", false);
 	p.heat_guard = json_bool(j, "heat_guard", false);
 	p.bitrate_now = (int)json_num(j, "bitrate_now", 0);
+	p.bitrate_auto = json_bool(j, "bitrate_auto", false);
 	p.bg_strength = json_num(j, "bg_strength", 0.6);
 	p.rec_ms = (long long)json_num(j, "rec_ms", 0);
 	if ((err = json_str(j, "bg_error", NULL)) != NULL) {
@@ -457,6 +465,9 @@ struct session {
 	uint8_t *cfg;
 	uint32_t cfg_len;
 	bool cfg_hevc;
+	/* pts последнего отданного кадра: кадр старше него означает, что декодер не переупорядочил B-кадры, такой не показываю */
+	int64_t last_out_pts;
+	bool out_valid;
 };
 
 /* Если декодер или сеть не успевают (4K, слабый Wi-Fi), кадры приходят всё позже, и задержка сама уже не уходит.
@@ -487,9 +498,14 @@ static bool video_lagging(struct session *s, int64_t pts_us, bool key)
 	return s->lagging && !key;
 }
 
-static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h)
+static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t pts_us)
 {
 	struct session *s = opaque;
+	/* скачок назад больше секунды — новые часы телефона, а не перестановка кадров */
+	if (s->out_valid && pts_us <= s->last_out_pts && s->last_out_pts - pts_us < 1000000)
+		return;
+	s->last_out_pts = pts_us;
+	s->out_valid = true;
 	struct nv12 src = {(uint8_t *)y, (uint8_t *)uv, stride, stride, w, h};
 	EnterCriticalSection(&app.lock);
 	int rot = app.cfg.rotation < 0 ? app.ph.orient : app.cfg.rotation;
@@ -597,9 +613,18 @@ static int stream_session(const struct settings *cfg, LONG gen)
 		snprintf(params, sizeof(params), "profile=%s", cam);
 	} else {
 		url_encode(cam, sizeof(cam), cfg->camera);
-		snprintf(params, sizeof(params), "w=%d&h=%d&fps=%d&bitrate=%d&camera=%s", cfg->width, cfg->height,
-			 cfg->fps, cfg->bitrate_kbps, cam);
+		char br[16];
+		/* старый телефон "auto" за число не примет и оставит свой битрейт */
+		if (cfg->bitrate_auto)
+			snprintf(br, sizeof(br), "auto");
+		else
+			snprintf(br, sizeof(br), "%d", cfg->bitrate_kbps);
+		snprintf(params, sizeof(params), "w=%d&h=%d&fps=%d&bitrate=%s&camera=%s", cfg->width, cfg->height,
+			 cfg->fps, br, cam);
 	}
+	/* bframes=1: B-кадры переупорядочу, телефон скажет флагом в VIDEO_CONFIG, когда они пойдут */
+	size_t pl = strlen(params);
+	snprintf(params + pl, sizeof(params) - pl, "&enc=%s&bframes=1", cfg->quality ? "quality" : "latency");
 	if (cfg->key[0])
 		snprintf(keyhdr, sizeof(keyhdr), "X-MagerCam-Key: %s\r\n", cfg->key);
 	int n = snprintf(req, sizeof(req),
@@ -678,6 +703,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 			s.cfg_len = len;
 			/* бит 1 во флагах конфига: телефон кодирует в H.265 */
 			s.cfg_hevc = (flags & 2) != 0;
+			s.out_valid = false;
 			s.dec = decoder_create(on_frame, &s, s.cfg_hevc);
 			if (!s.dec) {
 				/* сессию не рву: телефон пришлёт новый конфиг, когда сменит кодек, а до тех пор кадры пропускаю */
@@ -704,6 +730,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 				   телефон шлёт их сам раз в пару секунд */
 				decoder_destroy(s.dec);
 				s.dec = s.cfg ? decoder_create(on_frame, &s, s.cfg_hevc) : NULL;
+				s.out_valid = false;
 				if (s.dec)
 					decoder_feed(s.dec, s.cfg, s.cfg_len, pts);
 				s.wait_key = true;
@@ -751,8 +778,8 @@ static int stream_session(const struct settings *cfg, LONG gen)
 					_snwprintf(bat, 64, L", батарея %d%%%ls", ph.battery, ph.charging ? L" ⚡" : L"");
 				wchar_t br[48] = L"";
 				if (ph.bitrate_now > 0)
-					_snwprintf(br, 48, L", %ls %.1f Мбит/с", strcmp(ph.codec, "hevc") ? L"H.264" : L"H.265",
-						   ph.bitrate_now / 1000.0);
+					_snwprintf(br, 48, L", %ls %.1f Мбит/с%ls", strcmp(ph.codec, "hevc") ? L"H.264" : L"H.265",
+						   ph.bitrate_now / 1000.0, ph.bitrate_auto ? L" (авто)" : L"");
 				if (ph.error[0])
 					set_net_status(L"%ls: %ls", ph.name, ph.error);
 				else
@@ -1322,7 +1349,7 @@ static void build_ui(void)
 	app.hevc = mk(L"BUTTON", L"H.265 (меньше трафика)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 62, 170, 22, ID_HEVC);
 	mk(L"BUTTON", L"Ещё телефон…", BS_PUSHBUTTON | WS_TABSTOP, x + 186, 58, 102, 28, ID_MORE);
 
-	group(L"Функции телефона", x, 104, w, 238);
+	group(L"Функции телефона", x, 104, w, 262);
 	label(L"Профиль:", x + 12, 128, 70, 20);
 	app.profile = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, x + 84, 124, 204, 200, ID_PROFILE);
 	label(L"Фон:", x + 12, 160, 70, 20);
@@ -1336,9 +1363,11 @@ static void build_ui(void)
 	app.lock_btn = mk(L"BUTTON", L"Фикс. экспозиции", BS_AUTOCHECKBOX | WS_TABSTOP, x + 156, 254, 132, 22, ID_LOCK);
 	app.abr = mk(L"BUTTON", L"Адаптивный битрейт", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 278, 140, 22, ID_ABR);
 	app.heat = mk(L"BUTTON", L"Защита от нагрева", BS_AUTOCHECKBOX | WS_TABSTOP, x + 156, 278, 132, 22, ID_HEAT);
-	app.phone_info = label(L"", x + 12, 304, w - 24, 34);
+	app.quality = mk(L"BUTTON", L"Режим «Качество» (задержка +1–2 кадра)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 302, w - 24, 22,
+			 ID_QUALITY);
+	app.phone_info = label(L"", x + 12, 328, w - 24, 34);
 
-	group(L"Цвет на компьютере", x, 348, w, 214);
+	group(L"Цвет на компьютере", x, 372, w, 214);
 	static const struct { const wchar_t *name; int id; HWND *h; } sliders[] = {
 		{L"Яркость", ID_BRIGHT, &app.bright},
 		{L"Контраст", ID_CONTRAST, &app.contrast},
@@ -1347,15 +1376,15 @@ static void build_ui(void)
 	};
 	for (int i = 0; i < 4; i++) {
 		/* подпись создаю прямо перед ползунком: set_track_label находит её через GW_HWNDPREV */
-		label(sliders[i].name, x + 12, 372 + i * 30, 110, 20);
-		*sliders[i].h = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 120, 368 + i * 30, 172, 26,
+		label(sliders[i].name, x + 12, 396 + i * 30, 110, 20);
+		*sliders[i].h = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, x + 120, 392 + i * 30, 172, 26,
 				   sliders[i].id);
 		SendMessageW(*sliders[i].h, TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
 	}
-	app.doc = mk(L"BUTTON", L"Режим документа (чёткий текст)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 492,
+	app.doc = mk(L"BUTTON", L"Режим документа (чёткий текст)", BS_AUTOCHECKBOX | WS_TABSTOP, x + 12, 516,
 		     w - 24, 22, ID_DOC);
-	app.lut_btn = mk(L"BUTTON", L"LUT (.cube)…", BS_PUSHBUTTON | WS_TABSTOP, x + 12, 522, 180, 28, ID_LUT);
-	mk(L"BUTTON", L"Сбросить", BS_PUSHBUTTON | WS_TABSTOP, x + 198, 522, 90, 28, ID_COLOR_RESET);
+	app.lut_btn = mk(L"BUTTON", L"LUT (.cube)…", BS_PUSHBUTTON | WS_TABSTOP, x + 12, 546, 180, 28, ID_LUT);
+	mk(L"BUTTON", L"Сбросить", BS_PUSHBUTTON | WS_TABSTOP, x + 198, 546, 90, 28, ID_COLOR_RESET);
 
 	combo_add(app.profile, L"Свои настройки", 0);
 	combo_add(app.profile, L"Звонок (720p, лицо)", 1);
@@ -1368,6 +1397,7 @@ static void build_ui(void)
 	SetWindowTextW(app.key, kw);
 	free(kw);
 	Button_SetCheck(app.hevc, app.cfg.hevc);
+	Button_SetCheck(app.quality, app.cfg.quality);
 	if (!g_hevc_decoder) {
 		EnableWindow(app.hevc, FALSE);
 		SetWindowTextW(app.hevc, L"H.265 (нет декодера)");
@@ -1381,13 +1411,15 @@ static void build_ui(void)
 
 	struct phone_status none = {0};
 	fill_format_lists(&none, app.cfg.width, app.cfg.height, app.cfg.fps);
+	/* 0 — авто: телефон считает битрейт от разрешения, частоты кадров и кодека */
+	combo_add(app.bitrate, L"Авто", 0);
 	static const int br[] = {2000, 4000, 8000, 12000, 20000, 30000, 50000};
 	for (int i = 0; i < (int)(sizeof(br) / sizeof(br[0])); i++) {
 		wchar_t b[24];
 		_snwprintf(b, 24, L"%d Мбит/с", br[i] / 1000);
 		combo_add(app.bitrate, b, br[i]);
 	}
-	combo_select_data(app.bitrate, app.cfg.bitrate_kbps);
+	combo_select_data(app.bitrate, app.cfg.bitrate_auto ? 0 : app.cfg.bitrate_kbps);
 	combo_add(app.rot, L"Авто (по телефону)", -1);
 	combo_add(app.rot, L"0°", 0);
 	combo_add(app.rot, L"90°", 90);
@@ -1568,12 +1600,18 @@ static void on_command(int id, int code)
 			app.cfg.width = LOWORD(r);
 			app.cfg.height = HIWORD(r);
 			app.cfg.fps = (int)combo_data(app.fps);
-			app.cfg.bitrate_kbps = (int)combo_data(app.bitrate);
+			int br = (int)combo_data(app.bitrate);
+			app.cfg.bitrate_auto = br == 0;
+			if (br > 0)
+				app.cfg.bitrate_kbps = br;
 			app.profile_live[0] = 0;
 			struct settings c = app.cfg;
 			LeaveCriticalSection(&app.lock);
 			save_settings();
-			send_control("w=%d&h=%d&fps=%d&bitrate=%d", c.width, c.height, c.fps, c.bitrate_kbps);
+			if (c.bitrate_auto)
+				send_control("w=%d&h=%d&fps=%d&bitrate=auto", c.width, c.height, c.fps);
+			else
+				send_control("w=%d&h=%d&fps=%d&bitrate=%d", c.width, c.height, c.fps, c.bitrate_kbps);
 		}
 		break;
 	case ID_TORCH:
@@ -1652,6 +1690,16 @@ static void on_command(int id, int code)
 		if (app.want_connect)
 			reconnect(); /* кодек выбирается при подключении */
 		break;
+	case ID_QUALITY: {
+		bool on = Button_GetCheck(app.quality) == BST_CHECKED;
+		EnterCriticalSection(&app.lock);
+		app.cfg.quality = on;
+		LeaveCriticalSection(&app.lock);
+		save_settings();
+		/* кодер на телефоне перезапустится сам и пришлёт новый конфиг, переподключаться не нужно */
+		send_control("enc=%s", on ? "quality" : "latency");
+		break;
+	}
 	case ID_MORE: {
 		/* следующая свободная камера: «MagerCam 2», «MagerCam 3»… каждая в своём окне */
 		int free_slot = -1;
@@ -2065,7 +2113,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
 	wc.hIconSm = wc.hIcon;
 	RegisterClassExW(&wc);
-	RECT r = {0, 0, S(1292), S(572)};
+	RECT r = {0, 0, S(1292), S(596)};
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 	AdjustWindowRect(&r, style, FALSE);
 	wchar_t title[96];
