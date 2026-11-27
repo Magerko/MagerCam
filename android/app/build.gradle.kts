@@ -50,6 +50,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    // BuildConfig.VERSION_NAME уходит в статус: по нему ПК понимает, что умеет приложение на телефоне
+    buildFeatures {
+        buildConfig = true
+    }
     kotlinOptions {
         jvmTarget = "17"
     }

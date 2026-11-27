@@ -21,10 +21,13 @@
 EXPORT void os_set_thread_name(const char *name);
 
 #include "ffdec.h"
+#include "imgwin.h"
 
 OBS_DECLARE_MODULE()
 
 #define PLUGIN_VERSION "1.3.0"
+/* приложение на телефоне выходит вместе с плагином: до этой версии и советую обновить старый телефон */
+#define MC_PHONE_VERSION PLUGIN_VERSION
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)
 
 #define DEFAULT_PORT 4848
@@ -75,6 +78,8 @@ struct mc_config {
 	char bg[8];       /* off/blur/image */
 	double bg_strength;
 	bool framing, lock;
+	char sharp[12], nr[12]; /* резкость и шумоподавление камеры: off/low/default/high */
+	int sharp_amount;       /* своя резкость телефона поверх камеры: -100 (мягче)..100 */
 };
 
 struct mc_source {
@@ -135,6 +140,16 @@ struct mc_source {
 	/* что умеют камера и кодер телефона, под lock: из этого строю списки в свойствах */
 	int phone_sizes[32][2], phone_nsizes;
 	int phone_fps[8], phone_nfps;
+	/* тоже под lock: что телефон сейчас делает с картинкой (для окна настроек) и подсказка про старое приложение */
+	struct mc_phone_img ph;
+	char hint[320];
+
+	/* B-кадры декодер отдаёт пачками, а OBS без буфера показывает только последний кадр пачки: развожу их по времени */
+	struct mc_pacer *pacer;
+	bool pace_on; /* трогает только сетевой поток */
+#ifdef MC_FRAME_PROBE
+	struct mc_probe *probe;
+#endif
 };
 
 #ifdef _WIN32
@@ -970,7 +985,318 @@ static uint64_t map_timestamp(struct mc_source *s, int64_t pts_us, bool audio)
 	return (uint64_t)ts;
 }
 
-static void output_frame(struct mc_source *s, const struct mc_frame *f, int rot, bool mirror)
+/* С B-кадрами телефон отдаёт опорный кадр и следом зависевшие от него, и декодер выдаёт кадры пачкой по два-три
+ * разом. В режиме без буфера OBS на каждом такте берёт только самый свежий кадр, остальные из пачки пропадают, и
+ * картинка дёргается. Буфер OBS тут не годится: он раз за разом копит задержку после каждой заминки Wi-Fi и сам
+ * её не отдаёт. Поэтому развожу кадры сам: показываю кадр в pts + D, где D — самое позднее «время прихода − pts»
+ * за последние секунды. Опоздавший кадр сразу поднимает D, а вниз D сползает понемногу, чтобы уменьшение задержки
+ * не сжимало кадры в один такт. Задержка выходит такой, какая нужна, чтобы не терять кадры. */
+#define PACE_SLOTS 8
+
+struct pace_slot {
+	struct obs_source_frame2 f;
+	uint8_t *buf;
+	size_t cap;
+	int64_t due_us;
+};
+
+struct mc_pacer {
+	struct mc_source *s;
+	CRITICAL_SECTION lock;
+	mc_event_t wake;
+	mc_thread_t thread;
+	bool has_thread;
+	volatile bool stop;
+	struct pace_slot q[PACE_SLOTS];
+	int head, count;
+	bool busy; /* голова очереди сейчас уходит в OBS, её не трогаю */
+	int64_t delay_us;
+	bool delay_valid;
+	int64_t bucket_max[2];
+	int64_t bucket_start;
+	bool full_warned;
+#ifdef _WIN32
+	HANDLE timer;
+#endif
+};
+
+static inline int64_t now_us(void)
+{
+	return (int64_t)(os_gettime_ns() / 1000);
+}
+
+static bool copy_frame2(struct obs_source_frame2 *dst, uint8_t **buf, size_t *cap, const struct obs_source_frame2 *f)
+{
+	int planes = f->format == VIDEO_FORMAT_NV12 ? 2 : 3;
+	size_t sz[3] = {0}, total = 0;
+	for (int i = 0; i < planes; i++) {
+		size_t rows = i ? (f->height + 1) / 2 : f->height;
+		sz[i] = (size_t)f->linesize[i] * rows;
+		total += sz[i];
+	}
+	if (total > *cap) {
+		bfree(*buf);
+		*buf = bmalloc(total);
+		*cap = total;
+	}
+	*dst = *f;
+	uint8_t *d = *buf;
+	for (int i = 0; i < planes; i++) {
+		memcpy(d, f->data[i], sz[i]);
+		dst->data[i] = d;
+		d += sz[i];
+	}
+	for (int i = planes; i < MAX_AV_PLANES; i++)
+		dst->data[i] = NULL;
+	return true;
+}
+
+#ifdef MC_FRAME_PROBE
+/* Отладка плавности (сборка с -DMC_FRAME_PROBE): в угол каждого кадра пишу его номер полосками, а в готовом
+ * выходе OBS читаю, какие номера реально показаны. Так видно пропуски, а не только число отправленных кадров. */
+struct mc_probe {
+	volatile long decoded, sent, rendered, skipped, repeated, misses;
+	int last_code;
+	bool have_last;
+	uint64_t t0;
+	uint8_t *buf;
+	size_t cap;
+	bool no_pacer;
+	int64_t delay_sum;
+	long delay_n;
+	struct mc_source *s;
+};
+
+#define PROBE_BITS 16
+#define PROBE_BLOCK 16
+
+static void probe_stamp(struct obs_source_frame2 *f, int code)
+{
+	uint8_t *y = f->data[0];
+	for (int bi = 0; bi < PROBE_BITS + 2; bi++) {
+		int bit = bi == 0 ? 1 : bi == 1 ? 0 : (code >> (PROBE_BITS + 1 - bi)) & 1;
+		uint8_t v = bit ? 235 : 16;
+		for (int row = 0; row < PROBE_BLOCK && row < (int)f->height; row++)
+			for (int x = bi * PROBE_BLOCK; x < (bi + 1) * PROBE_BLOCK && x < (int)f->width; x++)
+				y[(size_t)row * f->linesize[0] + x] = v;
+	}
+}
+
+static void probe_render(void *param, struct video_data *frame)
+{
+	struct mc_probe *pr = param;
+	const uint8_t *y = frame->data[0];
+	uint32_t ls = frame->linesize[0];
+	if (!y)
+		return;
+	const uint8_t *row = y + (size_t)ls * (PROBE_BLOCK / 2);
+#define PROBE_AT(bi) row[(bi) * PROBE_BLOCK + PROBE_BLOCK / 2]
+	if (!(PROBE_AT(0) > 128 && PROBE_AT(1) < 128)) {
+		pr->misses++;
+	} else {
+		int code = 0;
+		for (int bi = 2; bi < PROBE_BITS + 2; bi++)
+			code = (code << 1) | (PROBE_AT(bi) > 128);
+		if (!pr->have_last) {
+			pr->rendered++;
+		} else if (code == pr->last_code) {
+			pr->repeated++;
+		} else {
+			int d = (code - pr->last_code) & 0xFFFF;
+			pr->rendered++;
+			if (d < 1000)
+				pr->skipped += d - 1;
+		}
+		pr->last_code = code;
+		pr->have_last = true;
+	}
+#undef PROBE_AT
+	uint64_t now = os_gettime_ns();
+	if (!pr->t0)
+		pr->t0 = now;
+	if (now - pr->t0 >= 5000000000ULL) {
+		LOG(LOG_INFO, "probe %s: decoded %ld, sent to OBS %ld, rendered %ld, skipped %ld, repeated %ld, unreadable %ld, "
+			      "pacer %s, avg wait in pacer %.1f ms",
+		    obs_source_get_name(pr->s->source), pr->decoded, pr->sent, pr->rendered, pr->skipped, pr->repeated, pr->misses, pr->no_pacer ? "off" : "on",
+		    pr->delay_n ? pr->delay_sum / (double)pr->delay_n / 1000.0 : 0.0);
+		pr->decoded = pr->sent = pr->rendered = pr->skipped = pr->repeated = pr->misses = 0;
+		pr->delay_sum = 0;
+		pr->delay_n = 0;
+		pr->t0 = now;
+	}
+}
+#endif
+
+static void pace_output(struct mc_source *s, const struct obs_source_frame2 *f)
+{
+#ifdef MC_FRAME_PROBE
+	if (s->probe)
+		s->probe->sent++;
+#endif
+	obs_source_output_video2(s->source, f);
+}
+
+static void pacer_sleep(struct mc_pacer *p, int64_t us)
+{
+#ifdef _WIN32
+	if (us >= 0 && p->timer) {
+		LARGE_INTEGER due;
+		due.QuadPart = -(LONGLONG)us * 10;
+		SetWaitableTimer(p->timer, &due, 0, NULL, NULL, FALSE);
+		HANDLE h[2] = {p->wake, p->timer};
+		WaitForMultipleObjects(2, h, FALSE, 1000);
+	} else {
+		WaitForSingleObject(p->wake, us < 0 ? 200 : (DWORD)(us / 1000 + 1));
+	}
+#else
+	if (us < 0) {
+		mc_event_wait(p->wake, 200);
+	} else if (us > 2000) {
+		mc_event_wait(p->wake, (DWORD)((us - 1000) / 1000));
+	} else {
+		struct timespec ts = {0, (long)us * 1000};
+		nanosleep(&ts, NULL);
+	}
+#endif
+}
+
+MC_THREAD_FN(pacer_thread, param)
+{
+	struct mc_pacer *p = param;
+	os_set_thread_name("magercam-pace");
+	while (!p->stop) {
+		struct pace_slot *sl = NULL;
+		int64_t wait = -1;
+		EnterCriticalSection(&p->lock);
+		if (p->count) {
+			int64_t left = p->q[p->head].due_us - now_us();
+			if (left > 0) {
+				wait = left;
+			} else {
+				sl = &p->q[p->head];
+				p->busy = true;
+			}
+		}
+		LeaveCriticalSection(&p->lock);
+		if (!sl) {
+			pacer_sleep(p, wait);
+			continue;
+		}
+		pace_output(p->s, &sl->f);
+		EnterCriticalSection(&p->lock);
+		p->busy = false;
+		if (p->count) {
+			p->head = (p->head + 1) % PACE_SLOTS;
+			p->count--;
+		}
+		LeaveCriticalSection(&p->lock);
+	}
+	MC_THREAD_RETURN;
+}
+
+static struct mc_pacer *pacer_create(struct mc_source *s)
+{
+	struct mc_pacer *p = bzalloc(sizeof(*p));
+	p->s = s;
+	InitializeCriticalSection(&p->lock);
+	p->wake = mc_event_create();
+#ifdef _WIN32
+	/* обычный таймер Windows тикает по 15,6 мс, а кадры 60 к/с идут через 16,7: нужен таймер высокого разрешения */
+	p->timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+	if (!p->timer)
+		p->timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+#endif
+	p->has_thread = mc_thread_start(&p->thread, pacer_thread, p);
+	return p;
+}
+
+static void pacer_destroy(struct mc_pacer *p)
+{
+	if (!p)
+		return;
+	p->stop = true;
+	mc_event_set(p->wake);
+	if (p->has_thread)
+		mc_thread_join(p->thread);
+#ifdef _WIN32
+	if (p->timer)
+		CloseHandle(p->timer);
+#endif
+	mc_event_destroy(p->wake);
+	DeleteCriticalSection(&p->lock);
+	for (int i = 0; i < PACE_SLOTS; i++)
+		bfree(p->q[i].buf);
+	bfree(p);
+}
+
+/* wait — дождаться, пока кадр, который уже уходит в OBS, уйдёт: после этого можно чистить картинку */
+static void pacer_flush(struct mc_pacer *p, bool wait)
+{
+	EnterCriticalSection(&p->lock);
+	p->count = p->busy ? 1 : 0;
+	p->delay_valid = false;
+	LeaveCriticalSection(&p->lock);
+	while (wait) {
+		EnterCriticalSection(&p->lock);
+		bool busy = p->busy;
+		LeaveCriticalSection(&p->lock);
+		if (!busy)
+			break;
+		Sleep(1);
+	}
+}
+
+static void pacer_push(struct mc_pacer *p, const struct obs_source_frame2 *f, int64_t pts_us)
+{
+	int64_t now = now_us();
+	int64_t d = now - pts_us;
+	EnterCriticalSection(&p->lock);
+	/* больше секунды разницы — у телефона новые часы, старая оценка ни к чему */
+	if (!p->delay_valid || d > p->delay_us || p->delay_us - d > 1000000) {
+		if (!p->delay_valid || p->delay_us - d > 1000000) {
+			p->bucket_max[0] = p->bucket_max[1] = d;
+			p->bucket_start = now;
+		}
+		p->delay_us = d;
+		p->delay_valid = true;
+	}
+	if (now - p->bucket_start >= 1000000) {
+		p->bucket_max[1] = p->bucket_max[0];
+		p->bucket_max[0] = d;
+		p->bucket_start = now;
+	} else if (d > p->bucket_max[0]) {
+		p->bucket_max[0] = d;
+	}
+	int64_t recent = p->bucket_max[0] > p->bucket_max[1] ? p->bucket_max[0] : p->bucket_max[1];
+	if (p->delay_us > recent + 2000) {
+		/* лишнее срезаю на шестнадцатую часть за кадр, но не меньше миллисекунды: большой запас после заминки
+		 * уходит за секунду-другую, а маленький сползает почти незаметно для плавности */
+		int64_t excess = p->delay_us - recent - 2000;
+		int64_t step = excess / 16 > 1000 ? excess / 16 : 1000;
+		p->delay_us -= step < excess ? step : excess;
+	}
+	if (p->count >= PACE_SLOTS) {
+		if (!p->full_warned)
+			LOG(LOG_WARNING, "pacer queue full, dropping a frame");
+		p->full_warned = true;
+		LeaveCriticalSection(&p->lock);
+		return;
+	}
+	struct pace_slot *sl = &p->q[(p->head + p->count) % PACE_SLOTS];
+	copy_frame2(&sl->f, &sl->buf, &sl->cap, f);
+	sl->due_us = pts_us + p->delay_us;
+	p->count++;
+#ifdef MC_FRAME_PROBE
+	if (p->s->probe) {
+		p->s->probe->delay_sum += p->delay_us - d; /* сколько кадр ждёт в очереди сверх прихода */
+		p->s->probe->delay_n++;
+	}
+#endif
+	LeaveCriticalSection(&p->lock);
+	mc_event_set(p->wake);
+}
+
+static void output_frame(struct mc_source *s, const struct mc_frame *f, int rot, bool mirror, bool pace)
 {
 	struct obs_source_frame2 out = {0};
 	enum video_format fmt;
@@ -1049,7 +1375,30 @@ static void output_frame(struct mc_source *s, const struct mc_frame *f, int rot,
 
 	int64_t pts_us = f->pts_us;
 	out.timestamp = map_timestamp(s, pts_us, false);
-	obs_source_output_video2(s->source, &out);
+#ifdef MC_FRAME_PROBE
+	if (s->probe && s->probe->no_pacer)
+		pace = false;
+#endif
+	if (pace != s->pace_on) {
+		/* без развода кадры идут сразу, и то, что ещё ждёт в очереди, вышло бы позже них */
+		if (!pace)
+			pacer_flush(s->pacer, true);
+		LOG(LOG_INFO, "video: %s", pace ? "b-frames, pacing decoder output" : "showing frames as they come");
+		s->pace_on = pace;
+	}
+#ifdef MC_FRAME_PROBE
+	struct mc_probe *pr = s->probe;
+	if (pr) {
+		int code = (int)(pr->decoded++ & 0xFFFF);
+		/* штамп пишу в копию: кадр декодера может быть опорным для следующих */
+		copy_frame2(&out, &pr->buf, &pr->cap, &out);
+		probe_stamp(&out, code);
+	}
+#endif
+	if (pace)
+		pacer_push(s->pacer, &out, pts_us);
+	else
+		pace_output(s, &out);
 	s->had_video = true;
 	s->ever_video = true;
 }
@@ -1058,6 +1407,7 @@ struct frame_ctx {
 	struct mc_source *s;
 	int rot;
 	bool mirror;
+	bool pace;
 };
 
 static void on_frame(void *opaque, const struct mc_frame *f)
@@ -1091,11 +1441,11 @@ static void on_frame(void *opaque, const struct mc_frame *f)
 	}
 	s->last_out_pts = f->pts_us;
 	s->out_valid = true;
-	output_frame(s, f, c->rot, c->mirror);
+	output_frame(s, f, c->rot, c->mirror, c->pace);
 }
 
 static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, int64_t pts, bool key, int rot,
-			  bool mirror)
+			  bool mirror, bool low_latency)
 {
 	if (!s->dec)
 		return;
@@ -1103,7 +1453,7 @@ static void decode_packet(struct mc_source *s, const uint8_t *data, size_t len, 
 		return;
 	s->need_key = false;
 
-	struct frame_ctx c = {s, rot, mirror};
+	struct frame_ctx c = {s, rot, mirror, s->stream_reorder && low_latency};
 	switch (g_ff->decode(s->dec, data, len, pts, key, on_frame, &c)) {
 	case MC_DEC_NEED_KEY:
 		s->need_key = true;
@@ -1166,6 +1516,109 @@ static void parse_formats(struct mc_source *s, const char *json)
 	LeaveCriticalSection(&s->lock);
 }
 
+/* массив строк ["off","low"] складываю в "off,low" */
+static void parse_str_list(const char *json, const char *key, char *out, size_t sz)
+{
+	out[0] = 0;
+	const char *p = json_array_body(json, key);
+	size_t n = 0;
+	while (p && *p && *p != ']') {
+		if (*p == '"') {
+			const char *e = strchr(p + 1, '"');
+			if (!e)
+				break;
+			int len = (int)(e - p - 1);
+			if (n + (size_t)len + 2 < sz)
+				n += (size_t)snprintf(out + n, sz - n, "%s%.*s", n ? "," : "", len, p + 1);
+			p = e;
+		}
+		p++;
+	}
+}
+
+static void read_phone_img(struct mc_phone_img *ph, obs_data_t *d, const char *json)
+{
+	ph->valid = true;
+	ph->seq++;
+	snprintf(ph->name, sizeof(ph->name), "%s", obs_data_get_string(d, "name"));
+	snprintf(ph->app, sizeof(ph->app), "%s", obs_data_get_string(d, "app"));
+	ph->zoom = obs_data_get_double(d, "zoom");
+	ph->zoom_min = obs_data_has_user_value(d, "zoom_min") ? obs_data_get_double(d, "zoom_min") : 1.0;
+	ph->zoom_max = obs_data_get_double(d, "zoom_max");
+	ph->ev = obs_data_get_double(d, "ev");
+	ph->ev_min = obs_data_get_double(d, "ev_min");
+	ph->ev_max = obs_data_get_double(d, "ev_max");
+	ph->bg_strength = obs_data_get_double(d, "bg_strength");
+	snprintf(ph->wb, sizeof(ph->wb), "%s", obs_data_get_string(d, "wb"));
+	snprintf(ph->focus, sizeof(ph->focus), "%s", obs_data_get_string(d, "focus"));
+	snprintf(ph->antibanding, sizeof(ph->antibanding), "%s", obs_data_get_string(d, "antibanding"));
+	snprintf(ph->bg, sizeof(ph->bg), "%s", obs_data_get_string(d, "bg"));
+	snprintf(ph->profile, sizeof(ph->profile), "%s", obs_data_get_string(d, "profile"));
+	ph->has_wb_temp = obs_data_has_user_value(d, "wb_temp");
+	ph->wb_temp = (int)obs_data_get_int(d, "wb_temp");
+	ph->wb_tint = (int)obs_data_get_int(d, "wb_tint");
+	ph->has_wb_manual = obs_data_get_bool(d, "wb_manual_available");
+	ph->has_flash = obs_data_get_bool(d, "has_flash");
+	ph->torch = obs_data_get_bool(d, "torch");
+	ph->framing_available = !obs_data_has_user_value(d, "framing_available") || obs_data_get_bool(d, "framing_available");
+	ph->framing = obs_data_get_bool(d, "framing");
+	ph->stab = obs_data_get_bool(d, "stab");
+	ph->lock = obs_data_get_bool(d, "lock");
+	ph->rec = obs_data_get_bool(d, "rec");
+	ph->has_sharp = obs_data_has_user_value(d, "sharp");
+	ph->has_nr = obs_data_has_user_value(d, "nr");
+	snprintf(ph->sharp, sizeof(ph->sharp), "%s", obs_data_get_string(d, "sharp"));
+	snprintf(ph->nr, sizeof(ph->nr), "%s", obs_data_get_string(d, "nr"));
+	parse_str_list(json, "sharp_modes", ph->sharp_modes, sizeof(ph->sharp_modes));
+	parse_str_list(json, "nr_modes", ph->nr_modes, sizeof(ph->nr_modes));
+	ph->has_sharp_amount = obs_data_has_user_value(d, "sharp_amount");
+	ph->sharp_amount = (int)obs_data_get_int(d, "sharp_amount");
+	ph->has_exp = obs_data_has_user_value(d, "exp_us");
+	ph->exp_us = (int)obs_data_get_int(d, "exp_us");
+	ph->iso = (int)obs_data_get_int(d, "iso");
+	ph->iso_max = (int)obs_data_get_int(d, "iso_max");
+	ph->frame_us = (int)obs_data_get_int(d, "exp_max_us");
+}
+
+/* Телефон старше плагина молча пропускает незнакомые ключи, и ручной баланс или авто-битрейт просто не работают.
+ * Узнаю это по отсутствию полей в статусе и пишу в строку статуса; в лог — один раз, пока подсказка не сменится. */
+static void update_old_phone_hint(struct mc_source *s, obs_data_t *d)
+{
+	const struct mc_config *c = &s->cfg;
+	const char *miss[4];
+	int n = 0;
+	if (c->control && strcmp(c->wb, "manual") == 0 && !obs_data_has_user_value(d, "wb_manual_available"))
+		miss[n++] = "ручной баланс белого";
+	if (c->bitrate_auto && !s->profile_live[0] && !obs_data_has_user_value(d, "bitrate_auto"))
+		miss[n++] = "авто-битрейт";
+	if (c->quality && !obs_data_has_user_value(d, "enc"))
+		miss[n++] = "режим «Качество»";
+	if (c->control && (strcmp(c->sharp, "default") != 0 || strcmp(c->nr, "default") != 0) &&
+	    !obs_data_has_user_value(d, "sharp"))
+		miss[n++] = "резкость и шумоподавление";
+	else if (c->control && c->sharp_amount && !obs_data_has_user_value(d, "sharp_amount"))
+		miss[n++] = "доп. резкость";
+	char hint[sizeof(s->hint)] = "";
+	if (n) {
+		char list[200] = "";
+		for (int i = 0; i < n; i++) {
+			size_t o = strlen(list);
+			snprintf(list + o, sizeof(list) - o, "%s%s", i == 0 ? "" : i == n - 1 ? " и " : ", ", miss[i]);
+		}
+		const char *app = obs_data_get_string(d, "app");
+		char ver[40] = "";
+		if (*app)
+			snprintf(ver, sizeof(ver), " (%s)", app);
+		snprintf(hint, sizeof(hint), "На телефоне старая версия MagerCam%s — обновите до " MC_PHONE_VERSION
+			 ", иначе не %s %s", ver, n > 1 ? "работают" : "работает", list);
+	}
+	if (strcmp(hint, s->hint) != 0) {
+		snprintf(s->hint, sizeof(s->hint), "%s", hint);
+		if (*hint)
+			LOG(LOG_WARNING, "%s", hint);
+	}
+}
+
 static void apply_status_json(struct mc_source *s, const char *json)
 {
 	obs_data_t *d = obs_data_create_from_json(json);
@@ -1183,6 +1636,8 @@ static void apply_status_json(struct mc_source *s, const char *json)
 	}
 	s->phone_rec = obs_data_get_bool(d, "rec");
 	snprintf(s->profile_live, sizeof(s->profile_live), "%s", obs_data_get_string(d, "profile"));
+	read_phone_img(&s->ph, d, json);
+	update_old_phone_hint(s, d);
 	LeaveCriticalSection(&s->lock);
 	char extra[256] = "";
 	int br = (int)obs_data_get_int(d, "bitrate_now");
@@ -1245,6 +1700,8 @@ static void build_stream_query(struct dstr *q, const struct mc_config *c, const 
 			dstr_catf(q, "&wb_temp=%d&wb_tint=%d", c->wb_temp, c->wb_tint);
 		dstr_cat(q, "&antibanding=");
 		url_encode(q, c->antibanding);
+		/* старый телефон эти ключи пропустит */
+		dstr_catf(q, "&sharp=%s&nr=%s&sharp_amount=%d", c->sharp, c->nr, c->sharp_amount);
 	}
 }
 
@@ -1399,6 +1856,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 		EnterCriticalSection(&s->lock);
 		int rot = s->rotation < 0 ? s->phone_orient : s->rotation;
 		bool mirror = s->mirror;
+		bool low_latency = s->low_latency;
 		LeaveCriticalSection(&s->lock);
 
 		switch (type) {
@@ -1409,7 +1867,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 			s->lat_valid = false;
 			s->lagging = false;
 			decoder_open(s, cfg->hw_decode);
-			decode_packet(s, s->payload, len, pts, true, rot, mirror);
+			decode_packet(s, s->payload, len, pts, true, rot, mirror, low_latency);
 			s->need_key = true;
 			break;
 		case PKT_VIDEO_FRAME:
@@ -1418,7 +1876,7 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 				s->need_key = true;
 				break;
 			}
-			decode_packet(s, s->payload, len, pts, key, rot, mirror);
+			decode_packet(s, s->payload, len, pts, key, rot, mirror, low_latency);
 			break;
 		case PKT_AUDIO_CONFIG:
 			if (len >= 5) {
@@ -1456,9 +1914,15 @@ static bool stream_session(struct mc_source *s, const struct mc_config *cfg, LON
 	bool was_connected = s->connected;
 	s->connected = false;
 	bool clear = s->clear_on_disconnect;
+	s->ph.valid = false;
+	s->ph.seq++;
+	s->hint[0] = 0;
 	LeaveCriticalSection(&s->lock);
 	closesocket(sock);
 	decoder_close(s);
+	/* кадры прежней сессии в очереди уже ни к чему, а после чистки картинки не должно прийти ни одного */
+	pacer_flush(s->pacer, true);
+	s->pace_on = false;
 
 	if (was_connected) {
 		if (!s->stop && s->gen == gen)
@@ -1556,6 +2020,31 @@ static void send_control(struct mc_source *s, const char *query)
 		bfree(r);
 }
 
+#ifdef _WIN32
+obs_source_t *mc_obs_source(struct mc_source *s)
+{
+	return s->source;
+}
+
+void mc_get_phone_img(struct mc_source *s, struct mc_phone_img *out)
+{
+	EnterCriticalSection(&s->lock);
+	*out = s->ph;
+	out->connected = s->connected;
+	LeaveCriticalSection(&s->lock);
+}
+
+void mc_send_control_query(struct mc_source *s, const char *query)
+{
+	send_control(s, query);
+}
+
+const char *mc_phone_version(void)
+{
+	return MC_PHONE_VERSION;
+}
+#endif
+
 static const char *mc_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -1600,6 +2089,9 @@ static void mc_defaults(obs_data_t *st)
 	obs_data_set_default_double(st, "bg_strength", 0.6);
 	obs_data_set_default_bool(st, "framing", false);
 	obs_data_set_default_bool(st, "lock", false);
+	obs_data_set_default_string(st, "sharp", "default");
+	obs_data_set_default_string(st, "nr", "default");
+	obs_data_set_default_int(st, "sharp_amount", 0);
 }
 
 static void read_config(obs_data_t *st, struct mc_config *c)
@@ -1646,6 +2138,19 @@ static void read_config(obs_data_t *st, struct mc_config *c)
 	c->bg_strength = obs_data_get_double(st, "bg_strength");
 	c->framing = obs_data_get_bool(st, "framing");
 	c->lock = obs_data_get_bool(st, "lock");
+	/* в запрос значения идут как есть, поэтому беру только известные */
+	static const char *const levels[] = {"off", "low", "default", "high"};
+	const char *sh = obs_data_get_string(st, "sharp"), *nr = obs_data_get_string(st, "nr");
+	int amount = (int)obs_data_get_int(st, "sharp_amount");
+	c->sharp_amount = amount < -100 ? -100 : amount > 100 ? 100 : amount;
+	snprintf(c->sharp, sizeof(c->sharp), "default");
+	snprintf(c->nr, sizeof(c->nr), "default");
+	for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+		if (strcmp(sh, levels[i]) == 0)
+			snprintf(c->sharp, sizeof(c->sharp), "%s", levels[i]);
+		if (strcmp(nr, levels[i]) == 0)
+			snprintf(c->nr, sizeof(c->nr), "%s", levels[i]);
+	}
 }
 
 static bool stream_params_differ(const struct mc_config *a, const struct mc_config *b)
@@ -1745,6 +2250,12 @@ static void mc_update(void *data, obs_data_t *st)
 		}
 		if (old.stab != c.stab || !old.control)
 			dstr_catf(&q, "&stab=%d", c.stab ? 1 : 0);
+		if (strcmp(old.sharp, c.sharp) != 0 || !old.control)
+			dstr_catf(&q, "&sharp=%s", c.sharp);
+		if (strcmp(old.nr, c.nr) != 0 || !old.control)
+			dstr_catf(&q, "&nr=%s", c.nr);
+		if (old.sharp_amount != c.sharp_amount || !old.control)
+			dstr_catf(&q, "&sharp_amount=%d", c.sharp_amount);
 		if (old.framing != c.framing || !old.control)
 			dstr_catf(&q, "&framing=%d", c.framing ? 1 : 0);
 		if (old.lock != c.lock || !old.control)
@@ -1771,6 +2282,14 @@ static void *mc_create(obs_data_t *st, obs_source_t *source)
 	InitializeCriticalSection(&s->lock);
 	s->wake = mc_event_create();
 	snprintf(s->status, sizeof(s->status), "Запуск…");
+	s->pacer = pacer_create(s);
+#ifdef MC_FRAME_PROBE
+	s->probe = bzalloc(sizeof(*s->probe));
+	s->probe->s = s;
+	s->probe->no_pacer = getenv("MAGERCAM_NO_PACER") != NULL;
+	obs_add_raw_video_callback(NULL, probe_render, s->probe);
+	LOG(LOG_INFO, "frame probe on, pacer %s", s->probe->no_pacer ? "disabled" : "enabled");
+#endif
 	mc_update(s, st);
 	s->showing = obs_source_showing(source);
 	s->has_thread = mc_thread_start(&s->thread, net_thread, s);
@@ -1780,10 +2299,19 @@ static void *mc_create(obs_data_t *st, obs_source_t *source)
 static void mc_destroy(void *data)
 {
 	struct mc_source *s = data;
+#ifdef _WIN32
+	imgwin_source_gone(s);
+#endif
 	s->stop = true;
 	force_reconnect(s);
 	if (s->has_thread)
 		mc_thread_join(s->thread);
+	pacer_destroy(s->pacer);
+#ifdef MC_FRAME_PROBE
+	obs_remove_raw_video_callback(probe_render, s->probe);
+	bfree(s->probe->buf);
+	bfree(s->probe);
+#endif
 	mc_event_destroy(s->wake);
 	DeleteCriticalSection(&s->lock);
 	bfree(s->rot_buf);
@@ -1870,15 +2398,6 @@ static bool on_bitrate_auto_changed(obs_properties_t *props, obs_property_t *p, 
 	return true;
 }
 
-static bool on_wb_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *st)
-{
-	UNUSED_PARAMETER(p);
-	bool manual = strcmp(obs_data_get_string(st, "wb"), "manual") == 0;
-	obs_property_set_visible(obs_properties_get(props, "wb_temp"), manual);
-	obs_property_set_visible(obs_properties_get(props, "wb_tint"), manual);
-	return true;
-}
-
 static bool on_discover(obs_properties_t *props, obs_property_t *p, void *data)
 {
 	UNUSED_PARAMETER(p);
@@ -1899,34 +2418,6 @@ static bool on_reconnect(obs_properties_t *props, obs_property_t *p, void *data)
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
 	force_reconnect(data);
-	return false;
-}
-
-static bool on_torch(obs_properties_t *props, obs_property_t *p, void *data)
-{
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	send_control(data, "torch=toggle");
-	return false;
-}
-
-static bool on_record(obs_properties_t *props, obs_property_t *p, void *data)
-{
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	struct mc_source *s = data;
-	EnterCriticalSection(&s->lock);
-	bool rec = s->phone_rec;
-	LeaveCriticalSection(&s->lock);
-	send_control(s, rec ? "rec=0" : "rec=1");
-	return false;
-}
-
-static bool on_autofocus(obs_properties_t *props, obs_property_t *p, void *data)
-{
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	send_control(data, "af=trigger&x=0.5&y=0.5");
 	return false;
 }
 
@@ -1962,15 +2453,176 @@ static bool on_switch_camera(obs_properties_t *props, obs_property_t *p, void *d
 	return true;
 }
 
+/* выдержку в саму строку статуса не кладу: она меняется каждую секунду, а каждая смена статуса пишется в лог */
+static void format_status(struct mc_source *s, char *buf, size_t sz)
+{
+	EnterCriticalSection(&s->lock);
+	char expo[96];
+	bool dark = false;
+	bool have = s->connected && mc_format_exposure(&s->ph, expo, sizeof(expo), &dark);
+	size_t o = (size_t)snprintf(buf, sz, "Статус: %s", s->status);
+	if (have && o < sz)
+		o += (size_t)snprintf(buf + o, sz - o, "\n%s%s", expo, dark ? " — " MC_DARK_HINT : "");
+	if (s->hint[0] && o < sz)
+		snprintf(buf + o, sz - o, "\n⚠ %s", s->hint);
+	LeaveCriticalSection(&s->lock);
+}
+
 static bool on_refresh_status(obs_properties_t *props, obs_property_t *p, void *data)
 {
 	UNUSED_PARAMETER(p);
-	struct mc_source *s = data;
-	EnterCriticalSection(&s->lock);
-	obs_property_set_description(obs_properties_get(props, "status"), s->status);
-	LeaveCriticalSection(&s->lock);
+	char status[800];
+	format_status(data, status, sizeof(status));
+	obs_property_set_description(obs_properties_get(props, "status"), status);
 	return true;
 }
+
+#ifdef _WIN32
+static bool on_image_settings(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	imgwin_open(data);
+	return false;
+}
+#else
+/* В Windows это всё в отдельном окне, а здесь — в группе, которая раскрывается галочкой: свёрнутая группа
+ * не загромождает подключение. Сворачивать группы OBS не умеет, поэтому содержимое прячу сам. */
+static const char *const image_keys[] = {"expo", "control", "torch", "autofocus", "zoom", "ev", "focus", "wb", "wb_temp",
+					 "wb_tint", "antibanding", "sharp", "sharp_amount", "nr", "stab", "lock", "profile", "framing",
+					 "bg", "bg_strength", "record", "rotation", "mirror"};
+
+static void sync_image_group(obs_properties_t *props, obs_data_t *st)
+{
+	bool open = obs_data_get_bool(st, "grp_image");
+	bool manual = strcmp(obs_data_get_string(st, "wb"), "manual") == 0;
+	for (size_t i = 0; i < sizeof(image_keys) / sizeof(image_keys[0]); i++) {
+		bool wb_part = strcmp(image_keys[i], "wb_temp") == 0 || strcmp(image_keys[i], "wb_tint") == 0;
+		obs_property_set_visible(obs_properties_get(props, image_keys[i]), open && (!wb_part || manual));
+	}
+}
+
+static bool on_image_group_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *st)
+{
+	UNUSED_PARAMETER(p);
+	sync_image_group(props, st);
+	return true;
+}
+
+static bool on_torch(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	send_control(data, "torch=toggle");
+	return false;
+}
+
+static bool on_record(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	struct mc_source *s = data;
+	EnterCriticalSection(&s->lock);
+	bool rec = s->phone_rec;
+	LeaveCriticalSection(&s->lock);
+	send_control(s, rec ? "rec=0" : "rec=1");
+	return false;
+}
+
+static bool on_autofocus(obs_properties_t *props, obs_property_t *p, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(p);
+	send_control(data, "af=trigger&x=0.5&y=0.5");
+	return false;
+}
+
+static void add_levels(obs_property_t *p)
+{
+	obs_property_list_add_string(p, "Выкл", "off");
+	obs_property_list_add_string(p, "Слабая", "low");
+	obs_property_list_add_string(p, "Стандарт (как у камеры)", "default");
+	obs_property_list_add_string(p, "Сильная", "high");
+}
+
+static void add_image_group(obs_properties_t *props, struct mc_source *s)
+{
+	obs_property_t *p;
+	obs_properties_t *img = obs_properties_create();
+	char expo[200] = "Выдержка и ISO — после подключения к телефону";
+	if (s) {
+		char e[96];
+		bool dark = false;
+		EnterCriticalSection(&s->lock);
+		if (s->connected && mc_format_exposure(&s->ph, e, sizeof(e), &dark))
+			snprintf(expo, sizeof(expo), "%s%s", e, dark ? " — " MC_DARK_HINT : "");
+		LeaveCriticalSection(&s->lock);
+	}
+	obs_properties_add_text(img, "expo", expo, OBS_TEXT_INFO);
+	obs_properties_add_bool(img, "control", "Управлять камерой из OBS");
+	obs_properties_add_button(img, "torch", "Фонарик вкл/выкл", on_torch);
+	obs_properties_add_button(img, "autofocus", "Сфокусироваться (по центру)", on_autofocus);
+	p = obs_properties_add_list(img, "profile", "Профиль", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Свои настройки", "");
+	obs_property_list_add_string(p, "Звонок (720p, следить за лицом)", "call");
+	obs_property_list_add_string(p, "Стрим (1080p60)", "stream");
+	obs_property_list_add_string(p, "Документ", "doc");
+	obs_properties_add_float_slider(img, "zoom", "Зум", 1.0, 10.0, 0.1);
+	obs_properties_add_float_slider(img, "ev", "Экспозиция (EV)", -3.0, 3.0, 0.1);
+	p = obs_properties_add_list(img, "focus", "Фокус", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Непрерывный автофокус", "continuous");
+	obs_property_list_add_string(p, "Автофокус по кнопке", "auto");
+	obs_property_list_add_string(p, "Бесконечность", "infinity");
+	obs_property_list_add_string(p, "Макро", "macro");
+	p = obs_properties_add_list(img, "wb", "Баланс белого", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Авто", "auto");
+	obs_property_list_add_string(p, "Дневной свет", "daylight");
+	obs_property_list_add_string(p, "Облачно", "cloudy");
+	obs_property_list_add_string(p, "Тень", "shade");
+	obs_property_list_add_string(p, "Лампа накаливания", "incandescent");
+	obs_property_list_add_string(p, "Флуоресцентная лампа", "fluorescent");
+	obs_property_list_add_string(p, "Сумерки", "twilight");
+	obs_property_list_add_string(p, "Вручную (температура)", "manual");
+	obs_property_set_modified_callback(p, on_image_group_changed);
+	p = obs_properties_add_int_slider(img, "wb_temp", "Температура, K", 2000, 10000, 100);
+	obs_property_set_long_description(p, "Температура света, который должен стать белым: под лампой 3200 K ставьте "
+					     "3200. Меньше — картинка холоднее, больше — теплее.");
+	obs_properties_add_int_slider(img, "wb_tint", "Оттенок (− зелень, + пурпур)", -50, 50, 1);
+	p = obs_properties_add_list(img, "antibanding", "Антимерцание", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Авто", "auto");
+	obs_property_list_add_string(p, "50 Гц (Россия/Европа)", "50");
+	obs_property_list_add_string(p, "60 Гц", "60");
+	obs_property_list_add_string(p, "Выкл", "off");
+	p = obs_properties_add_list(img, "sharp", "Резкость камеры", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	add_levels(p);
+	obs_property_set_long_description(p, "Обработка камеры телефона. Если вокруг контуров светлые ореолы, ставьте «Слабая» "
+					     "или «Выкл». Уровень, которого камера не умеет, телефон не применит.");
+	p = obs_properties_add_int_slider(img, "sharp_amount", "Доп. резкость (− мягче, + резче)", -100, 100, 1);
+	obs_property_set_long_description(p, "Для мягкой картинки: камера — Выкл, ползунок по вкусу.");
+	p = obs_properties_add_list(img, "nr", "Шумоподавление", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	add_levels(p);
+	obs_property_set_long_description(p, "При слабом свете сильное шумоподавление делает кожу «восковой»: тогда «Слабая».");
+	obs_properties_add_bool(img, "stab", "Стабилизация видео");
+	obs_properties_add_bool(img, "lock", "Зафиксировать экспозицию и баланс белого");
+	obs_properties_add_bool(img, "framing", "Следить за лицом (автокадрирование)");
+	p = obs_properties_add_list(img, "bg", "Фон", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, "Без обработки", "off");
+	obs_property_list_add_string(p, "Размыть", "blur");
+	obs_property_list_add_string(p, "Заменить картинкой (выбирается на телефоне или в программе для Windows)", "image");
+	obs_properties_add_float_slider(img, "bg_strength", "Сила размытия", 0.0, 1.0, 0.05);
+	obs_properties_add_button(img, "record", "Запись на телефоне: старт/стоп", on_record);
+	p = obs_properties_add_list(img, "rotation", "Поворот", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, "Авто (по положению телефона)", -1);
+	obs_property_list_add_int(p, "0°", 0);
+	obs_property_list_add_int(p, "90°", 90);
+	obs_property_list_add_int(p, "180°", 180);
+	obs_property_list_add_int(p, "270°", 270);
+	obs_properties_add_bool(img, "mirror", "Отразить по горизонтали");
+	p = obs_properties_add_group(props, "grp_image", "Настройки изображения (галочка — показать)", OBS_GROUP_CHECKABLE,
+				     img);
+	obs_property_set_modified_callback(p, on_image_group_changed);
+}
+#endif
 
 static obs_properties_t *mc_properties(void *data)
 {
@@ -1978,14 +2630,16 @@ static obs_properties_t *mc_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
 
-	char status[440] = "Статус: —";
-	if (s) {
-		EnterCriticalSection(&s->lock);
-		snprintf(status, sizeof(status), "Статус: %s", s->status);
-		LeaveCriticalSection(&s->lock);
-	}
+	char status[800] = "Статус: —";
+	if (s)
+		format_status(s, status, sizeof(status));
 	p = obs_properties_add_text(props, "status", status, OBS_TEXT_INFO);
 	obs_properties_add_button(props, "refresh_status", "Обновить статус", on_refresh_status);
+#ifdef _WIN32
+	p = obs_properties_add_button(props, "image_settings", "Настройки изображения…", on_image_settings);
+	obs_property_set_long_description(p, "Зум, экспозиция, баланс белого, резкость, фон, поворот и прочее — в отдельном "
+					     "окне, которое можно держать открытым рядом с OBS.");
+#endif
 
 	obs_properties_t *conn = obs_properties_create();
 	p = obs_properties_add_list(conn, "conn", "Подключение", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -2058,7 +2712,7 @@ static obs_properties_t *mc_properties(void *data)
 	}
 	p = obs_properties_add_bool(vid, "bitrate_auto", "Подбирать битрейт автоматически");
 	obs_property_set_long_description(p, "Телефон сам выберет битрейт под разрешение, частоту кадров и кодек "
-					     "(например, 1080p 30 — около 12 Мбит/с). Адаптивный битрейт при плохой сети "
+					     "(например, 1080p 30 — около 18 Мбит/с). Адаптивный битрейт при плохой сети "
 					     "по-прежнему снижает его.");
 	obs_property_set_modified_callback(p, on_bitrate_auto_changed);
 	p = obs_properties_add_int_slider(vid, "bitrate", "Битрейт (Мбит/с)", 1, 50, 1);
@@ -2082,64 +2736,12 @@ static obs_properties_t *mc_properties(void *data)
 				p, "Остальные объективы (широкоугольный, телефото) появятся после подключения к телефону");
 	}
 	obs_properties_add_button(vid, "switch_camera", "Сменить камеру", on_switch_camera);
-	p = obs_properties_add_list(vid, "rotation", "Поворот", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(p, "Авто (по положению телефона)", -1);
-	obs_property_list_add_int(p, "0°", 0);
-	obs_property_list_add_int(p, "90°", 90);
-	obs_property_list_add_int(p, "180°", 180);
-	obs_property_list_add_int(p, "270°", 270);
-	obs_properties_add_bool(vid, "mirror", "Отразить по горизонтали");
 	obs_properties_add_bool(vid, "audio", "Передавать звук с микрофона телефона");
 	obs_properties_add_group(props, "grp_video", "Видео и звук", OBS_GROUP_NORMAL, vid);
 
-	obs_properties_t *cam = obs_properties_create();
-	obs_properties_add_bool(cam, "control", "Управлять камерой из OBS");
-	obs_properties_add_button(cam, "torch", "Фонарик вкл/выкл", on_torch);
-	obs_properties_add_button(cam, "autofocus", "Сфокусироваться (по центру)", on_autofocus);
-	obs_properties_add_float_slider(cam, "zoom", "Зум", 1.0, 10.0, 0.1);
-	obs_properties_add_float_slider(cam, "ev", "Экспозиция (EV)", -3.0, 3.0, 0.1);
-	p = obs_properties_add_list(cam, "focus", "Фокус", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "Непрерывный автофокус", "continuous");
-	obs_property_list_add_string(p, "Автофокус по кнопке", "auto");
-	obs_property_list_add_string(p, "Бесконечность", "infinity");
-	obs_property_list_add_string(p, "Макро", "macro");
-	p = obs_properties_add_list(cam, "wb", "Баланс белого", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "Авто", "auto");
-	obs_property_list_add_string(p, "Дневной свет", "daylight");
-	obs_property_list_add_string(p, "Облачно", "cloudy");
-	obs_property_list_add_string(p, "Тень", "shade");
-	obs_property_list_add_string(p, "Лампа накаливания", "incandescent");
-	obs_property_list_add_string(p, "Флуоресцентная лампа", "fluorescent");
-	obs_property_list_add_string(p, "Сумерки", "twilight");
-	obs_property_list_add_string(p, "Вручную (температура)", "manual");
-	obs_property_set_modified_callback(p, on_wb_changed);
-	p = obs_properties_add_int_slider(cam, "wb_temp", "Температура, K", 2000, 10000, 100);
-	obs_property_set_long_description(p, "Температура света, который должен стать белым: под лампой 3200 K ставьте "
-					     "3200. Меньше — картинка холоднее, больше — теплее.");
-	obs_properties_add_int_slider(cam, "wb_tint", "Оттенок (− зелень, + пурпур)", -50, 50, 1);
-	p = obs_properties_add_list(cam, "antibanding", "Антимерцание", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "Авто", "auto");
-	obs_property_list_add_string(p, "50 Гц (Россия/Европа)", "50");
-	obs_property_list_add_string(p, "60 Гц", "60");
-	obs_property_list_add_string(p, "Выкл", "off");
-	obs_properties_add_bool(cam, "stab", "Стабилизация видео");
-	obs_properties_add_group(props, "grp_cam", "Управление камерой", OBS_GROUP_NORMAL, cam);
-
-	obs_properties_t *fx = obs_properties_create();
-	p = obs_properties_add_list(fx, "profile", "Профиль", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "Свои настройки", "");
-	obs_property_list_add_string(p, "Звонок (720p, следить за лицом)", "call");
-	obs_property_list_add_string(p, "Стрим (1080p60)", "stream");
-	obs_property_list_add_string(p, "Документ", "doc");
-	p = obs_properties_add_list(fx, "bg", "Фон", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "Без обработки", "off");
-	obs_property_list_add_string(p, "Размыть", "blur");
-	obs_property_list_add_string(p, "Заменить картинкой (выбирается на телефоне или в программе для Windows)", "image");
-	obs_properties_add_float_slider(fx, "bg_strength", "Сила размытия", 0.0, 1.0, 0.05);
-	obs_properties_add_bool(fx, "framing", "Следить за лицом (автокадрирование)");
-	obs_properties_add_bool(fx, "lock", "Зафиксировать экспозицию и баланс белого");
-	obs_properties_add_button(fx, "record", "Запись на телефоне: старт/стоп", on_record);
-	obs_properties_add_group(props, "grp_fx", "Функции телефона", OBS_GROUP_NORMAL, fx);
+#ifndef _WIN32
+	add_image_group(props, s);
+#endif
 
 	obs_properties_t *adv = obs_properties_create();
 	obs_properties_add_bool(adv, "low_latency", "Минимальная задержка (без буферизации)");
@@ -2176,6 +2778,7 @@ bool obs_module_load(void)
 #endif
 	InitializeCriticalSection(&g_found_lock);
 #ifdef _WIN32
+	imgwin_init();
 	/* сначала то, что OBS уже загрузил сам, иначе ищу рядом с obs64.exe; новые версии вперёд */
 	const struct mc_ffapi *(*const variants[])(bool) = {mc_ff8_api, mc_ff7_api, mc_ff6_api};
 	for (int pass = 0; pass < 2 && !g_ff; pass++)
@@ -2194,6 +2797,7 @@ void obs_module_unload(void)
 {
 	DeleteCriticalSection(&g_found_lock);
 #ifdef _WIN32
+	imgwin_free();
 	WSACleanup();
 #endif
 }

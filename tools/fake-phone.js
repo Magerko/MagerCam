@@ -1,10 +1,13 @@
 // Притворяюсь телефоном MagerCam, чтобы проверять плагин OBS без настоящего телефона.
 // Тестовую картинку и тон 440 Гц генерирую через ffmpeg и отдаю по протоколу docs/PROTOCOL.md.
-// Запуск: node tools/fake-phone.js [port] [--key 123456] [--stall] [--bframes [--no-reorder-flag]] [--old]
+// Запуск: node tools/fake-phone.js [port] [--key 123456] [--stall] [--bframes [--no-reorder-flag]] [--old] [--dark] [--limited]
+//   [--no-discovery]   (не отвечать на автопоиск: чтобы другой OBS в этой сети не увидел поддельный телефон)
 // С --key требую код доступа даже с localhost, иначе проверить его на одном компьютере нельзя.
 // --bframes: кодирую с B-кадрами (как режим «Качество» на телефоне), pts беру из MPEG-TS, кадры идут в порядке
 // декодирования и с флагом B-кадров в VIDEO_CONFIG; --no-reorder-flag этот флаг не ставит (так видно, что будет
-// у клиента, который о B-кадрах не знает). --old: веду себя как телефон до bitrate=auto, enc и ручного баланса белого.
+// у клиента, который о B-кадрах не знает). --old: веду себя как телефон 1.2 — без bitrate=auto, enc, ручного баланса,
+// резкости и шумоподавления, версии приложения и выдержки в статусе. --dark: камера в темноте (выдержка во весь кадр,
+// высокий ISO). --limited: камера умеет не все уровни резкости и шумоподавления.
 'use strict';
 const net = require('net');
 const dgram = require('dgram');
@@ -19,6 +22,9 @@ const STALL = args.includes('--stall');
 const BFRAMES = args.includes('--bframes');
 const REORDER_FLAG = !args.includes('--no-reorder-flag');
 const OLD = args.includes('--old');
+const DARK = args.includes('--dark');
+const LIMITED = args.includes('--limited');
+const LEVELS = ['off', 'low', 'default', 'high'];
 const state = {
   name: 'Fake Phone (' + os.hostname() + ')', ver: 2, auth: !!KEY,
   profile: '', codec: 'h264', codec_pref: 'auto', hevc: true, abr: true, bitrate_now: 4000,
@@ -34,6 +40,10 @@ const state = {
   orient: 0, audio: true, torch: false, zoom: 1, zoom_max: 8, ev: 0, ev_min: -2, ev_max: 2,
   focus: 'continuous', wb: 'auto', antibanding: 'auto', stab: false,
   wb_temp: 5000, wb_tint: 0, wb_manual: 'none', wb_manual_available: true,
+  app: '1.3.0',
+  sharp: 'default', nr: 'default', sharp_amount: 0,
+  sharp_modes: LIMITED ? ['off', 'default'] : LEVELS, nr_modes: LIMITED ? ['default', 'high'] : LEVELS,
+  iso_max: 6400,
   battery: 77, charging: false, temp: 30, clients: 0,
 };
 const t0 = process.hrtime.bigint();
@@ -50,7 +60,7 @@ function packet(type, payload, pts, key, hevc, reorder) {
 
 // та же формула, что Core.autoBitrate на телефоне
 function autoBitrate(w, h, fps, hevc) {
-  let k = 12000 * Math.pow(w * h / 2073600, 0.9) * Math.pow(fps / 30, 0.6);
+  let k = 18000 * Math.pow(w * h / 2073600, 0.9) * Math.pow(fps / 30, 0.6);
   if (hevc) k *= 0.65;
   return Math.min(50000, Math.max(2000, Math.round(k / 500) * 500));
 }
@@ -66,6 +76,11 @@ function applyParams(q) {
     }
     else if (k === 'enc') { if (!OLD && (v === 'latency' || v === 'quality')) state.enc = v; }
     else if (k === 'bframes') {}
+    else if (k === 'sharp_amount') { if (!OLD && Number.isFinite(+v)) state.sharp_amount = Math.max(-100, Math.min(100, Math.round(+v))); }
+    else if (k === 'sharp' || k === 'nr') {
+      // как телефон: знаю только четыре уровня, а то, чего камера не умеет, не ставлю
+      if (!OLD && LEVELS.includes(v) && state[k + '_modes'].includes(v)) state[k] = v;
+    }
     else if (k === 'wb_temp' || k === 'wb_tint') {
       // старый телефон этих ключей не знал и пропускал их
       if (!OLD && Number.isFinite(+v)) state[k] = k === 'wb_temp' ? Math.min(10000, Math.max(2000, Math.round(+v)))
@@ -94,9 +109,14 @@ const snapshot = () => {
   if (state.bitrate_auto) state.bitrate = autoBitrate(state.w, state.h, state.fps, state.codec === 'hevc');
   state.bitrate_now = state.bitrate;
   state.wb_manual = state.wb === 'manual' ? 'gl' : 'none';
+  // выдержка и ISO, как их докладывает камера: днём короткая выдержка, в темноте упирается в длину кадра
+  state.exp_max_us = Math.round(1e6 / state.fps);
+  state.exp_us = DARK ? state.exp_max_us - 200 : Math.round(1e6 / 120);
+  state.iso = DARK ? 3200 + Math.round(Math.random() * 100) : 200 + Math.round(Math.random() * 20);
   const out = { ...state };
   if (OLD) { delete out.bitrate_auto; delete out.enc; delete out.bframes; }
   if (OLD) { delete out.wb_temp; delete out.wb_tint; delete out.wb_manual; delete out.wb_manual_available; }
+  if (OLD) for (const k of ['app', 'sharp', 'nr', 'sharp_amount', 'sharp_modes', 'nr_modes', 'exp_us', 'iso', 'iso_max', 'exp_max_us']) delete out[k];
   return Buffer.from(JSON.stringify(out));
 };
 
@@ -122,7 +142,8 @@ function startStream(sock, query) {
   console.log(`[stream] client ${sock.remoteAddress} ${state.w}x${state.h}@${state.fps} ${state.bitrate}kbps` +
     `${state.bitrate_auto ? ' (auto)' : ''} front=${state.front} ${state.codec} enc=${state.enc}` +
     ` client-bframes=${query.get('bframes') === '1'} sending-bframes=${BFRAMES} reorder-flag=${BFRAMES && REORDER_FLAG}` +
-    ` wb=${state.wb}${state.wb === 'manual' ? ` ${state.wb_temp}K tint ${state.wb_tint}` : ''}`);
+    ` wb=${state.wb}${state.wb === 'manual' ? ` ${state.wb_temp}K tint ${state.wb_tint}` : ''}` +
+    ` sharp=${state.sharp}${state.sharp_amount >= 0 ? '+' : ''}${state.sharp_amount} nr=${state.nr}${OLD ? ' (old phone)' : ''}`);
   sock.write('HTTP/1.1 200 OK\r\nContent-Type: application/x-magercam\r\n\r\n');
   // --stall: каждые 15 с на 3 с придерживаю пакеты, потом отдаю пачкой — так выглядит пробка в Wi-Fi
   let held = null;
@@ -270,12 +291,14 @@ net.createServer((sock) => {
   };
   sock.on('data', onData);
   sock.on('error', () => {});
-}).listen(PORT, () => console.log(`fake phone on tcp ${PORT}, discovery on udp 4849`));
+}).listen(PORT, () => console.log(`fake phone on tcp ${PORT}, ${udp ? 'discovery on udp 4849' : 'no discovery'}`));
 
-const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-udp.on('message', (msg, rinfo) => {
-  if (!msg.toString().startsWith('MAGERCAM_DISCOVER')) return;
-  console.log(`[discovery] from ${rinfo.address}:${rinfo.port}`);
-  udp.send(JSON.stringify({ magercam: 1, name: state.name, port: PORT, ver: 2, auth: !!KEY }), rinfo.port, rinfo.address);
-});
-udp.bind(4849);
+const udp = args.includes('--no-discovery') ? null : dgram.createSocket({ type: 'udp4', reuseAddr: true });
+if (udp) {
+  udp.on('message', (msg, rinfo) => {
+    if (!msg.toString().startsWith('MAGERCAM_DISCOVER')) return;
+    console.log(`[discovery] from ${rinfo.address}:${rinfo.port}`);
+    udp.send(JSON.stringify({ magercam: 1, name: state.name, port: PORT, ver: 2, auth: !!KEY }), rinfo.port, rinfo.address);
+  });
+  udp.bind(4849);
+}

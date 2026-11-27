@@ -329,6 +329,9 @@ class Core(val context: Context) : CameraEngine.Listener {
         f("wb_tint")?.takeIf { !it.isNaN() }?.let { settings.wbTint = it.roundToInt().coerceIn(-WhiteBalance.TINT_LIMIT, WhiteBalance.TINT_LIMIT); controls = true }
         p["antibanding"]?.let { settings.antibanding = it; controls = true }
         if ("stab" in p) { settings.stab = b("stab"); controls = true }
+        p["sharp"]?.let { if (it in CameraEngine.LEVELS) { settings.sharp = it; controls = true } }
+        p["nr"]?.let { if (it in CameraEngine.LEVELS) { settings.nr = it; controls = true } }
+        p["sharp_amount"]?.toIntOrNull()?.let { settings.sharpAmount = it.coerceIn(-100, 100); controls = true }
         if ("ae_lock" in p) { settings.aeLock = b("ae_lock"); controls = true }
         if ("awb_lock" in p) { settings.awbLock = b("awb_lock"); controls = true }
         if ("mirror" in p) settings.mirrorPreview = b("mirror")
@@ -397,7 +400,7 @@ class Core(val context: Context) : CameraEngine.Listener {
         val (bat, charging, temp) = battery()
         val size = engine.activeSize
         val o = JSONObject()
-        o.put("name", settings.displayName).put("ver", PROTOCOL_VERSION)
+        o.put("name", settings.displayName).put("ver", PROTOCOL_VERSION).put("app", BuildConfig.VERSION_NAME)
         o.put("w", size?.width ?: settings.width).put("h", size?.height ?: settings.height)
         o.put("fps", if (engine.activeFps > 0) engine.activeFps else settings.fps)
         o.put("bitrate", currentBaseBitrate()).put("bitrate_auto", settings.bitrateAuto)
@@ -419,6 +422,13 @@ class Core(val context: Context) : CameraEngine.Listener {
         o.put("focus", settings.focus).put("focus_dist", settings.focusDist.toDouble())
         o.put("wb", settings.wb).put("antibanding", settings.antibanding).put("stab", settings.stab)
         o.put("wb_temp", settings.wbTemp).put("wb_tint", settings.wbTint)
+        o.put("sharp", settings.sharp).put("nr", settings.nr).put("sharp_amount", settings.sharpAmount)
+        o.put("sharp_modes", JSONArray(engine.sharpLevels)).put("nr_modes", JSONArray(engine.nrLevels))
+        engine.exposure()?.let { e ->
+            o.put("exp_us", e.expUs).put("exp_max_us", e.maxUs)
+            if (e.iso > 0) o.put("iso", e.iso)
+            if (e.isoMax > 0) o.put("iso_max", e.isoMax)
+        }
         o.put("wb_manual", engine.wbManualPath).put("wb_manual_available", true)
         o.put("ae_lock", settings.aeLock).put("awb_lock", settings.awbLock).put("mirror", settings.mirrorPreview)
         o.put("battery", bat).put("charging", charging).put("temp", temp.toDouble())
@@ -478,11 +488,11 @@ class Core(val context: Context) : CameraEngine.Listener {
         private const val HOT_BITRATE = 6000
 
         /**
-         * Авто-битрейт: 1080p30 H.264 — 12 Мбит/с, дальше чуть медленнее, чем растут пиксели и кадры
+         * Авто-битрейт: 1080p30 H.264 — 18 Мбит/с, дальше чуть медленнее, чем растут пиксели и кадры
          * (кодеру на большом кадре и частых кадрах легче), H.265 обходится примерно на треть меньшим.
          */
         fun autoBitrate(w: Int, h: Int, fps: Int, hevc: Boolean, maxKbps: Int): Int {
-            var k = 12000.0 * Math.pow(w.toDouble() * h / 2073600.0, 0.9) * Math.pow(fps.coerceAtLeast(1) / 30.0, 0.6)
+            var k = 18000.0 * Math.pow(w.toDouble() * h / 2073600.0, 0.9) * Math.pow(fps.coerceAtLeast(1) / 30.0, 0.6)
             if (hevc) k *= 0.65
             var r = ((Math.round(k / 500.0) * 500).toInt()).coerceIn(2000, 50000)
             if (maxKbps > 0) r = r.coerceAtMost(maxKbps)

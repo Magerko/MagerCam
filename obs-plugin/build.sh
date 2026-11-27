@@ -21,15 +21,19 @@ build_arch() {
   CC="$TC/bin/$1-w64-mingw32-clang"
   OUT="$2"
   OBJ="$OUT/obj"
-  FLAGS="-O2 -std=gnu11 -Wall -Wno-unknown-pragmas -Wno-missing-braces -D_WIN32_WINNT=0x0A00 -DWIN32 -I$DEPS/inc -I$OBS_INC"
+  # MC_CFLAGS — для отладочных сборок, например -DMC_FRAME_PROBE (см. magercam.c)
+  FLAGS="-O2 -std=gnu11 -Wall -Wno-unknown-pragmas -Wno-missing-braces -D_WIN32_WINNT=0x0A00 -DWIN32 -I$DEPS/inc -I$OBS_INC $MC_CFLAGS"
   mkdir -p "$OBJ"
   for v in "6 ffmpeg-n6.1.2" "7 ffmpeg" "8 ffmpeg-n8.0"; do
     n=${v%% *}
     "$CC" $FLAGS -c -DMC_FFV=$n -I"$DEPS/${v#* }" "$HERE/src/ffdec.c" -o "$OBJ/ffdec$n.o"
   done
   "$CC" $FLAGS -c "$HERE/src/magercam.c" -o "$OBJ/magercam.o"
+  "$CC" $FLAGS -c "$HERE/src/imgwin.c" -o "$OBJ/imgwin.o"
+  # манифест Common Controls 6 для окна настроек: без него ползунки и списки в стиле Windows 2000
+  (cd "$HERE/src" && "$TC/bin/$1-w64-mingw32-windres" magercam.rc -O coff -o "$OBJ/magercam.res.o")
   # FFmpeg не линкую: функции беру через GetProcAddress, поэтому в импортах DLL его нет
-  "$CC" -shared "$OBJ/magercam.o" "$OBJ/ffdec6.o" "$OBJ/ffdec7.o" "$OBJ/ffdec8.o" \
+  "$CC" -shared "$OBJ/magercam.o" "$OBJ/imgwin.o" "$OBJ/magercam.res.o" "$OBJ/ffdec6.o" "$OBJ/ffdec7.o" "$OBJ/ffdec8.o" \
     -L"$3" -lobs -lws2_32 -liphlpapi -lgdi32 -luser32 \
     -static-libgcc -Wl,--no-insert-timestamp \
     -o "$OUT/magercam.dll"

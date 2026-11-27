@@ -28,6 +28,7 @@
 #define TIMER_CONTROLS 1
 #define TIMER_VCAM 2
 #define TIMER_COLOR 3
+#define TIMER_SHARP 4
 #define PREVIEW_W 640
 #define PREVIEW_H 360
 #define MAX_CAMS 16
@@ -39,7 +40,7 @@ enum {
 	ID_PREVIEW, ID_TOTRAY,
 	ID_KEY, ID_PAIR, ID_HEVC, ID_MORE, ID_QUALITY,
 	ID_PROFILE, ID_BG, ID_BG_STRENGTH, ID_BG_PICK, ID_FRAMING, ID_LOCK, ID_ABR, ID_HEAT, ID_REC,
-	ID_WB, ID_WB_TEMP, ID_WB_TINT,
+	ID_WB, ID_WB_TEMP, ID_WB_TINT, ID_SHARP, ID_NR, ID_SHARP_AMT,
 	ID_BRIGHT, ID_CONTRAST, ID_SAT, ID_WARM, ID_DOC, ID_LUT, ID_COLOR_RESET,
 	ID_TRAY_OPEN = 300, ID_TRAY_CONNECT, ID_TRAY_EXIT,
 };
@@ -51,6 +52,10 @@ enum { SESSION_RETRY, SESSION_AUTH_FAILED };
 /* порядок как в списке «Баланс белого»; manual — по температуре (wb_temp, wb_tint) */
 #define WB_MODES 8
 static const char *wb_modes[WB_MODES] = {"auto", "daylight", "cloudy", "shade", "incandescent", "fluorescent", "twilight", "manual"};
+
+/* резкость и шумоподавление камеры: тот же набор значений и порядок в списках */
+#define CAM_LEVELS 4
+static const char *cam_levels[CAM_LEVELS] = {"off", "low", "default", "high"};
 
 struct settings {
 	int conn; /* 0 — Wi-Fi, 1 — USB */
@@ -93,6 +98,12 @@ struct phone_status {
 	char wb[16];
 	int wb_temp, wb_tint;
 	bool wb_manual_available; /* телефон умеет wb=manual с wb_temp и wb_tint */
+	char app_ver[16];         /* версия приложения на телефоне; у старых поля нет */
+	bool has_new_fields;    /* есть sharp_modes и wb_manual_available, иначе телефон старше 1.3.0 */
+	char sharp[12], nr[12];
+	int sharp_mask, nr_mask; /* бит i — cam_levels[i] поддерживается */
+	int sharp_amount;
+	int exp_us, iso, iso_max;
 	int bitrate_now;
 	double bg_strength;
 	long long rec_ms;
@@ -110,6 +121,11 @@ static struct {
 	HWND key, hevc, profile, bg, bg_strength, bg_strength_label, framing, lock_btn, abr, heat, quality, rec, phone_info;
 	HWND bright, contrast, sat, warm, doc, lut_btn;
 	HWND wb, wb_temp, wb_tint, wb_temp_label, wb_tint_label;
+	HWND sharp, nr, sharp_amt, sharp_label, exp_label;
+	int sharp_built, nr_built; /* какой набор пунктов сейчас в списках */
+	bool exp_red;
+	bool sharp_dirty, sharp_timer;
+	DWORD sharp_last;
 	NOTIFYICONDATAW nid;
 	int slot;              /* номер камеры: 0 — «MagerCam», 1 — «MagerCam 2»… */
 	wchar_t section[32];   /* секция client.ini для этой камеры */
@@ -398,6 +414,23 @@ static void apply_status_json(const char *text)
 	p.wb_temp = (int)json_num(j, "wb_temp", 5000);
 	p.wb_tint = (int)json_num(j, "wb_tint", 0);
 	p.wb_manual_available = json_bool(j, "wb_manual_available", false);
+	snprintf(p.app_ver, sizeof(p.app_ver), "%s", json_str(j, "app", ""));
+	snprintf(p.sharp, sizeof(p.sharp), "%s", json_str(j, "sharp", "default"));
+	snprintf(p.nr, sizeof(p.nr), "%s", json_str(j, "nr", "default"));
+	p.sharp_amount = (int)json_num(j, "sharp_amount", 0);
+	p.exp_us = (int)json_num(j, "exp_us", 0);
+	p.iso = (int)json_num(j, "iso", 0);
+	p.iso_max = (int)json_num(j, "iso_max", 0);
+	for (int k = 0; k < 2; k++) {
+		const struct json *ml = json_get(j, k ? "nr_modes" : "sharp_modes");
+		if (!ml || ml->type != JSON_ARR)
+			continue;
+		for (const struct json *c = ml->child; c; c = c->next)
+			for (int i = 0; i < CAM_LEVELS; i++)
+				if (c->str && !strcmp(c->str, cam_levels[i]))
+					*(k ? &p.nr_mask : &p.sharp_mask) |= 1 << i;
+	}
+	p.has_new_fields = p.app_ver[0] && json_get(j, "sharp_modes") && json_get(j, "wb_manual_available");
 	p.bg_strength = json_num(j, "bg_strength", 0.6);
 	p.rec_ms = (long long)json_num(j, "rec_ms", 0);
 	if ((err = json_str(j, "bg_error", NULL)) != NULL) {
@@ -1185,6 +1218,46 @@ static void set_wb_labels(void)
 	SetWindowTextW(app.wb_tint_label, b);
 }
 
+/* неподдерживаемые пункты просто не добавляю; список пересобираю, только когда набор изменился */
+static void sync_level_combo(HWND cb, int *built, int mask, const char *cur, bool on)
+{
+	static const wchar_t *names[CAM_LEVELS] = {L"Выкл", L"Слабая", L"Стандарт (как у камеры)", L"Сильная"};
+	int want = mask ? mask : 0xF;
+	if (*built != want) {
+		SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+		for (int i = 0; i < CAM_LEVELS; i++)
+			if (want & (1 << i))
+				combo_add(cb, names[i], i);
+		*built = want;
+	}
+	int sel = -1;
+	for (int i = 0; i < CAM_LEVELS; i++)
+		if (!strcmp(cur, cam_levels[i]))
+			sel = i;
+	if (sel >= 0 && mask)
+		combo_select_data(cb, sel);
+	else
+		SendMessageW(cb, CB_SETCURSEL, -1, 0);
+	EnableWindow(cb, on && mask != 0);
+}
+
+static void set_sharp_label(void)
+{
+	int v = (int)SendMessageW(app.sharp_amt, TBM_GETPOS, 0, 0);
+	wchar_t b[64];
+	_snwprintf(b, 64, L"Доп. резкость: %ls%d", v > 0 ? L"+" : v < 0 ? L"−" : L"", abs(v));
+	SetWindowTextW(app.sharp_label, b);
+}
+
+static void send_sharp_amount(HWND w)
+{
+	KillTimer(w, TIMER_SHARP);
+	app.sharp_timer = false;
+	app.sharp_last = GetTickCount();
+	send_control("sharp_amount=%d", (int)SendMessageW(app.sharp_amt, TBM_GETPOS, 0, 0));
+	SetTimer(w, TIMER_CONTROLS + 10, 1500, NULL);
+}
+
 static void sync_phone_controls(void)
 {
 	EnterCriticalSection(&app.lock);
@@ -1255,6 +1328,35 @@ static void sync_phone_controls(void)
 		set_wb_labels();
 	}
 	EnableWindow(app.bg_strength, on && strcmp(ph.bg, "blur") == 0);
+	bool new_ok = on && ph.has_new_fields;
+	sync_level_combo(app.sharp, &app.sharp_built, new_ok ? ph.sharp_mask : 0, ph.sharp, on);
+	sync_level_combo(app.nr, &app.nr_built, new_ok ? ph.nr_mask : 0, ph.nr, on);
+	EnableWindow(app.sharp_amt, new_ok);
+	if (new_ok && !app.sharp_dirty)
+		SendMessageW(app.sharp_amt, TBM_SETPOS, TRUE, ph.sharp_amount);
+	set_sharp_label();
+	wchar_t ex[256] = L"";
+	app.exp_red = false;
+	if (on && !ph.has_new_fields) {
+		wcscpy(ex, L"Обновите приложение на телефоне до 1.3.0");
+		app.exp_red = true;
+	} else if (on && ph.exp_us > 0) {
+		if (ph.exp_us < 1000000)
+			_snwprintf(ex, 256, L"Выдержка 1/%d", (int)lround(1e6 / ph.exp_us));
+		else
+			_snwprintf(ex, 256, L"Выдержка %.1f с", ph.exp_us / 1e6);
+		if (ph.iso > 0) {
+			size_t n = wcslen(ex);
+			_snwprintf(ex + n, 256 - n, L" · ISO %d", ph.iso);
+			int iso_lim = ph.iso_max / 2 > 1600 ? ph.iso_max / 2 : 1600;
+			if (ph.fps > 0 && ph.exp_us >= 0.9e6 / ph.fps && ph.iso >= iso_lim) {
+				n = wcslen(ex);
+				_snwprintf(ex + n, 256 - n, L" — Мало света: камера подняла чувствительность — добавьте свет или снизьте к/с");
+				app.exp_red = true;
+			}
+		}
+	}
+	SetWindowTextW(app.exp_label, ex);
 	if (on) {
 		static const char *profiles[] = {"", "call", "stream", "doc"};
 		int pi = 0;
@@ -1350,6 +1452,22 @@ static void build_ui(void)
 	app.install_btn = mk(L"BUTTON", L"Установить виртуальную камеру…", BS_PUSHBUTTON, 24, 474, 250, 28, ID_INSTALL);
 	app.autostart = mk(L"BUTTON", L"Запускать вместе с Windows", BS_AUTOCHECKBOX, 300, 468, 340, 20, ID_AUTOSTART);
 	app.totray = mk(L"BUTTON", L"Сворачивать в трей (значок у часов)", BS_AUTOCHECKBOX, 300, 490, 340, 20, ID_TOTRAY);
+
+	group(L"Картинка камеры", 12, 570, PREVIEW_W + 4, 142);
+	label(L"Резкость:", 24, 596, 66, 20);
+	app.sharp = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 92, 592, 200, 200, ID_SHARP);
+	label(L"Шумоподавление:", 306, 596, 112, 20);
+	app.nr = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 420, 592, 224, 200, ID_NR);
+	app.sharp_label = label(L"", 24, 628, 170, 20);
+	app.sharp_amt = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 196, 624, 448, 26, ID_SHARP_AMT);
+	/* TBM_SETRANGE кладёт границы в WORD, отрицательное минимальное значение так не передать */
+	SendMessageW(app.sharp_amt, TBM_SETRANGEMIN, TRUE, -100);
+	SendMessageW(app.sharp_amt, TBM_SETRANGEMAX, TRUE, 100);
+	SendMessageW(app.sharp_amt, TBM_SETPAGESIZE, 0, 10);
+	SendMessageW(app.sharp_amt, TBM_SETPOS, TRUE, 0);
+	label(L"Для мягкой картинки: камера — Выкл, ползунок по вкусу", 24, 654, PREVIEW_W - 24, 18);
+	app.exp_label = label(L"", 24, 676, PREVIEW_W - 24, 34);
+	set_sharp_label();
 
 	int x = 668, w = 300;
 	group(L"Подключение", x, 6, w, 150);
@@ -1808,6 +1926,14 @@ static void on_command(int id, int code)
 				send_control("wb=%s", wb_modes[i]);
 		}
 		break;
+	case ID_SHARP:
+	case ID_NR:
+		if (code == CBN_SELCHANGE) {
+			int i = (int)combo_data(id == ID_SHARP ? app.sharp : app.nr);
+			if (i >= 0 && i < CAM_LEVELS)
+				send_control("%s=%s", id == ID_SHARP ? "sharp" : "nr", cam_levels[i]);
+		}
+		break;
 	case ID_BG_PICK: {
 		wchar_t path[MAX_PATH] = L"";
 		OPENFILENAMEW ofn = {sizeof(ofn)};
@@ -1958,10 +2084,25 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_CTLCOLORSTATIC: {
 		HDC dc = (HDC)wp;
 		SetBkMode(dc, TRANSPARENT);
+		if ((HWND)lp == app.exp_label && app.exp_red)
+			SetTextColor(dc, RGB(200, 60, 20));
 		return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
 	}
 	case WM_HSCROLL: {
 		HWND tb = (HWND)lp;
+		if (tb == app.sharp_amt) {
+			/* шлю сразу не чаще 10 раз в секунду, остальное — отложенным таймером */
+			app.sharp_dirty = true;
+			set_sharp_label();
+			DWORD since = GetTickCount() - app.sharp_last;
+			if (LOWORD(wp) == SB_ENDSCROLL || since >= 100)
+				send_sharp_amount(w);
+			else if (!app.sharp_timer) {
+				app.sharp_timer = true;
+				SetTimer(w, TIMER_SHARP, 100 - since, NULL);
+			}
+			return 0;
+		}
 		if (tb == app.bright || tb == app.contrast || tb == app.sat || tb == app.warm) {
 			EnterCriticalSection(&app.lock);
 			app.cfg.color.brightness = (int)SendMessageW(app.bright, TBM_GETPOS, 0, 0);
@@ -2018,7 +2159,9 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 			SetTimer(w, TIMER_CONTROLS + 10, 1500, NULL);
 		} else if (wp == TIMER_CONTROLS + 10) {
 			KillTimer(w, wp);
-			app.zoom_dirty = app.ev_dirty = app.bg_dirty = app.wb_dirty = false;
+			app.zoom_dirty = app.ev_dirty = app.bg_dirty = app.wb_dirty = app.sharp_dirty = false;
+		} else if (wp == TIMER_SHARP) {
+			send_sharp_amount(w);
 		} else if (wp == TIMER_COLOR) {
 			KillTimer(w, wp);
 			rebuild_color();
@@ -2188,7 +2331,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
 	wc.hIconSm = wc.hIcon;
 	RegisterClassExW(&wc);
-	RECT r = {0, 0, S(1292), S(662)};
+	RECT r = {0, 0, S(1292), S(722)};
 	DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 	AdjustWindowRect(&r, style, FALSE);
 	wchar_t title[96];

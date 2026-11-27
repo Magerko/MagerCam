@@ -473,6 +473,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 append("⏺ Запись %d:%02d\n".format(sec / 60, sec % 60))
             }
             append("🔋 $bat%"); if (charging) append(" ⚡"); append(" · ${"%.0f".format(temp)}°C")
+            c.engine.exposure()?.let { e ->
+                append("\n").append(e.text)
+                if (e.dark) append("\n⚠ ").append(CameraEngine.DARK_HINT)
+            }
         }
         val err = c.serverError ?: c.engine.error ?: c.engine.recordError ?: c.engine.recorder.lastError ?: c.engine.bgError
             ?: if (c.overheated && s.heatGuard) "Телефон перегрелся: снижаю до 30 к/с и 6 Мбит/с. Снимите чехол и уберите его от солнца." else null
@@ -812,6 +816,45 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         tintBar.setOnSeekBarChangeListener(wbSeek)
         val abValues = listOf("auto", "50", "60", "off")
         val abSp = spinner("Антимерцание", listOf("Авто", "50 Гц (Россия/Европа)", "60 Гц", "Выкл"), abValues, s.antibanding)
+        // резкость и шумоподавление тоже применяю сразу, чтобы подбирать по превью; «Отмена» возвращает прежние
+        val procWas = mapOf("sharp" to s.sharp, "nr" to s.nr, "sharp_amount" to "${s.sharpAmount}")
+        val levelLabels = mapOf("off" to "Выкл", "low" to "Слабая", "default" to "Стандарт (как у камеры)", "high" to "Сильная")
+        val sharpVals = c.engine.sharpLevels
+        val sharpSp = spinner("Резкость камеры", sharpVals.map { levelLabels[it] ?: it }, sharpVals, s.sharp)
+        val amountLabel = TextView(this).apply { setPadding(0, dpi(8), 0, 0); box.addView(this) }
+        val amountBar = SeekBar(this).apply { max = 200; progress = s.sharpAmount + 100; box.addView(this) }
+        box.addView(TextView(this).apply {
+            text = "Для мягкой картинки: камера — Выкл, ползунок по вкусу"
+            textSize = 12f; alpha = 0.7f; setPadding(0, 0, 0, dpi(6))
+        })
+        val nrVals = c.engine.nrLevels
+        val nrSp = spinner("Шумоподавление", nrVals.map { levelLabels[it] ?: it }, nrVals, s.nr)
+        var procSentAt = 0L
+        fun applyProc(force: Boolean) {
+            val amount = amountBar.progress - 100
+            amountLabel.text = "Доп. резкость: " + (if (amount > 0) "+$amount (резче)" else if (amount < 0) "$amount (мягче)" else "0")
+            val sharp = sharpVals.getOrNull(sharpSp.selectedItemPosition) ?: s.sharp
+            val nr = nrVals.getOrNull(nrSp.selectedItemPosition) ?: s.nr
+            if (sharp == s.sharp && nr == s.nr && amount == s.sharpAmount) return
+            // ползунок шлёт события на каждый пиксель, а камере хватает десяти правок в секунду
+            val now = SystemClock.elapsedRealtime()
+            if (!force && now - procSentAt < 100) return
+            procSentAt = now
+            c.applyParams(mapOf("sharp" to sharp, "nr" to nr, "sharp_amount" to "$amount"))
+        }
+        applyProc(false)
+        val procSel = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) = applyProc(true)
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+        sharpSp.onItemSelectedListener = procSel
+        nrSp.onItemSelectedListener = procSel
+        amountBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) applyProc(false) }
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) = applyProc(true)
+        })
+
         val codecValues = listOf("auto", "h264")
         val codecSp = spinner("Кодек", listOf(if (VideoEncoder.isHevcSupported()) "Авто: HEVC, если ПК его умеет" else "Авто (HEVC этот телефон не умеет)", "Только H.264"), codecValues, s.codec)
         val orValues = listOf("auto", "landscape", "portrait")
@@ -877,6 +920,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                     c.applyParams(wbWas)
                     refreshUi()
                 }
+                if (!saved && (procWas["sharp"] != s.sharp || procWas["nr"] != s.nr || procWas["sharp_amount"] != "${s.sharpAmount}")) {
+                    c.applyParams(procWas)
+                    refreshUi()
+                }
             }
             .setPositiveButton("Сохранить") { _, _ ->
                 saved = true
@@ -898,6 +945,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 p["antibanding"] = abValues[abSp.selectedItemPosition]
                 p["orientation_mode"] = orValues[orSp.selectedItemPosition]
                 p["stab"] = if (swStab.isChecked) "1" else "0"
+                sharpVals.getOrNull(sharpSp.selectedItemPosition)?.let { p["sharp"] = it }
+                nrVals.getOrNull(nrSp.selectedItemPosition)?.let { p["nr"] = it }
+                p["sharp_amount"] = "${amountBar.progress - 100}"
                 p["ae_lock"] = if (swAe.isChecked) "1" else "0"
                 p["awb_lock"] = if (swAwb.isChecked) "1" else "0"
                 p["mirror"] = if (swMirror.isChecked) "1" else "0"

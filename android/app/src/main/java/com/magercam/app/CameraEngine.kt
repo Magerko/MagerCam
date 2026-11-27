@@ -167,6 +167,42 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     private var wbWaitingAuto = false
     private var wbAutoFrames = 0
     private var ccModeTemplate: Int? = null
+    // резкость и шумоподавление, которые шаблон запроса выбрал сам: к ним возвращаюсь на «default»
+    private var edgeTemplate: Int? = null
+    private var nrTemplate: Int? = null
+    private var edgeModes = intArrayOf()
+    private var nrModes = intArrayOf()
+    private var procLogged = ""
+    /** Уровни из LEVELS, которые эта камера умеет; default есть всегда. */
+    @Volatile var sharpLevels: List<String> = listOf("default"); private set
+    @Volatile var nrLevels: List<String> = listOf("default"); private set
+    // выдержку и ISO беру из каждого пятнадцатого результата: чаще статус их всё равно не отправит
+    @Volatile private var expNs = 0L
+    @Volatile private var expIso = 0
+    @Volatile private var expAt = 0L
+    @Volatile private var isoMax = 0
+
+    class Exposure(val expUs: Int, val maxUs: Int, val iso: Int, val isoMax: Int) {
+        /** «Выдержка 1/60 · ISO 1600», как на ПК. */
+        val text: String
+            get() {
+                val e = if (expUs < 1_000_000) "1/" + (1_000_000.0 / expUs).roundToInt() else "%.1f с".format(expUs / 1e6)
+                return if (iso > 0) "Выдержка $e · ISO $iso" else "Выдержка $e"
+            }
+        /** Выдержка упёрлась в длину кадра, а ISO высокое: света мало, картинка шумит. */
+        val dark: Boolean
+            get() = maxUs > 0 && expUs * 10L >= maxUs * 9L && (iso >= 1600 || (isoMax > 0 && iso * 2 >= isoMax))
+    }
+
+    /** Последние выдержка и ISO и предел выдержки при нынешней частоте кадров; null, если свежих данных нет. */
+    fun exposure(): Exposure? {
+        val ns = expNs
+        if (!isOpen || ns <= 0 || SystemClock.elapsedRealtime() - expAt > 3000) return null
+        // AE не растянет выдержку дольше кадра при нижней границе диапазона частот
+        val low = fpsRange?.lower ?: activeFps
+        val maxUs = if (low > 0) 1_000_000 / low else 0
+        return Exposure((ns / 1000).toInt().coerceAtLeast(1), maxUs, expIso, isoMax)
+    }
     private var wbLogged = ""
     private var wbVerify = false
     private var wbSentCcm: ColorSpaceTransform? = null
@@ -426,7 +462,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
      * Там же делаю ручной баланс белого, если камера не даёт задать его сама.
      */
     private fun wantGl() = needCamera() &&
-        (settings.background != "off" || recordRequested || (settings.wb == "manual" && !wbCameraCapable))
+        (settings.background != "off" || recordRequested || (settings.wb == "manual" && !wbCameraCapable) ||
+            settings.sharpAmount != 0)
 
     private fun doReconfigure() {
         val needCamera = needCamera()
@@ -695,6 +732,14 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         autoGains = null
         wbWaitingAuto = false
         wbLogged = ""
+        edgeModes = ch.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: intArrayOf()
+        nrModes = ch.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: intArrayOf()
+        sharpLevels = LEVELS.filter { it == "default" || edgeMode(it) != null }
+        nrLevels = LEVELS.filter { it == "default" || nrMode(it) != null }
+        procLogged = ""
+        isoMax = ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.upper ?: 0
+        expNs = 0L
+        Log.i(TAG, "camera $id: edge modes ${edgeModes.joinToString()}, noise reduction modes ${nrModes.joinToString()}")
         Log.i(TAG, "camera $id: manual WB ${if (wbCameraCapable) "by camera" else "by GL"}, " +
             "sensor calibration ${if (wbCalib != null) "present" else "absent"}")
     }
@@ -795,6 +840,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             ).also { nb ->
                 sessionSurfaces.forEach { nb.addTarget(it) }
                 ccModeTemplate = nb.get(CaptureRequest.COLOR_CORRECTION_MODE)
+                edgeTemplate = nb.get(CaptureRequest.EDGE_MODE)
+                nrTemplate = nb.get(CaptureRequest.NOISE_REDUCTION_MODE)
             }
             builder = b
             applyControls(b)
@@ -809,6 +856,11 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
         override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, result: TotalCaptureResult) {
             result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { lastFocusDistance = it }
             frameNo++
+            if (frameNo % 15L == 0L) {
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { expNs = it }
+                expIso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+                expAt = SystemClock.elapsedRealtime()
+            }
             if (wbCameraCapable) trackAutoWb(r, result)
             if (framingOn()) onFaces(result.get(CaptureResult.STATISTICS_FACES) ?: emptyArray())
             else facesVisible = 0
@@ -1059,11 +1111,34 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                 if (settings.stab) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
                 else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
         }
+        val edge = (if (settings.sharp == "default") null else edgeMode(settings.sharp)) ?: edgeTemplate
+        val nr = (if (settings.nr == "default") null else nrMode(settings.nr)) ?: nrTemplate
+        edge?.let { b.set(CaptureRequest.EDGE_MODE, it) }
+        nr?.let { b.set(CaptureRequest.NOISE_REDUCTION_MODE, it) }
+        val procKey = "sharp=${settings.sharp} nr=${settings.nr}: EDGE_MODE $edge, NOISE_REDUCTION_MODE $nr"
+        if (procKey != procLogged) { procLogged = procKey; Log.i(TAG, "request $procKey") }
+
         val ois = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: intArrayOf()
         if (ois.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
             b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)
         }
     }
+
+    /** EDGE_MODE для уровня резкости или null, если камера такого не умеет; default решает шаблон. */
+    private fun edgeMode(level: String): Int? = when (level) {
+        "off" -> CameraMetadata.EDGE_MODE_OFF
+        "low" -> CameraMetadata.EDGE_MODE_FAST
+        "high" -> CameraMetadata.EDGE_MODE_HIGH_QUALITY
+        else -> null
+    }?.takeIf { edgeModes.contains(it) }
+
+    private fun nrMode(level: String): Int? = when (level) {
+        "off" -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
+        "low" -> if (nrModes.contains(CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL))
+            CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL else CameraMetadata.NOISE_REDUCTION_MODE_FAST
+        "high" -> CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
+        else -> null
+    }?.takeIf { nrModes.contains(it) }
 
     private fun onImage(reader: ImageReader) {
         val img = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
@@ -1148,5 +1223,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     companion object {
         private const val TAG = "MC.Camera"
+        /** Уровни резкости и шумоподавления в протоколе. */
+        val LEVELS = listOf("off", "low", "default", "high")
+        const val DARK_HINT = "Мало света: камера подняла чувствительность — добавьте свет или снизьте к/с"
     }
 }

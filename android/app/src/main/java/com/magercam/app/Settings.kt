@@ -32,6 +32,11 @@ class Settings(context: Context) {
     @Volatile var wbTint = prefs.getInt("wb_tint", 0)
     @Volatile var antibanding = prefs.getString("antibanding", "auto") ?: "auto"
     @Volatile var stab = prefs.getBoolean("stab", false)
+    /** Резкость и шумоподавление камеры: off, low, default (как решит камера), high. */
+    @Volatile var sharp = prefs.getString("sharp", "default") ?: "default"
+    @Volatile var nr = prefs.getString("nr", "default") ?: "default"
+    /** Доп. резкость в GL-ступени: минус размывает, плюс подчёркивает края, 0 — ступени нет. */
+    @Volatile var sharpAmount = prefs.getInt("sharp_amount", 0)
     @Volatile var aeLock = false
     @Volatile var awbLock = false
     @Volatile var mirrorPreview = prefs.getBoolean("mirror", false)
@@ -71,6 +76,7 @@ class Settings(context: Context) {
             .putFloat("focus_dist", focusDist).putString("wb", wb)
             .putInt("wb_temp", wbTemp).putInt("wb_tint", wbTint)
             .putString("antibanding", antibanding).putBoolean("stab", stab)
+            .putString("sharp", sharp).putString("nr", nr).putInt("sharp_amount", sharpAmount)
             .putBoolean("mirror", mirrorPreview)
             .putBoolean("auth", authEnabled).putString("pin", pin).putString("profile", profile)
             .putBoolean("abr", abr).putString("codec", codec).putBoolean("framing", framing)

@@ -28,7 +28,7 @@ import java.util.concurrent.TimeUnit
  * Промежуточная GL-ступень для размытия и замены фона: камера пишет в SurfaceTexture, я смешиваю резкий кадр
  * с размытым (или с картинкой) по маске человека и рисую результат в кодер, запись и превью.
  * Пока фон выключен, этой ступени нет вовсе и камера пишет в кодер напрямую. Она же сдвигает баланс белого,
- * если камера не даёт задать его вручную.
+ * если камера не даёт задать его вручную, и добавляет резкость или мягкость поверх обработки камеры.
  */
 class GlRenderer(private val ctx: Context, private val settings: Settings) : SurfaceTexture.OnFrameAvailableListener {
     private val thread = HandlerThread("mc-gl").apply { start() }
@@ -81,6 +81,7 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
         private set
     /** Ручной баланс белого: матрица для линейного sRGB (по столбцам) или null, если кадр не трогаю. */
     @Volatile var wbMatrix: FloatArray? = null
+    private var sharpLogged = 0
 
     private fun sync(block: () -> Unit) {
         val latch = CountDownLatch(1)
@@ -326,6 +327,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
         val img = if (bgH > 0) bgW.toFloat() / bgH else upright
         val bgScale = if (img > upright) floatArrayOf(upright / img, 1f) else floatArrayOf(1f, img / upright)
         val wb = wbMatrix
+        val amount = settings.sharpAmount.coerceIn(-100, 100)
+        if (amount != sharpLogged) { sharpLogged = amount; Log.i(TAG, "extra sharpness $amount") }
         for (o in outputs) {
             if (!EGL14.eglMakeCurrent(display, o.egl, o.egl, context)) continue
             GLES20.glViewport(0, 0, o.w, o.h)
@@ -352,6 +355,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uBgScale"), bgScale[0], bgScale[1])
             GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uWbOn"), if (wb != null) 1f else 0f)
             GLES20.glUniformMatrix3fv(GLES20.glGetUniformLocation(prog, "uWb"), 1, false, wb ?: IDENTITY, 0)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uSharp"), amount / 100f)
+            GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uTexel"), 1f / inW, 1f / inH)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             EGLExt.eglPresentationTimeANDROID(display, o.egl, ts)
@@ -528,9 +533,14 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             }
         """
 
+        // highp: шаг в один пиксель 1080p меньше, чем различает mediump (fp16) около середины кадра
         private const val FS_COMPOSITE = """
             #extension GL_OES_EGL_image_external : require
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
             precision mediump float;
+            #endif
             uniform samplerExternalOES uCam;
             uniform sampler2D uBlur;
             uniform sampler2D uMaskT;
@@ -540,6 +550,8 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
             uniform vec2 uBgScale;
             uniform mat3 uWb;
             uniform float uWbOn;
+            uniform float uSharp;
+            uniform vec2 uTexel;
             varying vec2 vCam;
             varying vec2 vUv;
             varying vec2 vMask;
@@ -549,8 +561,21 @@ class GlRenderer(private val ctx: Context, private val settings: Settings) : Sur
                 vec3 lin = uWb * pow(c.rgb, vec3(2.2));
                 return vec4(pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2)), c.a);
             }
+            // четыре билинейные выборки по диагоналям дают размытие 3×3 почти даром; на плюсе вычитаю его
+            // из кадра по яркости (нерезкая маска с порогом против шума), на минусе подмешиваю чуть более широкое
+            vec4 cam() {
+                vec4 c = texture2D(uCam, vCam);
+                if (uSharp == 0.0) return c;
+                vec2 d = uTexel * (uSharp > 0.0 ? 0.75 : 1.25);
+                vec4 b = 0.25 * (texture2D(uCam, vCam + d) + texture2D(uCam, vCam - d) +
+                    texture2D(uCam, vCam + vec2(d.x, -d.y)) + texture2D(uCam, vCam + vec2(-d.x, d.y)));
+                if (uSharp < 0.0) return mix(c, b, -uSharp);
+                float diff = dot(c.rgb - b.rgb, vec3(0.299, 0.587, 0.114));
+                float k = sign(diff) * max(abs(diff) - 0.006, 0.0);
+                return vec4(clamp(c.rgb + k * uSharp * 2.0, 0.0, 1.0), c.a);
+            }
             void main() {
-                vec4 sharp = wb(texture2D(uCam, vCam));
+                vec4 sharp = wb(cam());
                 float m = uHasMask > 0.5 ? smoothstep(0.3, 0.7, texture2D(uMaskT, vMask).r) : 1.0;
                 vec4 bg = uMode > 1.5 ? texture2D(uBg, (vMask - 0.5) * uBgScale + 0.5) : wb(texture2D(uBlur, vUv));
                 gl_FragColor = mix(bg, sharp, m);
