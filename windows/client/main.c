@@ -17,7 +17,7 @@
 #include "../common/mcv_nv12.h"
 #include "../common/mcv_shared.h"
 
-#define APP_VERSION "1.3.0"
+#define APP_VERSION "1.4.0"
 #define WM_APP_FRAME (WM_APP + 1)
 #define WM_APP_STATUS (WM_APP + 2)
 #define WM_APP_FOUND (WM_APP + 3)
@@ -514,6 +514,9 @@ struct session {
 	/* pts последнего отданного кадра: кадр старше него означает, что декодер не переупорядочил B-кадры, такой не показываю */
 	int64_t last_out_pts;
 	bool out_valid;
+	/* в потоке B-кадры (флаг в VIDEO_CONFIG): кадры декодера пускаю через pacer, а не сразу в камеру */
+	struct pacer *pc;
+	bool pace;
 };
 
 /* Если декодер или сеть не успевают (4K, слабый Wi-Fi), кадры приходят всё позже, и задержка сама уже не уходит.
@@ -544,14 +547,57 @@ static bool video_lagging(struct session *s, int64_t pts_us, bool key)
 	return s->lagging && !key;
 }
 
-static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t pts_us)
+static int64_t now_us(void)
 {
-	struct session *s = opaque;
-	/* скачок назад больше секунды — новые часы телефона, а не перестановка кадров */
-	if (s->out_valid && pts_us <= s->last_out_pts && s->last_out_pts - pts_us < 1000000)
-		return;
-	s->last_out_pts = pts_us;
-	s->out_valid = true;
+	LARGE_INTEGER c, f;
+	QueryPerformanceCounter(&c);
+	QueryPerformanceFrequency(&f);
+	return (int64_t)(c.QuadPart / f.QuadPart * 1000000 + c.QuadPart % f.QuadPart * 1000000 / f.QuadPart);
+}
+
+#ifdef MC_FRAME_PROBE
+/* Отладка плавности (сборка с -DMC_FRAME_PROBE): считаю кадры, записанные в слот камеры, пачки (два кадра почти
+ * разом) и кадры, которых не увидел бы потребитель, опрашивающий слот на частоте потока. */
+static volatile LONG probe_writes, probe_bursts, probe_lost, probe_seen;
+static volatile LONG64 probe_wait_sum, probe_wait_n;
+static int64_t probe_last_write, probe_gap_max;
+static int probe_fps = 30;
+
+static DWORD WINAPI probe_consumer(void *arg)
+{
+	(void)arg;
+	HANDLE t = CreateWaitableTimerExW(NULL, NULL, 0x2, TIMER_ALL_ACCESS);
+	LONG last = 0;
+	int64_t t0 = now_us();
+	while (!app.quit) {
+		LARGE_INTEGER due;
+		due.QuadPart = -10000000LL / probe_fps;
+		SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE);
+		WaitForSingleObject(t, 1000);
+		LONG w = probe_writes;
+		if (w != last) {
+			probe_seen++;
+			probe_lost += w - last - 1;
+			last = w;
+		}
+		if (now_us() - t0 >= 5000000) {
+			t0 = now_us();
+			fprintf(stderr, "probe: writes %ld, seen %ld, lost %ld, bursts %ld, max gap %.1f ms, avg pacer wait %.1f ms\n",
+				probe_writes, probe_seen, probe_lost, probe_bursts, probe_gap_max / 1000.0,
+				probe_wait_n ? probe_wait_sum / (double)probe_wait_n / 1000.0 : 0.0);
+			probe_writes = probe_seen = probe_lost = probe_bursts = 0;
+			probe_gap_max = 0;
+			last = 0;
+			probe_wait_sum = probe_wait_n = 0;
+		}
+	}
+	return 0;
+}
+#endif
+
+/* кадр в камеру и превью; зову либо из потока декодера, либо из pacer, но не из обоих сразу */
+static void present_frame(struct session *s, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t t_in)
+{
 	struct nv12 src = {(uint8_t *)y, (uint8_t *)uv, stride, stride, w, h};
 	EnterCriticalSection(&app.lock);
 	int rot = app.cfg.rotation < 0 ? app.ph.orient : app.cfg.rotation;
@@ -572,6 +618,22 @@ static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stri
 	}
 	LeaveCriticalSection(&app.lock);
 
+#ifdef MC_FRAME_PROBE
+	int64_t pn = now_us();
+	if (probe_last_write) {
+		int64_t g = pn - probe_last_write;
+		if (g < 1000000 / probe_fps / 2)
+			probe_bursts++;
+		if (g > probe_gap_max)
+			probe_gap_max = g;
+	}
+	probe_last_write = pn;
+	probe_writes++;
+	probe_wait_sum += pn - t_in;
+	probe_wait_n++;
+#else
+	(void)t_in;
+#endif
 	vcam_write(&src, rot, mirror, fill);
 
 	s->frames++;
@@ -595,6 +657,218 @@ static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stri
 	app.preview_valid = true;
 	LeaveCriticalSection(&app.lock);
 	PostMessageW(app.wnd, WM_APP_FRAME, 0, 0);
+}
+
+/* С B-кадрами декодер выдаёт кадры пачкой по два-три разом, а камера хранит один слот: потребитель (Zoom, OBS) берёт
+ * его раз в кадр и теряет остальное из пачки. Поэтому показываю кадр в pts + D, где D — самое позднее «время прихода −
+ * pts» за последние секунды: опоздавший кадр сразу поднимает D, а вниз D сползает понемногу. Тот же приём, что и в
+ * плагине OBS (pacer в magercam.c). Превью идёт теми же кадрами. */
+#define PACE_SLOTS 6
+
+struct pace_slot {
+	uint8_t *buf;
+	size_t cap;
+	int w, h;
+	int64_t pts, due, t_in;
+};
+
+struct pacer {
+	struct session *s;
+	CRITICAL_SECTION lock;
+	HANDLE wake, timer, thread;
+	volatile LONG stop;
+	struct pace_slot q[PACE_SLOTS], cur;
+	int head, count;
+	bool busy; /* cur сейчас уходит в камеру */
+	int64_t delay_us;
+	bool delay_valid;
+	int64_t bucket_max[2], bucket_start;
+};
+
+static DWORD WINAPI pacer_thread(void *arg)
+{
+	struct pacer *p = arg;
+	while (!p->stop) {
+		bool have = false;
+		int64_t wait = -1;
+		EnterCriticalSection(&p->lock);
+		if (p->count) {
+			int64_t left = p->q[p->head].due - now_us();
+			if (left > 0) {
+				wait = left;
+			} else {
+				struct pace_slot t = p->cur;
+				p->cur = p->q[p->head];
+				p->q[p->head] = t;
+				p->head = (p->head + 1) % PACE_SLOTS;
+				p->count--;
+				p->busy = true;
+				have = true;
+			}
+		}
+		LeaveCriticalSection(&p->lock);
+		if (!have) {
+			if (wait >= 0 && p->timer) {
+				LARGE_INTEGER due;
+				due.QuadPart = -(LONGLONG)wait * 10;
+				SetWaitableTimer(p->timer, &due, 0, NULL, NULL, FALSE);
+				HANDLE h[2] = {p->wake, p->timer};
+				WaitForMultipleObjects(2, h, FALSE, 1000);
+			} else {
+				WaitForSingleObject(p->wake, wait < 0 ? 200 : (DWORD)(wait / 1000 + 1));
+			}
+			continue;
+		}
+		const struct pace_slot *c = &p->cur;
+		present_frame(p->s, c->buf, c->buf + (size_t)c->w * c->h, c->w, c->w, c->h, c->t_in);
+		EnterCriticalSection(&p->lock);
+		p->busy = false;
+		LeaveCriticalSection(&p->lock);
+	}
+	return 0;
+}
+
+static struct pacer *pacer_create(struct session *s)
+{
+	struct pacer *p = calloc(1, sizeof(*p));
+	if (!p)
+		return NULL;
+	p->s = s;
+	InitializeCriticalSection(&p->lock);
+	p->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+	/* обычный таймер Windows тикает по 15,6 мс, а кадры 60 к/с идут через 16,7: нужен таймер высокого разрешения */
+	p->timer = CreateWaitableTimerExW(NULL, NULL, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+	if (!p->timer)
+		p->timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+#ifdef MC_FRAME_PROBE
+	static bool probe_started;
+	if (!probe_started) {
+		probe_started = true;
+		const char *e = getenv("MC_PROBE_FPS");
+		if (e && atoi(e) > 0)
+			probe_fps = atoi(e);
+		CloseHandle(CreateThread(NULL, 0, probe_consumer, NULL, 0, NULL));
+	}
+#endif
+	p->thread = CreateThread(NULL, 0, pacer_thread, p, 0, NULL);
+	return p;
+}
+
+/* жду кадр, который уже уходит в камеру: после этого сессию можно трогать из другого потока */
+static void pacer_flush(struct pacer *p)
+{
+	if (!p)
+		return;
+	EnterCriticalSection(&p->lock);
+	p->count = 0;
+	p->delay_valid = false;
+	LeaveCriticalSection(&p->lock);
+	for (;;) {
+		EnterCriticalSection(&p->lock);
+		bool busy = p->busy;
+		LeaveCriticalSection(&p->lock);
+		if (!busy)
+			break;
+		Sleep(1);
+	}
+}
+
+static void pacer_destroy(struct pacer *p)
+{
+	if (!p)
+		return;
+	p->stop = 1;
+	SetEvent(p->wake);
+	if (p->thread) {
+		WaitForSingleObject(p->thread, 5000);
+		CloseHandle(p->thread);
+	}
+	if (p->timer)
+		CloseHandle(p->timer);
+	CloseHandle(p->wake);
+	DeleteCriticalSection(&p->lock);
+	for (int i = 0; i < PACE_SLOTS; i++)
+		free(p->q[i].buf);
+	free(p->cur.buf);
+	free(p);
+}
+
+static void pacer_push(struct pacer *p, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t pts_us)
+{
+	int64_t now = now_us();
+	int64_t d = now - pts_us;
+	EnterCriticalSection(&p->lock);
+	/* больше секунды разницы — у телефона новые часы, старая оценка ни к чему */
+	if (!p->delay_valid || d > p->delay_us || p->delay_us - d > 1000000) {
+		if (!p->delay_valid || p->delay_us - d > 1000000) {
+			p->bucket_max[0] = p->bucket_max[1] = d;
+			p->bucket_start = now;
+		}
+		p->delay_us = d;
+		p->delay_valid = true;
+	}
+	if (now - p->bucket_start >= 1000000) {
+		p->bucket_max[1] = p->bucket_max[0];
+		p->bucket_max[0] = d;
+		p->bucket_start = now;
+	} else if (d > p->bucket_max[0]) {
+		p->bucket_max[0] = d;
+	}
+	int64_t recent = p->bucket_max[0] > p->bucket_max[1] ? p->bucket_max[0] : p->bucket_max[1];
+	if (p->delay_us > recent + 2000) {
+		/* лишнее срезаю на шестнадцатую часть за кадр, но не меньше миллисекунды */
+		int64_t excess = p->delay_us - recent - 2000;
+		int64_t step = excess / 16 > 1000 ? excess / 16 : 1000;
+		p->delay_us -= step < excess ? step : excess;
+	}
+	/* очередь переполнена только если потребитель встал: теряю самый старый кадр, а не самый свежий */
+	if (p->count >= PACE_SLOTS) {
+		p->head = (p->head + 1) % PACE_SLOTS;
+		p->count--;
+	}
+	struct pace_slot *sl = &p->q[(p->head + p->count) % PACE_SLOTS];
+	size_t need = (size_t)w * h * 3 / 2;
+	if (need > sl->cap) {
+		free(sl->buf);
+		sl->buf = malloc(need);
+		sl->cap = sl->buf ? need : 0;
+	}
+	if (!sl->buf) {
+		LeaveCriticalSection(&p->lock);
+		return;
+	}
+	for (int r = 0; r < h; r++)
+		memcpy(sl->buf + (size_t)r * w, y + (size_t)r * stride, (size_t)w);
+	uint8_t *duv = sl->buf + (size_t)w * h;
+	for (int r = 0; r < h / 2; r++)
+		memcpy(duv + (size_t)r * w, uv + (size_t)r * stride, (size_t)w);
+	sl->w = w;
+	sl->h = h;
+	sl->pts = pts_us;
+	sl->t_in = now;
+	sl->due = pts_us + p->delay_us;
+	p->count++;
+	LeaveCriticalSection(&p->lock);
+	SetEvent(p->wake);
+}
+
+static void on_frame(void *opaque, const uint8_t *y, const uint8_t *uv, int stride, int w, int h, int64_t pts_us)
+{
+	struct session *s = opaque;
+	/* скачок назад больше секунды — новые часы телефона, а не перестановка кадров */
+	if (s->out_valid && pts_us <= s->last_out_pts && s->last_out_pts - pts_us < 1000000)
+		return;
+	s->last_out_pts = pts_us;
+	s->out_valid = true;
+	bool pace = s->pace && s->pc;
+#ifdef MC_FRAME_PROBE
+	if (getenv("MC_NO_PACE"))
+		pace = false;
+#endif
+	if (pace)
+		pacer_push(s->pc, y, uv, stride, w, h, pts_us);
+	else
+		present_frame(s, y, uv, stride, w, h, now_us());
 }
 
 static void close_audio(struct session *s)
@@ -701,6 +975,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 	s.a_rate = 48000;
 	s.a_ch = 1;
 	s.fps_t0 = GetTickCount64();
+	s.pc = pacer_create(&s);
 	uint8_t *payload = NULL;
 	size_t cap = 0;
 	if (ok) {
@@ -742,6 +1017,8 @@ static int stream_session(const struct settings *cfg, LONG gen)
 		case PKT_VIDEO_CONFIG:
 			/* конфиг приходит заново при смене разрешения или камеры, поэтому декодер пересоздаю */
 			decoder_destroy(s.dec);
+			pacer_flush(s.pc);
+			s.pace = (flags & 4) != 0;
 			free(s.cfg);
 			s.cfg = malloc(len ? len : 1);
 			if (s.cfg)
@@ -775,6 +1052,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 				   и картинка замирала навсегда; пересоздаю декодер сразу и жду ключевой кадр,
 				   телефон шлёт их сам раз в пару секунд */
 				decoder_destroy(s.dec);
+				pacer_flush(s.pc);
 				s.dec = s.cfg ? decoder_create(on_frame, &s, s.cfg_hevc) : NULL;
 				s.out_valid = false;
 				if (s.dec)
@@ -843,6 +1121,7 @@ static int stream_session(const struct settings *cfg, LONG gen)
 	LeaveCriticalSection(&app.lock);
 	closesocket(sock);
 	decoder_destroy(s.dec);
+	pacer_destroy(s.pc);
 	close_audio(&s);
 	free(s.cfg);
 	free(s.small);

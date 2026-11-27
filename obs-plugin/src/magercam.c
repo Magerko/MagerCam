@@ -25,7 +25,7 @@ EXPORT void os_set_thread_name(const char *name);
 
 OBS_DECLARE_MODULE()
 
-#define PLUGIN_VERSION "1.3.0"
+#define PLUGIN_VERSION "1.4.0"
 /* приложение на телефоне выходит вместе с плагином: до этой версии и советую обновить старый телефон */
 #define MC_PHONE_VERSION PLUGIN_VERSION
 #define LOG(level, fmt, ...) blog(level, "[MagerCam] " fmt, ##__VA_ARGS__)

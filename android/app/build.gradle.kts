@@ -13,8 +13,8 @@ android {
         applicationId = "com.magercam.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.3.0"
+        versionCode = 8
+        versionName = "1.4.0"
         // x86_64 только для эмулятора; 32-битный x86 давно не встречается
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
@@ -64,4 +64,5 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
     // сегментация человека для размытия и замены фона (модель MediaPipe selfie_segmenter в assets, работает без интернета)
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    testImplementation("junit:junit:4.13.2")
 }

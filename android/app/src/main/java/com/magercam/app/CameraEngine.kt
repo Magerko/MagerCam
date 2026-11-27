@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.graphics.YuvImage
 import android.hardware.camera2.CameraCaptureSession
@@ -17,7 +16,6 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
-import android.hardware.camera2.params.Face
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.OutputConfiguration
@@ -152,9 +150,16 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
     @Volatile var recordError: String? = null; private set
     private var lastFocusDistance = -1f
     private var faceModes = intArrayOf()
-    private var framingCrop: RectF? = null
-    private var framingTarget: RectF? = null
-    private var lastFaceAt = 0L
+    private val framing = FramingController()
+    // crop region, который сейчас стоит в запросе от автокадрирования; null — зум идёт обычным путём
+    private var framingSent: Rect? = null
+    // камера двигает crop только по центру: заявила CENTER_ONLY или на деле возвращает кадр в центр
+    private var framingCenterOnly = false
+    private var framingCropChecked = false
+    private var framingRecentred = 0
+    private var framingOrient = 0
+    private var framingOrientAt = 0L
+    private var cropTemplate: Rect? = null
     private var frameNo = 0L
 
     // ручной баланс белого силами камеры: AWB выключен, усиления каналов и матрицу цвета задаю сам
@@ -719,8 +724,15 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             .map { it.upper }.filter { it in 15..60 }.distinct().sorted()
         faceModes = ch.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES) ?: intArrayOf()
         framingAvailable = physicalId == null && faceModes.any { it != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF }
-        framingCrop = null
-        framingTarget = null
+        framing.reset()
+        framingSent = null
+        framingCenterOnly = ch.get(CameraCharacteristics.SCALER_CROPPING_TYPE) == CameraMetadata.SCALER_CROPPING_TYPE_CENTER_ONLY
+        framingCropChecked = false
+        framingRecentred = 0
+        framingOrientAt = 0L
+        if (framingAvailable) Log.i(TAG, "camera $id: framing via crop region, cropping type " +
+            "${if (framingCenterOnly) "CENTER_ONLY" else "FREEFORM"}, max digital zoom " +
+            "${ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)}, face modes ${faceModes.joinToString()}")
         // запросы идут в открытое устройство, поэтому и умение смотрю у него
         val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
         val awbModes = ch.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
@@ -797,6 +809,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     /** С CONTROL_ZOOM_RATIO области 3A задаются во всём active array, без него — внутри crop region. */
     private fun regionBase(active: Rect): Rect {
+        // при автокадрировании зум 1x, а на экране ровно crop region: касание отсчитываю внутри него
+        framingSent?.let { if (framing.isActive) return it }
         if (Build.VERSION.SDK_INT >= 30 && chars?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
             return Rect(0, 0, active.width(), active.height())
         return cropFor(active, settings.zoom)
@@ -842,6 +856,7 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                 ccModeTemplate = nb.get(CaptureRequest.COLOR_CORRECTION_MODE)
                 edgeTemplate = nb.get(CaptureRequest.EDGE_MODE)
                 nrTemplate = nb.get(CaptureRequest.NOISE_REDUCTION_MODE)
+                cropTemplate = nb.get(CaptureRequest.SCALER_CROP_REGION)
             }
             builder = b
             applyControls(b)
@@ -862,7 +877,8 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
                 expAt = SystemClock.elapsedRealtime()
             }
             if (wbCameraCapable) trackAutoWb(r, result)
-            if (framingOn()) onFaces(result.get(CaptureResult.STATISTICS_FACES) ?: emptyArray())
+            // после выключения тоже веду кадр, пока он плавно не вернётся к зуму пользователя
+            if (framing.isActive || framingOn()) tickFraming(r, result)
             else facesVisible = 0
         }
     }
@@ -934,69 +950,104 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
 
     private fun framingOn() = settings.framing && framingAvailable
 
+    private fun zoomRatioApi(ch: CameraCharacteristics) =
+        Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null
+
+    /**
+     * Система координат crop region и лиц: active array, а у камеры с управляемой коррекцией дисторсии
+     * при выключенной коррекции — pre-correction array.
+     */
+    private fun cropArray(ch: CameraCharacteristics): Size? {
+        val active = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        if (Build.VERSION.SDK_INT >= 28) {
+            val modes = ch.get(CameraCharacteristics.DISTORTION_CORRECTION_AVAILABLE_MODES)
+            if (modes != null && modes.any { it != CameraMetadata.DISTORTION_CORRECTION_MODE_OFF } &&
+                builder?.get(CaptureRequest.DISTORTION_CORRECTION_MODE) == CameraMetadata.DISTORTION_CORRECTION_MODE_OFF) {
+                ch.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)?.let { return Size(it.width(), it.height()) }
+            }
+        }
+        return Size(active.width(), active.height())
+    }
+
+    private fun framingGeometry(): FramingGeometry? {
+        val ch = chars ?: return null
+        val arr = cropArray(ch) ?: return null
+        val size = activeSize ?: return null
+        val now = SystemClock.elapsedRealtime()
+        // поворот спрашиваю у Core нечасто: он лезет в характеристики камеры, а кадров 60 в секунду
+        if (framingOrientAt == 0L || now - framingOrientAt > 500) { framingOrient = orientProvider(); framingOrientAt = now }
+        val maxDigital = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        return FramingGeometry(arr.width, arr.height, size.width.toFloat() / size.height, framingOrient,
+            settings.zoom, maxDigital, framingCenterOnly)
+    }
+
+    private fun Box.toCropRect(g: FramingGeometry): Rect {
+        val p = FramingController.toPixels(this, g)
+        return Rect(p[0], p[1], p[2], p[3])
+    }
+
     /**
      * Автокадрирование: двигаю и масштабирую crop region сенсора за лицами. Это обрезка на самом
      * сенсоре, а не растягивание готового кадра, поэтому чёткости теряется меньше, чем при цифровом зуме на ПК.
+     * Вся логика движения — в [FramingController], здесь только камера.
      */
-    private fun onFaces(faces: Array<Face>) {
+    private fun tickFraming(r: CaptureRequest, result: TotalCaptureResult) {
         val ch = chars ?: return
-        val active = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
-        val size = activeSize ?: return
-        val aw = active.width().toFloat()
-        val ah = active.height().toFloat()
-        val outAspect = size.width.toFloat() / size.height
-        val now = SystemClock.elapsedRealtime()
-        val good = faces.filter { it.score >= 30 }
-        facesVisible = good.size
-
-        val fullW = minOf(aw, ah * outAspect)
-        val full = RectF((aw - fullW) / 2, (ah - fullW / outAspect) / 2, (aw + fullW) / 2, (ah + fullW / outAspect) / 2)
-        var target = framingTarget ?: full
-        if (good.isNotEmpty()) {
-            lastFaceAt = now
-            var l = Float.MAX_VALUE; var t = Float.MAX_VALUE; var r = 0f; var b = 0f
-            for (f in good) {
-                l = minOf(l, f.bounds.left.toFloat()); t = minOf(t, f.bounds.top.toFloat())
-                r = maxOf(r, f.bounds.right.toFloat()); b = maxOf(b, f.bounds.bottom.toFloat())
+        val g = framingGeometry() ?: return
+        val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
+        // время кадра с сенсора, а не время колбэка: так шаг не зависит от того, как кучно приходят результаты
+        val now = if (ts != null && ts > 0) ts / 1e9 else SystemClock.elapsedRealtimeNanos() / 1e9
+        val on = framingOn()
+        val faces = if (!on) emptyList() else (result.get(CaptureResult.STATISTICS_FACES) ?: emptyArray())
+            .filter { it.score >= 30 }
+            .map { Box(it.bounds.left.toFloat(), it.bounds.top.toFloat(), it.bounds.right.toFloat(), it.bounds.bottom.toFloat()) }
+        if (on) checkCropHonoured(r, result, g)
+        val wasActive = framing.isActive
+        val crop = framing.update(now, on, faces, g)
+        facesVisible = framing.faces
+        if (crop == null) {
+            if (wasActive) {
+                // кадр вернулся к виду пользователя: дальше зумом снова управляет обычный путь
+                framingSent = null
+                applyRepeating()
             }
-            val fw = maxOf(r - l, (b - t) * outAspect)
-            val w = (fw * 3.2f).coerceIn(fullW / 2.5f, fullW)
-            val cx = (l + r) / 2
-            val cy = (t + b) / 2
-            val cur = framingTarget
-            // мёртвая зона: мелкие движения головы не дёргают кадр
-            val still = cur != null && abs(cx - cur.centerX()) < cur.width() * 0.08f &&
-                abs(cy - cur.centerY()) < cur.height() * 0.08f && abs(w - cur.width()) < cur.width() * 0.12f
-            if (!still) {
-                val h = w / outAspect
-                val x0 = (cx - w / 2).coerceIn(0f, aw - w)
-                val y0 = (cy - h / 2).coerceIn(0f, ah - h)
-                target = RectF(x0, y0, x0 + w, y0 + h)
-            }
-        } else if (now - lastFaceAt > 2500) {
-            target = full
+            return
         }
-        framingTarget = target
-
-        val cur = framingCrop ?: full
-        val k = 0.07f
-        val next = RectF(
-            cur.left + (target.left - cur.left) * k, cur.top + (target.top - cur.top) * k,
-            cur.right + (target.right - cur.right) * k, cur.bottom + (target.bottom - cur.bottom) * k
-        )
-        framingCrop = next
-        if (frameNo % 2L != 0L) return
-        val moved = abs(next.left - cur.left) + abs(next.top - cur.top) + abs(next.width() - cur.width())
-        if (moved < aw * 0.0015f) return
+        val rect = crop.toCropRect(g)
+        if (rect == framingSent) return
         val b = builder ?: return
         val s = session ?: return
         try {
-            b.set(CaptureRequest.SCALER_CROP_REGION, next.toRect())
+            if (zoomRatioApi(ch)) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+            b.set(CaptureRequest.SCALER_CROP_REGION, rect)
             s.setRepeatingRequest(b.build(), captureCallback, handler)
-        } catch (_: Exception) {}
+            framingSent = rect
+        } catch (e: Exception) {
+            Log.w(TAG, "framing: $e")
+        }
     }
 
-    private fun RectF.toRect() = Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
+    /**
+     * Камера может заявить FREEFORM, а crop не по центру молча вернуть в центр. Тогда кадр не поедет за лицом,
+     * а только зумит в середину и режет человека — переключаю автокадрирование на зум без сдвига.
+     */
+    private fun checkCropHonoured(r: CaptureRequest, result: TotalCaptureResult, g: FramingGeometry) {
+        if (framingCenterOnly || framingCropChecked) return
+        val req = r.get(CaptureRequest.SCALER_CROP_REGION) ?: return
+        val got = result.get(CaptureResult.SCALER_CROP_REGION) ?: return
+        val aw = g.arrayW.toFloat(); val ah = g.arrayH.toFloat()
+        val off = maxOf(abs(req.exactCenterX() - aw / 2) / aw, abs(req.exactCenterY() - ah / 2) / ah)
+        if (off < 0.04f) return
+        val follows = abs(got.exactCenterX() - req.exactCenterX()) < aw * 0.02f && abs(got.exactCenterY() - req.exactCenterY()) < ah * 0.02f
+        val centred = abs(got.exactCenterX() - aw / 2) < aw * 0.01f && abs(got.exactCenterY() - ah / 2) < ah * 0.01f
+        if (follows) {
+            framingCropChecked = true
+            Log.i(TAG, "framing: off-centre crop region honoured, requested $req, got $got")
+        } else if (centred && ++framingRecentred >= 15) {
+            framingCenterOnly = true
+            Log.w(TAG, "framing: camera re-centres crop region (requested $req, got $got), zoom-only framing")
+        }
+    }
 
     private fun applyControls(b: CaptureRequest.Builder) {
         val ch = chars ?: return
@@ -1090,19 +1141,28 @@ class CameraEngine(private val ctx: Context, private val settings: Settings, pri
             b.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, mode)
         }
 
+        // при включении кадр стартует с текущего вида, при выключении ещё какое-то время плавно возвращается к нему
+        val fg = if (physicalId == null && framingAvailable) framingGeometry() else null
+        val framingCrop = fg?.let { g -> framing.crop(framingOn(), g)?.toCropRect(g) }
         if (physicalId != null) {
             // физическому объективу зум не трогаю, логическая камера остаётся на своём зуме по умолчанию
-        } else if (framingOn()) {
+        } else if (framingCrop != null) {
             // при автокадрировании зумом управляет crop region, поэтому общий зум держу на 1x
-            if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null)
-                b.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
-            framingCrop?.let { b.set(CaptureRequest.SCALER_CROP_REGION, it.toRect()) }
-        } else if (Build.VERSION.SDK_INT >= 30 && ch.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null) {
+            if (zoomRatioApi(ch)) b.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+            b.set(CaptureRequest.SCALER_CROP_REGION, framingCrop)
+            framingSent = framingCrop
+        } else if (zoomRatioApi(ch)) {
             b.set(CaptureRequest.CONTROL_ZOOM_RATIO, settings.zoom.coerceIn(zoomMin, zoomMax))
+            // builder живёт всю сессию: без сброса здесь оставался бы crop от автокадрирования, и при зуме 1x
+            // картинка так и висела обрезанной, пока не тронешь масштаб
+            val active = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            (cropTemplate ?: active?.let { Rect(0, 0, it.width(), it.height()) })?.let { b.set(CaptureRequest.SCALER_CROP_REGION, it) }
+            framingSent = null
         } else {
             ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let {
                 b.set(CaptureRequest.SCALER_CROP_REGION, cropFor(it, settings.zoom))
             }
+            framingSent = null
         }
 
         val vs = ch.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
